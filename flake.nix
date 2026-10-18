@@ -4,6 +4,16 @@
     systems.url = "github:nix-systems/default";
     devenv.url = "github:cachix/devenv";
     devenv.inputs.nixpkgs.follows = "nixpkgs";
+
+    # Neither upstream ships a flake.
+    clay = {
+      url = "github:nicbarker/clay/e6cc36941ab2af5d81107617039d6f527a1c660b";
+      flake = false;
+    };
+    termbox2 = {
+      url = "github:termbox/termbox2/master";
+      flake = false;
+    };
   };
 
   nixConfig = {
@@ -21,8 +31,36 @@
     }@inputs:
     let
       forEachSystem = nixpkgs.lib.genAttrs (import systems);
+
+      # Linux only (plan D6): pkgs.odin is broken on musl and this project targets
+      # glibc Linux exclusively.
+      linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
+
+      # Built per-system but shared with the package derivation so there is exactly one
+      # nixpkgs instance in this flake (devenv follows `nixpkgs` too).
+      libclay = system: nixpkgs.legacyPackages.${system}.callPackage ./nix/clay.nix {
+        clay-src = inputs.clay;
+      };
+
+      libtermbox2 = system: nixpkgs.legacyPackages.${system}.callPackage ./nix/termbox2.nix {
+        termbox2-src = inputs.termbox2;
+      };
     in
     {
+      # The package derivation is intentionally independent of devenv: `nix develop`
+      # and `nix flake show` cannot evaluate devenv in this repo without
+      # --no-pure-eval, and `nix build` must not inherit that problem.
+      packages = nixpkgs.lib.genAttrs linuxSystems (system: {
+        default = nixpkgs.legacyPackages.${system}.callPackage ./nix/package.nix {
+          clay = libclay system;
+          clay-src = inputs.clay;
+          termbox2 = libtermbox2 system;
+        };
+
+        clayLib = libclay system;
+        termbox2Lib = libtermbox2 system;
+      });
+
       devShells = forEachSystem (
         system:
         let

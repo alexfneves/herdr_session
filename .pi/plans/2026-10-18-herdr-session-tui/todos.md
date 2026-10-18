@@ -24,6 +24,14 @@
 
 ### T0.1 — Vendor clay + termbox2 as flake inputs and build both archives in-derivation
 
+> **STATUS: ✅ DONE (2026-10-19).** Both inputs pinned in `flake.lock` (`clay@e6cc3694`,
+> `termbox2@48cda6f8`, both `flake = false`). Verified:
+> `nix build .#clayLib` → `libclay.a` (`ar t` = `clay_impl.o`);
+> `nix build .#termbox2Lib` → `libtermbox2.a` (`ar t` = `tb_impl.o`), and
+> `objdump -d --disassemble=tb_attr_width` returns `mov $0x20,%eax` = **32**, so truecolor is real.
+> **Correction to the sketch:** `-Werror` is omitted as instructed; also omit it for termbox2, which warns
+> on ignored `write()`/`read()` results in its `SIGWINCH` self-pipe handler.
+
 **Create:** `flake.nix` (edit existing), `nix/clay.nix`, `nix/termbox2.nix`
 
 **Do now, in `flake.nix` inputs** — both upstreams have **no flake**, so `flake = false`:
@@ -65,6 +73,29 @@ stdenv.mkDerivation {
 ---
 
 ### T0.2 — Odin package that lays the archives at the paths the bindings hard-code, and builds
+
+> **STATUS: ✅ DONE (2026-10-19).** **ISC-1 satisfied** — `nix run .` executes:
+> ```
+> herdr-session: toolchain OK
+>   clay.MinMemorySize() = 5785280 bytes
+>   tb_wcwidth('A')      = 1
+>   tb_wcwidth(U+4E00)   = 2
+> ```
+> **Three corrections to the sketch, all verified the hard way — do not re-apply the old forms:**
+> 1. `-mode:release` **does not exist** in `pkgs.odin dev-2026-09` (`Unknown flag: 'mode'`).
+>    The optimisation flag is **`-o:speed`** (`-build-mode:` replaces the old `-mode:`).
+> 2. Odin foreign blocks require modern `name :: proc(args) -> ret`; the C-style
+>    `name(args) : ret` in the sketch is a syntax error. Comments are `//`, not `#`.
+> 3. **The blocker that mattered:** Odin emits staged archives as `-l:<absolute path>` with a bare
+>    `-L/`. GNU ld resolves `-l:` by *joining* search dirs to the name, so it needs `/` in the search
+>    path — and **the nix `cc` wrapper silently drops a bare `-L/`**, so every link failed with
+>    `cannot find -l:/build/source/...`. Fix: pass the long option form
+>    **`-extra-linker-flags=-Wl,--library-path,/`**. Measured: `-L/`→FAIL, `-Wl,-L/`→FAIL,
+>    `-Wl,--library-path,/`→OK, `NIX_LDFLAGS=-L/`→FAIL, `LIBRARY_PATH=/`→FAIL.
+> 4. `lib.fileset` is unusable here (it demands git-tracked files and the flake must evaluate before
+>    commit); use `lib.cleanSourceWith` with an explicit `src`/`vendor` prefix filter.
+>
+> **Note for T1.1:** `tb_last_errno` **does** exist (`termbox2.h:739`) — keep it in the binding.
 
 **Create:** `nix/package.nix`, `vendor/termbox2-odin/termbox.odin`, `src/main.odin`
 

@@ -1,2 +1,6 @@
 .devenv
 .direnv
+
+# Nix build results — never commit these (or any built archives; see ISC-A-9).
+result
+result-*
