@@ -4,3 +4,12 @@
 # Nix build results — never commit these (or any built archives; see ISC-A-9).
 result
 result-*
+
+# Locally staged build inputs. nix/package.nix's patchPhase lays these down inside
+# the build; a copy in the working tree is only for running `odin build` by hand.
+# Never commit an archive (ISC-A-9).
+/clay-odin/
+/vendor/termbox2-odin/lib/
+
+# `script` writes ./typescript by default when given no output file.
+/typescript

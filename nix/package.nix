@@ -48,14 +48,15 @@ stdenv.mkDerivation (finalAttrs: {
     cp ${termbox2}/lib/libtermbox2.a vendor/termbox2-odin/lib/libtermbox2.a
 
     # `-o:speed` is this Odin's optimisation flag. (`-out:` sets the output path;
-    # `-mode:release` no longer exists in pkgs.odin dev-2026-09.)
+    # `-mode:release` no longer exists in pkgs.odin dev-2026-09.) `-vet` is on so an
+    # unused import or dead branch cannot reach the build.
     #
     # `--library-path,/` is required, not cosmetic: Odin emits these archives as
     # `-l:<absolute path>`, which GNU ld resolves by *joining* each -L dir with the
     # name, so it needs `/` in the search path. The nix cc-wrapper drops a bare
     # `-L/`, so we pass the long option form (verified: `-Wl,-L/` fails,
     # `-Wl,--library-path,/` links).
-    odin build src -out:herdr-session -o:speed -extra-linker-flags=-Wl,--library-path,/
+    odin build src -out:herdr-session -o:speed -vet -extra-linker-flags=-Wl,--library-path,/
 
     runHook postBuild
   '';

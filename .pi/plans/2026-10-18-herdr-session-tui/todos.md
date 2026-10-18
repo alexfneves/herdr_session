@@ -157,6 +157,45 @@ long before herdr is involved.*
 
 ### T1.1 — termbox2 Odin foreign bindings
 
+> **STATUS: ✅ DONE (2026-10-19).** `vendor/termbox2-odin/termbox.odin` is the real, complete binding.
+> Every signature and constant was read out of the **pinned header in the nix store**
+> (`/nix/store/…-source/termbox2.h`, rev `48cda6f8`, 4312 lines) — not from memory; line refs are in
+> the file. **Risk-A1-adjacent ABI proof** (case 1 of `dev/handoff-smoke.sh`):
+> ```
+> [PASS] tb_wcwidth('A') == 1     got 1
+> [PASS] tb_wcwidth(U+4E00) == 2  got 2
+> [PASS] tb_attr_width() == 32    got 32 (TB_OPT_ATTR_W really built in)
+> [PASS] tb_has_truecolor() == 1  got 1
+> [PASS] Event struct is 24 bytes size_of(termbox2.Event) = 24
+> ```
+> **Confirmed upstream:** `typ/mod` u8 · `key` u16 · `ch` u32 · `w/h/x/y` i32 · `uintattr_t` is
+> `uint32_t` at `TB_OPT_ATTR_W==32` (`:395-401`) · `TB_OUTPUT_TRUECOLOR == 5` (`:327`) ·
+> `TB_KEY_ARROW_UP == 0xffff-18` (`:196`) · `TB_KEY_BACK_TAB == 0xffff-22` (`:200`) · `TB_MOD_*` =
+> 1/2/4/8 (`:312-316`) · `tb_last_errno` **does** exist (`:739`) and is kept. Style bits live in the
+> **high half** of the 32-bit word (`TB_BOLD == 0x01000000`); `TB_STRIKEOUT/UNDERLINE_2/OVERLINE/
+> INVISIBLE` need bits above `0xffffffff`, so they exist only at attr width 64 and are **not bindable
+> here**. No `TB_OPT_EGC` ⇒ `Cell` is 12 bytes.
+>
+> **Corrections to the sketch — each one learned by running it:**
+> 1. ⚠️ **`tb_poll_event` / `tb_peek_event` return a `TB_*` status code, NOT the event type.**
+>    `TB_OK` means "*`ev` is populated*"; the kind of event is `ev.typ`. (`wait_event`,
+>    `termbox2.h:3461-3522`.) The sketch's `if rv == EVENT_KEY` can **never** be true — and it fails
+>    silently, because a real key still fills the struct. Timeout is `TB_ERR_NO_EVENT`; `TB_ERR_POLL` and
+>    `TB_ERR_READ` are retryable, not fatal. Documented at the declaration.
+> 2. The sketch's `NAME : u8 = 1` is a **mutable variable** in Odin, not a constant — and it is then
+>    unusable as a `switch` case or in `#assert`. Typed constants need `NAME :: u8(1)`; this binding
+>    uses **plain untyped constants** (`KEY_ESC :: 0x1b`) for `#define` fidelity: they assign into
+>    `u8`/`u16`/`i32` and compare against any width without a cast. `Attr` stays a typed alias because
+>    colour arithmetic needs a definite width.
+> 3. `size_t` is **not** a builtin in `pkgs.odin dev-2026-09` → `c.size_t` (`core:c`). Same for
+>    `char` → `c.char`.
+> 4. Upstream calls the field `type`; it is **`typ`** here. Offsets are identical and asserted
+>    (`#assert(size_of(Event) == 24)`), so a layout drift breaks the build rather than garbling input.
+> 5. Deliberately **not** bound: `tb_printf` / `tb_printf_ex` / `tb_sendf` (variadic C — we format in
+>    Odin) and the header's own deprecated `tb_set_func` / `tb_cell_buffer`.
+> 6. Build hygiene: `-vet` is now part of the package build (`nix/package.nix`) — it caught an unused
+>    import that the default build passed silently.
+
 **Create:** `vendor/termbox2-odin/termbox.odin`
 
 **Exact ABI, verified from `termbox2.h` (do not guess — `ch` is 32-bit and `w/h/x/y` are `i32`):**
@@ -216,6 +255,81 @@ throwaway `main` to prove the ABI isn't garbled).
 ---
 
 ### T1.2 — Handoff: leave the screen, run a child, come back, repaint
+
+> **STATUS: ✅ DONE (2026-10-19) — risk A1 is retired empirically.** `src/terminal/handoff.odin`
+> implements plan §Terminal handoff literally (steps 2-6; step 1 is the caller's contract, documented
+> in the file header). Everything below was **run on a real pty**, captured by
+> `BIN=… ./dev/handoff-smoke.sh` → **28 PASS / 0 FAIL**, typescripts kept under `/tmp/hs-smoke/`.
+> ```
+> 1 handoff -> sleep 2        child exit == 0, terminal reacquired, forced repaint ran (FRAMES_PAINTED=1)
+>                           stty -a before == after: IDENTICAL  (termios round-tripped)
+> 2 post-handoff input       a keypress is readable after the handoff: ch=106 (U+006A = 'j')
+> 3 exit-code propagation   child `sh -c 'exit 7'`  ->  CHILD exit=7 killed_by=0
+> 4 double round-trip       2x init/shutdown clean; 2nd init = TB_ERR_INIT_ALREADY (-3);
+>                           2nd shutdown = TB_ERR_NOT_INIT (-8)
+> 5 env scrub               our env: 7 HERDR_* vars  ->  child env: HERDR_VARS=0
+>                           child kept TERM=xterm-256color COLORTERM=truecolor  (SemanticFrame intact)
+> 6 no setsid / fg pgroup   SELF pid=547191 pgid=547188 sid=547188
+>                           CHILD pid=547192 pgid=547188 sid=547188   (same pgid AND sid)
+>                           child pwd=/home/alexfneves (explicit cwd, not our repo dir)
+>                           child stdin=/dev/pts/15  (stdio INHERITED, still a tty)
+> 7 SIGINT during the child's lifetime  (group-killed: `kill -INT -<pgid>`, exactly what the tty does)
+>                           PARENT SigBlk=0x6  <- SIGINT|SIGQUIT blocked for us
+>                           CHILD  SigBlk=0x0  <- cleared for the child
+>                           CHILD_GOT_SIGNAL=2 -> child ran its handler, exit=42, we survived, stty IDENTICAL
+> 8 SIGTERM / SIGHUP        exit=143 / exit=129, alt-screen-leave sequence reached the tty,
+>                           stty before/after IDENTICAL  (our handler, not termbox2, did the restore)
+> ```
+> **Ordered pty byte stream** during a handoff (`dev/stream_order.py`) — proof that nothing of ours
+> renders while the child owns the screen:
+> ```
+>        0  ENTER alt screen
+>     1748  LEAVE alt screen  (terminal handed over to the child)
+>     1958  child output while it owns the screen
+>     2029  ENTER alt screen
+>     2497  forced full repaint after re-entry
+>     3798  LEAVE alt screen  (final shutdown)
+> ```
+> **Corrections / gotchas discovered — the next worker must respect these:**
+> 1. ⚠️ **termbox2's `init_term_attrs` calls `cfmakeraw` (`termbox2.h:2910-2932`), which clears
+>    `ISIG`.** So while termbox is up the tty produces **no SIGINT at all** — Ctrl-C arrives as byte
+>    `0x03` → `TB_KEY_CTRL_C`. SIGINT only becomes a *signal* in the window after `tb_shutdown()`,
+>    which is exactly what the block covers. Consequence: **ISC-12 ("Ctrl-C exits from all 7 states") is
+>    a keymap job, not a signal handler** — do not go adding a SIGINT handler to get Ctrl-C.
+> 2. **The child must have SIGINT/SIGQUIT explicitly un-blocked before `execve`.** The signal mask
+>    survives *both* fork and execve, so blocking in the parent and forgetting the child side hands the
+>    child a Ctrl-C-dead process. `child_pre_exec` clears exactly `HANDOFF_SIGNALS`.
+> 3. **We cannot use `execvp()`.** It resolves PATH from the *inherited* `environ`, not our scrubbed
+>    array — silently defeating the whole scrub. So `resolve_program()` does the PATH walk in the parent
+>    and we call `execve()` with the scrubbed `envp`.
+> 4. **`posix.execve` wants `[^]cstring`** — a pointer to the array. `out[0]` is the first *string*,
+>    `&out[0]` is the argv. The type system catches this; worth knowing before you chase a segfault.
+> 5. **Odin dynamic arrays are `[dynamic]T`** — `[..]T` is a hard syntax error in `dev-2026-09`.
+>    `make([dynamic]cstring, n)` / `make([dynamic]T, 0, cap)` + `append` both work.
+> 6. **Constant arrays are not addressable**: `HANDOFF_SIGNALS[:]` fails with "value is not addressable".
+>    Take a stack copy (`owned := HANDOFF_SIGNALS`) and slice that — safe in the child too.
+> 7. posix typing: `posix.errno()` is the `posix.Errno` enum (`posix.Errno.EINTR`, not `posix.EINTR`);
+>    `result`-typed returns (`access`, `sigprocmask`, `raise`) compare against **`nil`** for success,
+>    not `0`; signal members are `posix.Signal.SIGINT` / `.SIGQUIT` / `.SIGTERM` / `.SIGHUP`.
+> 8. `os`: there is **no `os.getenv`** (`os.get_env_alloc(key, allocator)`), **no `os.write_file`**
+>    (`os.open(path, {.Write,.Create,.Trunc})` + `os.write_string`), and the flag is `.Trunc` not
+>    `.Truncate`.
+> 9. Language surface hits (also apply to every later phase): **no `if x then a else b` expression**,
+>    **`not` is not an operator** (use `!`), **no `var` keyword**, and `fmt` uses `{}`/`%v` — `{s}` and
+>    `{v}` are printed literally, and mixing a `%X` verb into a `{}` string scrambles the argument order
+>    (pre-format the hex separately).
+> 10. ⚠️ **Nix landmine (bit us for ~15 min):** `nix build .` copies the **git tree** — HEAD plus the
+>     *tracked*-dirty diff — so **untracked files are invisible to the build**. Symptom: the file is
+>     plainly there in the editor, yet the build dies with
+>     `Syntax Error: Path does not exist: ./terminal`, and the drv hash does not even change.
+>     **`git add` new source files before `nix build`.** `lib.cleanSourceWith` cannot fix this: the
+>     flake-self copy happens before our filter runs. (Same family as Phase 0's "fileset needs git-tracked
+>     files" note.)
+> 11. `odin build <some-package-dir>` fails with "Undefined entry point procedure 'main'" and this Odin has
+>     **no `-build-library`** flag — build the whole `src` (or use `odin check`).
+> 12. Step 6 is **enforced, not remembered**: `handoff_run` calls the installed `full_repaint` hook
+>     itself, so a caller cannot forget it. `FRAMES_PAINTED` counts the calls, which is how the test
+>     distinguishes "the rule is enforced" from "the rule is documented".
 
 **Create:** `src/terminal/handoff.odin`
 
