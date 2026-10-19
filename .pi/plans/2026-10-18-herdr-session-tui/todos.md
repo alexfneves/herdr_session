@@ -392,6 +392,40 @@ Set child `cwd` explicitly to `$HOME` — a created session's `identity_cwd` is 
 
 ### T2.1 — `measure_text` backed by `tb_wcwidth`
 
+> **STATUS: ✅ DONE (2026-10-19) — `src/render/measure.odin`.** 13 assertions in
+> `BIN=… ./dev/render-smoke.sh` (case `measure`), **13 PASS / 0 FAIL**. Display
+> columns, not bytes, not runes:
+> ```
+> "hello"        5 bytes,  5 runes ->  5 columns
+> "hello world" 11 bytes, 11 runes -> 11 columns
+> "世界"          6 bytes,  2 runes ->  4 columns   (East Asian Wide)
+> "中a文b"       8 bytes,  4 runes ->  6 columns   (mixed)
+> "é" (e+U+0301) 3 bytes, 2 runes ->  1 column    (combining mark is zero-width)
+> "é̂n" (+U+0302) 6 bytes, 4 runes ->  2 columns   (stacking marks)
+> "😀"           4 bytes,  1 rune  ->  2 columns   (emoji presentation)
+> "a😀b"         6 bytes,  2 runes ->  4 columns
+> ""             0 bytes,  0 runes ->  0 columns
+> height == 1 cell per line;  glyph_columns == tb_wcwidth on all 22 sampled runes
+> ```
+> **Key decisions / gotchas:**
+> 1. **1 Clay unit == 1 terminal cell.** `SetLayoutDimensions(cols, rows)` plus a
+>    measurement fn that answers in columns/lines, so Clay's float boxes land on
+>    the cell grid and the renderer only rounds, never scales.
+> 2. **Height must be exactly 1.** Clay multiplies our height by its own wrapped-line
+>    count (`Clay__CalculateWrappedText`); returning anything else inflates every
+>    line of text in the layout.
+> 3. Width is the **widest line**, not the total, so a multi-line slice doesn't
+>    measure as all its lines laid end to end.
+> 4. Width comes from `tb_wcwidth` — the *same table* `tb_present()` lays glyphs
+>    out with. Measuring with anything else is how columns drift.
+> 5. `proc "c"` here must be allocation-free: `utf8.decode_rune` + the helpers are
+>    marked `proc "contextless"`, which makes the compiler reject any accidental
+>    context/allocator use.
+> 6. Combining marks measure 0 and are **not drawable** (termbox2 built without
+>    `TB_OPT_EGC`); the renderer drops them, which keeps column arithmetic honest.
+
+**Original task text (kept for reference):**
+
 **Create:** `src/render/measure.odin`
 
 ```odin
@@ -418,6 +452,73 @@ Note `proc "c"` has **no Odin context** → no allocation inside. Decode-only, n
 
 ### T2.2 — Clay render-command → `tb_set_cell`
 
+> **STATUS: ✅ DONE (2026-10-19) — `src/render/renderer.odin`.** 26 cell-level
+> assertions + 11 wire-level assertions in `dev/render-smoke.sh` (cases `render`,
+> `clip`), **37 PASS / 0 FAIL**. The driver reads termbox's **back buffer** back
+> with `tb_get_cell(x, y, back=1, ..)` and asserts glyph + fg + bg against the
+> geometry *Clay itself reported*.
+> ```
+> ┌──────────────────────────────────────────┐
+> │HEADER                                    │   left at Clay's (1,1)
+> │                                          │
+> │──────────────────────────────────────────│   betweenChildren rule
+> │              Body 中 😀 mix               │   centred + wide glyphs
+> │                                          │
+> │──────────────────────────────────────────│   betweenChildren rule
+> │                                    FOOTER│   right-aligned
+> └──────────────────────────────────────────┘
+> border sides top=42/42 bottom=42/42 left=10/10 right=10/10
+> clay centred x=15==want 15; right-aligned x=37==want 37
+> wide glyph claimed its trailing cell (col 21, 25) with the glyph's own fg/bg; stats.claimed=3
+> scissor: 75-col text in a 14-col box -> 0/318 cells painted past the right edge,
+>          0/4440 painted below, col 13 painted / col 14 untouched
+> wire: 38;2;255;60;60 · 38;2;220;220;220 · 38;2;60;200;120 · 48;2;16;20;28 and
+>       NO 38;5; indexed-colour fallback anywhere in the pty typescript
+> ```
+> **Key discoveries — these were not predictable from the header:**
+> 1. ⚠️ **`betweenChildren` is not geometry.** `BorderRenderData.width.betweenChildren`
+>    only says a container *has* dividers. Clay emits each divider **later**, as its
+>    own thin `Rectangle` command carrying the border's colour (clay.h:2852-2890).
+>    So the Border handler registers a `Rule_Source{attr, thickness, interior}` and
+>    the Rectangle handler recognises the thin rect and draws a ruled glyph instead
+>    of a solid band. Dumping the stream first is what made this visible:
+>    `Border (…) betweenChildren=1` then `Rectangle (0,3) 44x1`, `Rectangle (0,6) 44x1`.
+> 2. ⚠️ **Those divider rectangles span the container's full width and erase the
+>    border's own `│` glyphs.** Found by rendering: left/right sides came back
+>    `─` at every divider row. Fix: `Rule_Source.interior` = the container box
+>    inset by its own border lines, and the divider is clipped to it.
+> 3. ⚠️ **`childGap` must be >= 2 for a 1-cell `betweenChildren` rule to land in
+>    the gap.** With `childGap = 1` the rule lands on the *following child's row*
+>    and paints over its text (observed: children at rows 0/2/4, dividers at 2/4).
+>    The frame in Phase 5 must use `childGap >= 2`.
+> 4. ⚠️ **`TextElementConfig.textAlignment` alone does not move x** — a TEXT
+>    element fits its content, so there is nothing to align within. Alignment in a
+>    cell grid comes from the **parent's `childAlignment`**, which then bakes a
+>    *fractional* x (10.5, 14.5) into the command. One `round_cell`
+>    (`floor(x+0.5)`) is used everywhere, or borders and text disagree about cell
+>    boundaries.
+> 5. **`Clay_Color` is 0..255 on all four channels, alpha included** (upstream
+>    examples pass `a = 255`). Normalising to 0..1 paints the whole UI black.
+> 6. **termbox2 truecolour: an attr with low-24-bits == 0 and no `TB_HI_BLACK`
+>    means "terminal default"** (termbox2.h:3883). So literal black needs
+>    `TB_HI_BLACK` or it silently renders as the default colour.
+> 7. **`tb_clear()` fills cells with `' '` (0x20) and the current clear attrs, not
+>    NUL** (termbox2.h:4113-4121). "Untouched cell" therefore cannot be tested as
+>    `ch == 0`; the probe sets `tb_set_clear_attrs(sentinel_fg, sentinel_bg)` and
+>    compares attrs.
+> 8. **The scissor is one funnel.** Every write goes through `paint()`, which
+>    enforces the clip; `ScissorStart/End` push/pop an intersected rect. Wide
+>    glyphs may not straddle the clip's right edge (`col+width > clip.x+clip.w`).
+> 9. Dispatch is a **total switch** (all ten command types listed, including the
+>    explicit no-ops for `Image`/`OverlayColor*`/`Custom`/`None`), each with a
+>    reason in the code, so a future Clay that adds a type fails the build instead
+>    of dropping commands silently.
+> 10. Overlay blending is **deliberately not implemented yet** (counted in
+>    `stats.overlays`): hover/selection tinting is Phase 5's policy call, and the
+>    place it lands is `paint()`, the same funnel.
+
+**Original task text (kept for reference):**
+
 **Create:** `src/render/renderer.odin`
 
 **Must handle these command types — a `#partial switch` that silently ignores the rest is anti-pattern
@@ -443,6 +544,47 @@ renders the ruled lines described in the spec. *ISC-1* visually.
 ---
 
 ### T2.3 — Install a real Clay error handler
+
+> **STATUS: ✅ DONE (2026-10-19) — implemented in `src/render/errors.odin`**
+> (the plan named this `clay_error.odin`; it lives in `errors.odin` beside the
+> rest of the render layer, so the "error" surface of `package render` is one
+> file — rename only if that ever hurts). 13 assertions in `dev/render-smoke.sh`
+> (case `clay-error`), **13 PASS / 0 FAIL**.
+> ```
+> before the frame                     total=0
+> duplicate sibling id (clay.ID("dup-id") declared twice)
+>   -> reported: "An element with this ID was already previously declared during this layout."
+>      len=75, retained=2, kind=DuplicateId (mapped from ordinal 4)
+> oversized message (672 bytes)        -> truncated to 211 <= cap 224, truncated=true, still readable
+> unmapped ordinal (200)               -> kind=UnknownError  (degrades, does not mislabel or trap)
+> unbalanced open (2x OpenElement, 0x CloseElement)
+>   -> "There were still open layout elements when EndLayout was called…"  kind=UnbalancedOpenClose
+> 40 further duplicate frames          -> retained=8 (window is 8), total=81, dropped=73
+> ```
+> **Key decisions / gotchas:**
+> 1. **Clay's default handler is literally `(void) errorText;`** — every layout bug
+>    is silently discarded. Installing ours is the whole point of this task.
+> 2. **`proc "c"` = no Odin context = no allocator.** The handler composes
+>    `"Kind: message"` byte-by-byte into a **static** fixed-size store and returns;
+>    it is marked `proc "contextless"` so the compiler rejects any accidental
+>    allocation/formatting. Draining (`errors_latest`, `errors_records`,
+>    `errors_messages`) hands back *views* of that buffer — also allocation-free.
+> 3. ⚠️ **`clay.odin`'s `ErrorType` enum is missing `clay.h`'s 10th member**
+>    `CLAY_ERROR_TYPE_HASH_MAP_CAPACITY_EXCEEDED`. Switching on the *enum* would
+>    mean handling a value the binding cannot name, so we keep the raw ordinal and
+>    switch on `int` — unmapped values degrade to `UnknownError`.
+> 4. **Retention is a bounded shift-left window** (`ERROR_RING_CAPACITY = 8`) with
+>    `total`/`dropped` counters, so an error storm cannot grow memory *and* loss is
+>    visible. (Bug caught while testing this: the shift forgot to decrement
+>    `filled`, so the first eviction indexed past the array — now covered by the
+>    "40 more frames" assertion.)
+> 5. The store is `offset`/`length` based rather than holding string views, so
+>    shifting records by value can never dangle.
+> 6. **The unbalanced-open case needs TWO opens**: `Clay_EndLayout` closes one
+>    element itself before checking `openLayoutElementStack.length > 1`
+>    (clay.h:4448-4457), so a single leaked `OpenElement` is silently absorbed.
+
+**Original task text (kept for reference):**
 
 **Create:** `src/render/clay_error.odin`
 

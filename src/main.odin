@@ -2,6 +2,9 @@ package main
 
 // PHASE 1 DRIVER — terminal binding + handoff smoke test.
 //
+// Phase 2's Clay->cell renderer cases live in `render_cases.odin` (same package);
+// this file keeps the Phase 1 cases and the shared report plumbing.
+//
 // Its purpose is to retire plan risk A1 (`tb_shutdown()` → child → `tb_init()` is
 // a clean handoff, verified by reading source but never *run*) with a dummy child,
 // long before herdr is anywhere involved. The real poll loop replaces this file in
@@ -290,12 +293,17 @@ home_dir :: proc() -> string {
 // ---------------------------------------------------------------------------
 
 usage :: proc() {
-	fmt.eprintln(`herdr-session (Phase 1 smoke driver)
-  probe
-  double
-  handoff
-  child <cwd> <argv...>
-  sig-term`)
+	fmt.eprintln(`herdr-session smoke driver
+  probe                       termbox2 + clay ABI (safe with no tty)
+  double                      two init/shutdown round-trips
+  handoff                     leave -> child -> re-enter, repaint + input survive
+  child <cwd> <argv...>       generic handoff with any child
+  sig-term                    park in the alt screen for a SIGTERM
+  measure                     Clay measure_text in display columns
+  render                      Clay commands -> cells: border, rule, alignment, colour
+  clip                        scissor containment
+  clay-error                  duplicate id survives the C frame
+  layout-dump                 the raw render command stream`)
 }
 
 main :: proc() {
@@ -315,6 +323,11 @@ main :: proc() {
 	case "double":   ok = case_double()
 	case "handoff":  ok = case_handoff()
 	case "sig-term": ok = case_sig_term()
+	case "measure":    ok = case_measure()
+	case "render":     ok = case_render()
+	case "clip":       ok = case_clip()
+	case "clay-error": ok = case_clay_error()
+	case "layout-dump": ok = case_layout_dump()
 	case "child":
 		if len(args) < 4 {
 			usage()
