@@ -42,6 +42,7 @@ remembering host strings or shell incantations.
 | **D11** | New-session naming | Keep `herdr-cycle`'s exact `%Y-%m-%d-%H-%M-%S-%3N`; regenerate on collision (colons are illegal in herdr names). |
 | **D12** | `default` session | **Never** listed, attached or deleted (herdr refuses to delete it anyway). |
 | **D13** | Config format | **JSON via `core:encoding/json`** — removes the TOML dependency entirely. File: **`~/.config/herdr_session.json`** (spec literally said `.toml`; renamed by this decision). |
+| **D14** | Outer border | **REMOVED (RCH-1, user request 2026-10-19 — see `50-requirement-changes.md`).** The app is bounded only by the terminal edges. `BorderAll(1)` on the root is gone — the root carries `border.width = BorderWidth{betweenChildren = 1}` and nothing else, so Clay emits exactly the two dividers (Header\|Main, Main\|Footer) and no box. `FRAME_PAD` dropped `1 → 0` with it: that padding *was* the border allowance, and the freed 2×2 now belongs to the content. `childGap ≥ 2` is unchanged — removing the border does not relax it. |
 
 **Effort level: MVP + targeted hardening.** Hardened now = where being wrong is irreversible or invisible
 until it bites. Held at MVP = cheap to improve later.

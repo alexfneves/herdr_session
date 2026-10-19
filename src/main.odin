@@ -38,8 +38,16 @@ import "core:sys/posix"
 report     : [dynamic]string
 any_failed : bool
 
+// say streams immediately as well as recording. Buffering the whole report and
+// printing it at exit means a mid-case crash swallows every assertion — including
+// the ones that passed, which is exactly the evidence you need to find the crash.
 say :: proc(msg: string) {
+	if len(report) == 0 {
+		fmt.println("")
+		fmt.println("=== herdr-session smoke report ===")
+	}
 	append(&report, msg)
+	fmt.println(msg)
 }
 
 check :: proc(name: string, cond: bool, detail: string) {
@@ -49,12 +57,8 @@ check :: proc(name: string, cond: bool, detail: string) {
 	if !cond { any_failed = true }
 }
 
+// The lines are already on stdout (see say); only the verdict is printed here.
 print_report :: proc() {
-	fmt.println("")
-	fmt.println("=== herdr-session smoke report ===")
-	for line in report {
-		fmt.println(line)
-	}
 	if any_failed {
 		fmt.println("=== RESULT: FAIL ===")
 	} else {
@@ -308,7 +312,13 @@ usage :: proc() {
   render                      Clay commands -> cells: border, rule, alignment, colour
   clip                        scissor containment
   clay-error                  duplicate id survives the C frame
-  layout-dump                 the raw render command stream`)
+  layout-dump                 the raw render command stream
+  ui-frame        T5.1 spine: border, section rules, title, footer geometry
+  ui-sessions     T5.2 four fixed columns, live filter, selection, ordering
+  ui-shrink       T5.2 real resize re-clamps the selection
+  ui-edit         T5.3 caret is a display column; CJK/emoji typed + pasted
+  ui-list         T5.3 one filtered list for both pickers
+  ui-float        T5.3 floating error pane, Enter/Esc dismiss`)
 }
 
 main :: proc() {
@@ -337,6 +347,12 @@ main :: proc() {
 	case "clip":       ok = case_clip()
 	case "clay-error": ok = case_clay_error()
 	case "layout-dump": ok = case_layout_dump()
+	case "ui-frame":    ok = case_ui_frame()
+	case "ui-sessions": ok = case_ui_sessions()
+	case "ui-shrink":   ok = case_ui_shrink()
+	case "ui-edit":     ok = case_ui_edit()
+	case "ui-list":     ok = case_ui_list()
+	case "ui-float":    ok = case_ui_float()
 	case "child":
 		if len(args) < 4 {
 			usage()

@@ -1002,7 +1002,7 @@ selection never stores a row index.
 
 ---
 
-### T5.1 — Frame: Header / Main / Footer with ruled borders
+### T5.1 — Frame: Header / Main / Footer with ruled borders — ✅ DONE (RCH-1 applied: no outer border)
 
 **Create:** `src/ui/frame.odin`
 
@@ -1017,11 +1017,43 @@ selection never stores a row index.
 // no backgroundColor.alpha used as a pane-id tag (main.odin:768) — use
 // clay.GetElementData(id).boundingBox for geometry.
 ```
-**Acceptance:** the spec's ASCII layout reproduced: outer border + a rule between each section.
+**Acceptance (amended by RCH-1 / D14):** **no outer border**; a rule between Header/Main and between
+Main/Footer. The first and last row/column must contain **no** box-drawing glyphs.
+
+✅ DONE — `src/ui/frame.odin`, **14 checks green** in `./dev/ui-smoke.sh` (`ui-frame`), every
+assertion read out of real termbox cells inside a pty:
+
+| Evidence | Result |
+|---|---|
+| Perimeter (row 0, row rows-1, col 0, col cols-1) | **0** box-drawing glyphs — RCH-1 holds |
+| Divider Header\|Main | row 2, spans **all 120** columns |
+| Divider Main\|Footer | row 38, spans **all 120** columns |
+| Rule rows free of content | yes → **childGap ≥ 2 invariant** holds by construction |
+| Predicted geometry vs Clay's own record | `clay=(0,3,120x34) predicted=(0,3,120x34)` |
+| Dividers from Clay's command stream | `rules=2`, exactly `borders=1` (the betweenChildren registration) |
+| Palette opacity | every colour `alpha == 255` → alpha is never an identity tag |
+
+**Traps found here (each cost a real debugging cycle):**
+1. **Odin procedure literals capture nothing.** A `frame_paint(body: proc())` spine could not see the
+   caller's view state (`Undeclared name: v`). The frame is therefore an explicit **`frame_open` /
+   `frame_close`** pair with the caller painting MAIN in between.
+2. **`string(dyn[:])` shares the buffer.** Freeing the dynamic array right after converting left the
+   returned string dangling — it rendered as `]��^���1` mojibake at the start of every line, not at the
+   end, which made it look like a painting bug rather than a lifetime bug.
+3. **A pty eats input written at t=0.** termbox consumes whatever is pending during `tb_init` as terminal
+   identification responses, so keystrokes must be delayed by the harness (`{ sleep 1; printf … }`) and
+   the reader must tolerate seconds of silence — otherwise a whole case reads **0 keys** and every typed
+   assertion fails at once.
+4. **Buffered reports swallow the evidence on a crash.** `say` used to append only; the report is now
+   streamed so a mid-case panic still shows which assertions passed. Without this, a crash looked like a
+   case that never ran.
+5. **`fmt` has no `{:02}`.** Zero-padding the session-name timestamp needs an explicit helper, or the
+   name silently becomes `…%!(NO VERB)…`, which then fails `ts_from_name` and paints the whole table as
+   `—`.
 
 ---
 
-### T5.2 — Sessions view: filter line + scrollable table
+### T5.2 — Sessions view: filter line + scrollable table — ✅ DONE
 
 **Create:** `src/ui/sessions.odin`
 
@@ -1031,12 +1063,31 @@ column, truncation applied by **us** (Clay's `textAlignment` does not truncate).
 (keyboard-driven; pixel offsets are meaningless at cell granularity).
 Selection highlight = draw from app state at render time.
 
+✅ DONE — `src/ui/sessions.odin`, **16 checks green** (`ui-sessions`) + **12** (`ui-shrink`):
+
+- four **fixed** columns (`device 12 / timestamp 23 / state 8 / name rest`), each cell read back at its
+  predicted display column; the widths add up inside the interior
+- filter starts empty and narrows **live, typed through the pty** — 7 rows → 1 row on `api`, and every
+  row still visible contains the filter (a helper names the row that leaked through, rather than
+  reporting a bare `false`)
+- **every displayed row mirrors the model row at the same index**, built through the same `ellipsize`
+  the view uses; the fixture is deliberately scrambled so an unsorted view fails rather than gets lucky
+- selection highlight = the app's accent on the selected row **only**, resolved from the
+  `(device, name)` identity
+- **real shrink** (`TIOCSWINSZ` on our own tty → `SIGWINCH` → termbox resize): selection survives at the
+  same index, stays visible, scroll re-clamped, verified again after a second, brutal shrink to 12 rows
+- a held identity against a row set that no longer contains it resolves to **`-1`**, never to a
+  stand-in neighbour
+
+**Trap:** counting "populated rows" by reading whole screen lines counts the **frame** too — every row
+looked populated. Row emptiness must be judged on the *interior* columns only.
+
 **Acceptance:** filter starts empty and filters rows live; scroll keeps the selection on screen; on
 shrink the selection is re-clamped and never lost.
 
 ---
 
-### T5.3 — Single edit + Filtered list + floating error pane
+### T5.3 — Single edit + Filtered list + floating error pane — ✅ DONE
 
 **Create:** `src/ui/edit.odin`, `src/ui/list.odin`, `src/ui/float.odin`
 
@@ -1047,6 +1098,25 @@ shrink the selection is re-clamped and never lost.
   chars filter, `Enter` selects (no selection → **no-op**, per spec).
 - **float**: `floating = clay.FloatingElementConfig{ attachTo = .Root, zIndex = N }` for the error pane.
   Dismissed by `Enter`/`Esc`.
+
+✅ DONE — `src/ui/edit.odin`, `src/ui/list.odin`, `src/ui/float.odin`, **20 + 17 + 11 checks green**
+(`ui-edit`, `ui-list`, `ui-float`):
+
+- `"a世b😀c"` typed **through the pty** (5 `tb_event`s, `ch` = 97/19990/98/128512/99): caret lands on
+  the **derived display column** (7), the bytes-vs-cells gap is real (10 bytes vs 7 cells), and walking
+  the painted cells from the field start reaches the caret with **zero drift**
+- whole-rune backspace removes a 4-byte emoji and a 3-byte CJK rune in one go, leaving **no stray
+  continuation byte**
+- paste sanitiser drops **whole escape sequences**, not just the ESC byte — leaving `[200~` behind reads
+  as user content — plus control chars and NUL: `hi\x1b[200~世\t\r\n\x07😀\x7f\x00` → `hi世😀` (6 cells)
+- narrow-window editing scrolls so the caret stays inside, and the visible slice never exceeds the window
+- **one list serves both pickers** (`picker_rows` over `[]string` for themes and `[]app.Remote` for
+  remotes); down/tab share one movement op, typed chars filter live, `Enter` with no selection is a
+  **no-op**, an empty list prints "nothing matches" instead of a phantom row, and when the held row is
+  filtered out the selection is **dropped, not moved onto a neighbour**
+- the error pane **floats over the table** (its rows differ from the no-pane snapshot while the rows
+  above it are byte-identical — it moved nothing), is **centred on the root** (inset 38 = inset 38),
+  border drawn in the error colour, and **Enter/Esc** (typed into the pty) dismiss it completely
 
 **Acceptance:** typing/pasting CJK and emoji never desyncs the column layout.
 
@@ -1262,7 +1332,8 @@ T0.1 → T0.2                    ← toolchain risk retired; `nix run .` works  
   → T2.1 → T2.2 → T2.3         ← renderer                                      ✅
   → T3.1 → T3.2 → T3.3 → T3.4 ← herdr integration                             ✅
   → T4.1 → T4.2                ← parallel fan-out (no threads)                 ✅
-  → T5.1 → T5.2 → T5.3 → T5.4 → T5.5    ← next
+  → T5.1 → T5.2 → T5.3         ← views + frame (RCH-1 applied: no outer border) ✅
+  → T5.4 → T5.5                ← next
   → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6
 ```
 `nix build` must stay green at every arrow. **Do not reorder T1.2 later** — it is the assumption the whole

@@ -411,3 +411,118 @@ silent. The local deadline is a tight 5 s because a local list measures ~1.5 ms.
   one device's row group (pure data), `apply` = record the host's status and merge rows
   only when the status is `.ok`. Splitting them is what makes "a failed host contributes
   zero rows but keeps its verdict" a single obvious code path instead of a flag.
+
+### Phase 4 — T4.1 + T4.2 — ✅ PASSED (339 PASS / 0 FAIL, fixture-armed, fresh build)
+Commits `9d2c185` (code) + `528a362` (sequencing map).
+
+**⚠️ My own verification error, recorded so it isn't repeated.** My first Phase 4 run reported
+`fetch-unit: 0 PASS — nothing ran` + `13 malformed format expansions` → **3 FAIL**. I started
+investigating it as a product defect and found `main.odin` *did* dispatch `fetch-unit`. The real cause:
+**`app-smoke.sh` was pointing at a stale `result` symlink left over from the Phase 2 build**, which
+predated the fetch dispatch entirely, so it printed usage and exited 2.
+Running the subcommand directly worked; after `nix build .`, the whole suite went green.
+**Discipline added: always `nix build .` (or `dev/local-build.sh`) immediately before any smoke run,
+and pass `BIN=` explicitly.** A stale `result` produces *confident-looking false failures.*
+
+**The concurrency proof is the best-designed check in the project so far** — it includes its own control:
+
+| Arm | Wall | Children sum | Ratio | What it shows |
+|---|---|---|---|---|
+| Serialized (control) | 453 ms | 453 ms | **1.00** | the metric is honest — serial *is* the sum |
+| Fan-out | **238 ms** | 342 ms | **0.70** | bounded by the **slowest child**, not their count |
+
+Without the control arm, a 0.70 ratio would be meaningless. Worth copying that pattern.
+
+Other Phase 4 evidence: zero zombie children (settled=3, kills=1); `FETCH_DEADLINE (13 s)` sits deliberately
+**above** ssh's `ConnectTimeout (5 s)` so ssh reports first but we can never hang; the fetch argv is
+asserted to be exactly `ssh -T -o BatchMode=yes -o ConnectTimeout=5 <host> herdr session list --json`
+including a negative assertion that it is **never `-tt`**; `no_herdr` (127) distinguished from
+`unreachable`; a vanished identity resolves to `-1` **rather than a stand-in index**, so a stale selection
+can never silently act on the wrong row.
+
+Regressions re-run on the same fresh binary: handoff **28 PASS**, render **69 PASS**.
+
+### Note on the truncated worker report
+The Phase 4 worker returned a cut-off message (ending on a `ps`/`awk` self-match note) with no summary.
+Rather than assume success or failure from that, I verified the tree, the dispatch, and re-ran every suite.
+Two of the three reported-looking problems were environmental (my stale binary). Lesson: **a truncated or
+ambiguous worker report is a reason to verify harder, not to accept or reject early.**
+
+---
+
+## Phase 5a — T5.1 + T5.2 + T5.3 — ✅ DONE (90 UI checks / 6 pty cases, 0 regressions)
+
+Files added: `src/ui/frame.odin`, `src/ui/sessions.odin`, `src/ui/edit.odin`,
+`src/ui/list.odin`, `src/ui/float.odin`, `src/ui_cases.odin`, `dev/ui-smoke.sh`.
+**T5.4 / T5.5 deliberately not started** — this slice is views + harness only.
+
+**RCH-1 applied mid-slice.** `50-requirement-changes.md` (untracked, "read this before touching any UI
+code") removes the outer border. My first working frame had a full box and a *passing* 18-check suite
+asserting its corners — the requirement changed underneath it. The border was deleted rather than
+recoloured (`BorderWidth{betweenChildren = 1}` only) and `FRAME_PAD` went `1 → 0` because that padding
+was the border allowance. The suite was then **inverted**: the perimeter must hold **zero** box glyphs,
+and the two dividers must span the **full** width. Folded into `plan.md` as **D14**.
+Lesson: the requirement-changes file is part of the spec's source of truth; check it *before* the first
+build, not after the first green suite.
+
+### Suite totals on one fresh `nix build` binary (`./result/bin/herdr-session`)
+
+| Suite | Result |
+|---|---|
+| `dev/ui-smoke.sh` | **6/6 cases green — 90 checks** (frame 14, sessions 16, shrink 12, edit 20, list 17, float 11) |
+| `dev/app-smoke.sh` | **272 PASS / 0 FAIL** (session list byte-identical before/after) |
+| `dev/render-smoke.sh` | **69 PASS / 0 FAIL** |
+| `dev/handoff-smoke.sh` | **28 PASS / 0 FAIL** |
+| `nix build .` / `nix run .` | green / exit 0 |
+| `grep -rn 'localhost' src/` | **0 hits** |
+
+`app-smoke` reads **272** here vs **339** logged in Phase 4 — the total includes live-herdr sections
+that scale with whatever sessions exist in the daemon at run time. **0 FAIL** is the invariant; the
+absolute number is environmental. Both figures came from `BIN=` pointed at a fresh build.
+
+### Traps (each cost real time; all now encoded in the code or the suite)
+
+1. **Odin procedure literals capture nothing.** `frame_paint(p, f, body: proc())` cannot see the
+   caller's `v`/`pal`/`ordered` — `Undeclared name`. The spine is `frame_open` / `frame_close` with the
+   caller painting MAIN between them, and the smoke driver keeps one module-level `Scene`.
+2. **`string(dyn[:])` aliases the buffer.** Converting then `delete`-ing the dynamic array left the
+   string dangling. Symptom was confusing: mojibake at the **start** of every line, which reads like a
+   painting bug rather than a lifetime bug.
+3. **A pty eats keystrokes written at t=0.** termbox consumes pending input during `tb_init` as terminal
+   identification responses. Harness must `{ sleep 1; printf … }` and the reader must ride out seconds of
+   silence (`FEED_QUIET_POLLS = 40 × 100 ms`). Symptom: **0 keys read**, every typed assertion failing
+   at once, with the app otherwise perfect.
+4. **A buffered report erases the evidence on crash.** `say` only appended and `print_report` flushed at
+   exit, so a mid-case panic printed nothing — indistinguishable from "the case never ran". Now `say`
+   streams and the report holds only the verdict.
+5. **`fmt` has no `{:02}`.** The name timestamp needs an explicit pad helper; unformatted it becomes
+   `%!(NO VERB)`, `ts_from_name` fails, and the whole timestamp column renders `—`.
+6. **Counting whole screen lines counts the frame.** "Is this table row populated" must be judged on the
+   **interior** columns; with a border every line looked populated (30 populated rows for 7 sessions).
+7. **Truncation must be asserted through the *same* helper the view uses.** Comparing displayed cells to
+   `fit_cols` output failed against the view's `ellipsize` output (`alpha.exampl` vs `alpha.examp…`).
+   Mirror the view's own function or the check tests the wrong thing.
+8. **A single `feed` consumes the whole piped script.** The UI cases assumed arrows and typed characters
+   would arrive in separate reads; they arrive together, so state assertions have to be written against
+   the *end* of the burst (filter `"to"`, `sel` re-placed by identity), not against an imagined step.
+9. **`odin build ./src/ui` fails with `Undefined entry point 'main'`** — a non-main package can't be
+   built standalone here. Use `dev/local-build.sh` / `nix build`, never a per-directory build.
+10. **The nix source only carries git-tracked files.** `nix build` couldn't see `src/ui/` until the new
+    files were `git add`ed — a missing-file error in the derivation, not a compile error in the code.
+11. **A missing `x += 1` in a manual index loop** produced `Index 4800 is out of range 0..<4800` at the
+    line *after* the write. Reproduced minimally before touching anything: worth remembering that Odin's
+    bounds-panic line can point one statement past the real mistake.
+
+### Design points worth keeping
+
+- **One scroll helper** (`keep_visible`) drives both the sessions table and the picker, so the shrink /
+  selection-visibility rule cannot drift between two lists.
+- **Selection is an identity, never an index**, end to end: `app.selection_of` → highlight at render
+  time → `-1` when the row is gone. The list picker's "held row filtered out → selection dropped, not
+  slid onto a neighbour" check is the strongest guard against acting on the wrong row that exists yet.
+- **The edit buffer is a fixed `[1024]u8`, not `[dynamic]byte`**, because a *range* `delete` on a
+  dynamic array segfaults this toolchain (verified with a minimal probe). The fixed buffer also gives a
+  hard input bound for free.
+- **Assertions read cells, not strings.** Every UI claim in this slice is `cell_at(x, y)` /
+  `glyph_at(x, y)` / `line_of(y, w)` against the real back buffer after `tb_present`, with failures
+  reporting the offending coordinate and glyph name.
