@@ -5,7 +5,7 @@ and `plan.md` where they conflict.
 
 ---
 
-## RCH-1 — No outer border around the application (user, 2026-10-19)
+## RCH-1 — No outer border around the application (user, 2026-10-19) — ✅ APPLIED (D14, commit c087c01)
 
 > *"i want to remove the border around the application. i still want a division between the
 > header, main content and footer"*

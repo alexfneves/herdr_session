@@ -526,3 +526,50 @@ absolute number is environmental. Both figures came from `BIN=` pointed at a fre
 - **Assertions read cells, not strings.** Every UI claim in this slice is `cell_at(x, y)` /
   `glyph_at(x, y)` / `line_of(y, w)` against the real back buffer after `tb_present`, with failures
   reporting the offending coordinate and glyph name.
+
+### Phase 5a — T5.1 + T5.2 + T5.3 — ✅ PASSED
+Commit `c087c01`. Fresh-build results taken by the orchestrator:
+
+| Suite | Result |
+|---|---|
+| `app-smoke.sh` (fixture-armed) | **339 PASS / 0 FAIL** — per-section 133 / 59 / 67 / 54, **identical to Phase 4** |
+| `ui-smoke.sh` | **6/6 cases, 90 checks** (frame 14, sessions 16, shrink 12, edit 20, list 17, float 11) |
+| `render-smoke.sh` | **69 PASS / 0 FAIL** |
+| `handoff-smoke.sh` | **28 PASS / 0 FAIL** |
+| hygiene | no committed binaries · `grep -rn localhost src/` empty · herdr session list unchanged |
+
+**The 339-vs-272 discrepancy was resolved in the worker's favour.** The worker reported 272 and explained
+it as environmental; I did **not** take that at face value and diffed per-section against the saved Phase 4
+log — my run reproduced **339 exactly** (133/59/67/54). No regression; the worker's environment simply
+counted differently. *Instructive: "environmental" is a claim that must be checked, not accepted.*
+
+### RCH-1 (no outer border) — ✅ APPLIED AND INDEPENDENTLY CONFIRMED
+Folded into `plan.md` as **D14**. I verified from the **raw ANSI byte stream**, not just the assertions:
+
+```
+row  1  herdr-session                          <- no corners, no box
+row  2  (blank gap — childGap reservation)
+row  3  120 x '─'                             <- Header|Main divider, full width
+rows 4-38  filter: + caret, column headers, rows
+row 39  120 x '─'                             <- Main|Footer divider, full width
+row 40  select enter new  r remote  d delete  a attach  t theme  q quit
+```
+**Zero `│` vertical glyphs, zero corner glyphs anywhere.** Both dividers survive; the box is gone.
+
+Also held under the change:
+- *"both rule rows are pure rule"* → the **`childGap ≥ 2` invariant survived** removing the outer border.
+- Predicted MAIN box == Clay's actual **`(0,3,120x34)`** — the freed 2×2 was correctly returned to content.
+- *"every palette colour is fully opaque (alpha is not an identity tag)"* — ISC-A-8 still holds.
+
+**Worth noting how this landed:** the worker discovered `50-requirement-changes.md` on its own, recognised
+its own suite was asserting a requirement that had just been withdrawn (a full box with **passing corner
+assertions**), and inverted the assertions rather than leaving a green-but-wrong test. That is the behaviour
+you want from an autonomous worker and is recorded here deliberately.
+
+### Phase 5a traps recorded (11 in todos.md) — the three expensive ones
+1. **Odin procedure literals capture nothing** — killed the `frame_paint(body: proc())` design →
+   `frame_open` / `frame_close` split.
+2. **A pty eats keystrokes written at t=0** — termbox consumes pending input during `tb_init` (terminal
+   identification responses). Symptom was *every* typed assertion failing at once. Harness now delays input 1 s.
+3. **`string(dyn[:])` aliases the buffer** — dangling-read mojibake appeared at the *start* of each line and
+   looked like a painting bug rather than a lifetime bug.
