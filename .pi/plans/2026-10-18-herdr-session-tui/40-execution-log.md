@@ -573,3 +573,48 @@ you want from an autonomous worker and is recorded here deliberately.
    identification responses). Symptom was *every* typed assertion failing at once. Harness now delays input 1 s.
 3. **`string(dyn[:])` aliases the buffer** — dangling-read mojibake appeared at the *start* of each line and
    looked like a painting bug rather than a lifetime bug.
+
+### Phase 5b — T5.4 + T5.5 — ✅ PASSED (823 PASS / 0 FAIL)
+Commits `74634f9` (T5.4, 38 min) + `612db79` (T5.5, 157 min). **The split strategy worked** — the
+work that stalled for ~12h landed in under 3.5h total once the union question was pre-answered (O10) and
+the scope was halved.
+
+| Suite | Orchestrator-verified |
+|---|---|
+| `tui-smoke.sh` (fixture-armed) | **99 PASS / 0 FAIL** |
+| `state-smoke.sh` | **198 PASS / 0 FAIL** |
+| `app-smoke.sh` (fixture-armed) | **339 PASS / 0 FAIL** |
+| `ui-smoke.sh` | **90 checks / 6 of 6** |
+| `render-smoke.sh` | **69 PASS / 0 FAIL** |
+| `handoff-smoke.sh` | **28 PASS / 0 FAIL** |
+| **Total** | **823 PASS / 0 FAIL** |
+
+Key evidence: `nix run .` starts the TUI on a tty and exits **3** with one human line (no panic, no
+leaked escapes) when stdin is `/dev/null`. Trace shows `local_ms=1 first_paint_ms=5`, healthy remote
+`+157 ms`, black-hole host bounded at `+5016 ms` while keys stay answered. Terminal restore verified by
+reading `tcgetattr` back from the pty **slave** on Ctrl+C, SIGTERM→143 and post-round-trip.
+Guards prove a negative: `waitpid(-1,WNOHANG) = -1 (ECHILD)` after every refusal — nothing was forked.
+
+**Verified count nuance (recorded for honesty):** an *unarmed* `tui-smoke` run reports 75 PASS; the
+worker's 99 requires the fixture. Same as Phase 3 — always verify **armed**.
+
+### Cleanup investigation — a real leftover, and a clean bill of health
+A fixture-armed run left **`hs-t-guard-control` running** in `~/.config/herdr/sessions/` while the
+teardown reported `scratch sessions left = []`. I investigated rather than ignoring it:
+- The trap **does** remove every `hs-t-*`, and did remove this one on the next run — so the trap is sound.
+- The original leftover was left by an **interrupted run** (killed before its EXIT trap could fire).
+- I manually `stop` + `delete`d it and confirmed the list returned to exactly
+  `default, 2026-08-11-23-37-41-812, 2026-08-30-14-59-10-730`. Two further clean re-runs confirmed it.
+
+**Latent weakness worth hardening (non-blocking):** the drift check compares a `BEFORE` snapshot against
+`after`. A leftover that predates the run is absorbed into `BEFORE`, so it is **not** flagged as drift.
+The `hs-t-*` trap compensates, but a **hard-coded expected session set** would be strictly more robust.
+Flagged for T6.6.
+
+### T5.5's best bug story
+A fetch at **EOF is not a reaped fetch**: once both pipes drain, the fd leaves the poll set, but the child
+exits a moment later — so nothing can ever wake the loop for it. Measured: EOF at `+155 ms`, not settled
+until `+5014 ms`, released only when an unrelated host's ssh exited. Fixed by capping the poll sleep at
+`POLL_SLICE` while anything is unreaped (keeping `-1` only for an empty registry).
+**Notable: `HS_TUI_DEBUG` was removed deliberately because the bug vanished whenever it was watched** —
+a genuine Heisenbug, caught by timing rather than by logging.
