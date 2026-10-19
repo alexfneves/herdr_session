@@ -1122,7 +1122,7 @@ shrink the selection is re-clamped and never lost.
 
 ---
 
-### T5.4 — State machine returns Commands; it performs no side effects
+### T5.4 — State machine returns Commands; it performs no side effects — ✅ DONE
 
 **Create:** `src/app/state.odin`
 
@@ -1150,6 +1150,82 @@ name first, then the server** (2 steps) — `[s]`→`name_remote_named`, `Enter`
 `Enter`→`LaunchRemote`.
 
 **Acceptance:** scripted key-sequence test covering all 7 states + the `[s]` two-step. *ISC-3*.
+
+✅ DONE — `src/app/state.odin` (the machine) + `src/input/keymap.odin` (`tb_event`
+→ `Key`) + `src/state_cases.odin` (driver) + `dev/state-smoke.sh` (runner).
+**198 PASS / 0 FAIL** — `state-machine` 128 · `state-offline` 54 · 16 source-surface
+and safety greps — on a fresh `nix build .`, with every prior suite re-run against the
+same binary: **app 339 · ui 90 checks · render 69 · handoff 28**.
+
+| Definition of done | Captured evidence |
+|---|---|
+| **All 7 states reachable with the spec's exact keys** (ISC-3) | the runner prints the **full (state × key) matrix** (§2) and §3 asserts each reach: `[n]→name_local` `[r]→remote_server` `[s]→name_remote_named` `[a]→attach` `[d]→delete_session` `[t]→theme`, `mode_selection` is the start state, `{Error}` via a refused action |
+| **`[s]` two-step proven as a key sequence** | §4: `s` · type `api` · `Enter` → `name_remote_named` → `remote_server` with `carried_name="api"` · `down` · `Enter` → `launch_remote{device:"lab.example", name:"api-<ts>"}` (timestamp parses back via `ts_from_name` → D11 holds). Second run filters to the **mixed-case** target and asserts `cmd.device == "Deploy@lab.example"` byte-identical — no normalisation anywhere (ISC-4) |
+| **Empty field + `Enter` is a no-op** | §5: `cmd=none state=name_local (unchanged)`, also after type-then-erase, and the same rule in `name_remote_named` (`carried=""`) |
+| **No-selection `Enter` is a no-op** in the list states | §6: `remote_server` · `attach` · `delete_session` · `theme` all `none` + unchanged |
+| **`Ctrl+C` → quit from every state** (ISC-12) | §7: **8/8** states answer `quit`; the check sits **above** the per-state dispatch so no future state can swallow it. `0x03` arrives as data because `cfmakeraw` cleared `ISIG` (plan D8) |
+| **`Esc` returns to `mode_selection`, no timeout involved** (ISC-11) | §8: 7 states back to the root (the root itself quits). The surface greps prove the absence of a timeout: `core:time` / `sleep` / `peek_event` → **0 hits** in `state.odin`, and the keymap uses legacy `TB_KEY_ESC` — no Kitty protocol (ISC-A-4) |
+| **No Command ever targets `default`** (D12/ISC-18) | §10: **128** `(state × key)` probes run against a fixture that **contains** `default` → 0 offenders; aiming `attach`/`delete` at it yields `show_error` with **empty `name` and `device`**, and typing `default` as a new name is refused into `{Error}` |
+| **Offline: no side effects** | §12: `waitpid(-1, WNOHANG) = -1 errno=ECHILD` — the entire run created **no child process**. The whole battery re-runs under `env -i PATH=/nonexistent HERDR_ENV=1` (§2) and **passes with no herdr reachable**. `state.odin` imports exactly four things — `input`, `fmt`, `strings`, `unicode/utf8` — no `os`, no `posix`, no `net`, no `terminal`, no `clay`/`termbox`, no `open()/read()/write()` call shape |
+| **Hygiene** | `grep -rn 'localhost' src/` → empty · no committed binaries · the real herdr session list is byte-identical before/after (§4 of the runner) |
+
+**Design decisions made here (recorded because the spec is silent or ambiguous on each):**
+
+1. **Uniform clearing on the way back.** Leaving an *edit* state returns `clear_field`;
+   leaving a *filter* state returns `clear_filter`; `{Error}` returns `none` because it
+   owns neither. The spec names the clearing only for `{NameLocal}` / `{Attach}` /
+   `{Theme}` — implementing that asymmetry literally would leave every other edit or
+   filtered state holding stale text. Asserted per state in §8.
+2. **`name_remote_named` + empty field + `Enter` is a NO-OP.** The no-op rule is spelled
+   out only for `{NameLocal}`, but this is the *named* remote path: carrying nothing
+   forward would silently produce an unnamed session, which is `[r]`'s job.
+3. **In `{Mode selection}` the six mode keys are claimed first, and every *other*
+   printable character filters the Sessions table.** The spec binds six letters there
+   *and* asks for a filter line in the Sessions content; claiming only unclaimed
+   characters is the single reading where both exist.
+4. **The selection identity is invalidated when a re-filter drops the row — it never
+   slides onto a neighbour** (§9). `held` is what Commands are built from, so it has to
+   mean "a visible selection".
+5. **`Delete` keeps the user in `{Select session to delete}`** (the list refreshes under
+   them and they keep cleaning up); `launch` / `attach` / `set_theme` return to
+   `{Mode selection}`, matching the spec's "the TUI appears in the Mode selection".
+6. **`Command` is decision O10's tagged struct.** No `union` anywhere near it — the
+   runner greps `state.odin` for `union {` so that stays true.
+7. **The machine owns the filter/field TEXT**, not the views (per the task: *"mutation of
+   UI text fields happens here, external effects do not"*). The existing `ui` views keep
+   their own paint state; the cross-layer risk that the two filters disagree is pinned by
+   **§9b**, which asserts `app.machine_session_matches == ui.sessions_match` over every
+   fixture row × 12 filters (48 pairs, 0 mismatches).
+
+**Traps found here (each cost a real compile cycle; all Odin dev-2026-09):**
+1. **A `[dynamic]T` cannot be truncated by assigning a slice, and this Odin has NO
+   `delete_range`.** `b^ = b^[:n]` → *"Cannot assign value of type '[]u8' to
+   '[dynamic]u8'"*; `delete_range(...)` → *"Undeclared name"*. Backspace needs a
+   tail-truncate, so both text fields are now a fixed `[TEXT_MAX]u8` + `len` — the same
+   shape `ui.Edit` was forced into in T5.3, for the same reason.
+2. **A struct containing a `[dynamic]T` aliases that buffer in every copy of the struct.**
+   The transition probes seed and re-seed machine state constantly; a dynamic field would
+   be shared and then reallocated out from under a copy. Second reason for fixed buffers.
+3. **`and` / `or` are not Odin operators.** `x and y` is a plain *syntax error*; only
+   `&&` / `||` exist.
+4. **A package-level binding cannot be initialised by a procedure call** — constants must
+   be compile-time. `k_enter :: input.key_of(.enter)` fails; the composite literal
+   `input.Key{kind = .enter}` works.
+5. **`..spread` is for call arguments only.** `[]T{a, ..b}` is a syntax error; build
+   with `append(&d, ..b)`.
+6. **A variadic `append` cannot resolve an implicit selector**: `append(&out, .attach,
+   .theme)` → *"Cannot determine type for implicit selector expression"*. Spell them
+   `app.State.attach`.
+7. **`#partial switch` requires an enum** — `#partial switch k.r` (a `rune`) is
+   rejected; a plain `switch` over values is fine.
+8. **`strings.contains` takes 2 arguments** — no allocator parameter, unlike most of
+   `core:strings` here.
+9. **A one-letter helper proc collides with an import alias** — naming the char-key helper
+   `c` broke `import "core:c"` in the same file.
+10. **Process note (the anti-stall rule):** the O10 answer in `60-handoff-notes.md` removed
+    the blocker entirely. One `/tmp` probe was spent, to confirm `delete_range` is absent;
+    everything else came from compiler errors against the real files, not throwaway
+    probes. Total wall time for the task: well under the "stop and report" threshold.
 
 ---
 
@@ -1333,7 +1409,8 @@ T0.1 → T0.2                    ← toolchain risk retired; `nix run .` works  
   → T3.1 → T3.2 → T3.3 → T3.4 ← herdr integration                             ✅
   → T4.1 → T4.2                ← parallel fan-out (no threads)                 ✅
   → T5.1 → T5.2 → T5.3         ← views + frame (RCH-1 applied: no outer border) ✅
-  → T5.4 → T5.5                ← next
+  → T5.4                       ← the state machine (side-effect-free)      ✅
+  → T5.5                       ← executor + poll loop (NOT built in T5.4)  ← next
   → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6
 ```
 `nix build` must stay green at every arrow. **Do not reorder T1.2 later** — it is the assumption the whole

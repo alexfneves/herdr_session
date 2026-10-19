@@ -318,7 +318,9 @@ usage :: proc() {
   ui-shrink       T5.2 real resize re-clamps the selection
   ui-edit         T5.3 caret is a display column; CJK/emoji typed + pasted
   ui-list         T5.3 one filtered list for both pickers
-  ui-float        T5.3 floating error pane, Enter/Esc dismiss`)
+  ui-float        T5.3 floating error pane, Enter/Esc dismiss
+  state-machine   T5.4 the 7-state machine: full (state x key) grid + every rule
+  state-offline   T5.4 the same battery with no env and no child processes`)
 }
 
 main :: proc() {
@@ -353,6 +355,8 @@ main :: proc() {
 	case "ui-edit":     ok = case_ui_edit()
 	case "ui-list":     ok = case_ui_list()
 	case "ui-float":    ok = case_ui_float()
+	case "state-machine": ok = case_state_machine()
+	case "state-offline": ok = case_state_offline()
 	case "child":
 		if len(args) < 4 {
 			usage()
