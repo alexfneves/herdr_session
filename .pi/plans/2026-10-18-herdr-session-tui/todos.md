@@ -1257,12 +1257,12 @@ how to change theme, and **how to replace `herdr-cycle`** — one line in
 ## Sequencing
 
 ```
-T0.1 → T0.2                    ← toolchain risk retired; `nix run .` works
-  → T1.1 → T1.2                ← HANDOFF proven with a dummy child (highest-value de-risking)
-  → T2.1 → T2.2 → T2.3         ← renderer
-  → T3.1 → T3.2 → T3.3 → T3.4 ← herdr integration
-  → T4.1 → T4.2                ← parallel fan-out
-  → T5.1 → T5.2 → T5.3 → T5.4 → T5.5
+T0.1 → T0.2                    ← toolchain risk retired; `nix run .` works        ✅
+  → T1.1 → T1.2                ← HANDOFF proven with a dummy child               ✅
+  → T2.1 → T2.2 → T2.3         ← renderer                                      ✅
+  → T3.1 → T3.2 → T3.3 → T3.4 ← herdr integration                             ✅
+  → T4.1 → T4.2                ← parallel fan-out (no threads)                 ✅
+  → T5.1 → T5.2 → T5.3 → T5.4 → T5.5    ← next
   → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6
 ```
 `nix build` must stay green at every arrow. **Do not reorder T1.2 later** — it is the assumption the whole
