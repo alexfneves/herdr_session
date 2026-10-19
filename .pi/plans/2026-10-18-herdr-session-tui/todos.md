@@ -617,121 +617,190 @@ Surface `clay_err.count > 0` in the footer debug line and in `{Error}`.
 
 ### T3.1 — `app/herdr.odin`: the single choke point
 
-**Create:** `src/app/herdr.odin`
-
-**Nothing else in the codebase may spawn herdr.** This file owns:
-
-**a) env scrub** — *the launch-blocking requirement:*
-```odin
-SCRUB :: []string{ "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH",
-                  "HERDR_SESSION", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID" }
-// We run INSIDE herdr. Unscrubbed, EVERY create/attach fails:
-//   "nested herdr is disabled by default" (exit 1).
-// HERDR_ENV=0 is NOT a bypass — the PRESENCE is the trigger.
-// KEEP TERM and COLORTERM — dropping them downgrades render encoding to TerminalAnsi.
-scrub_env :: proc(base: map[string]string) -> map[string]string
-```
-
-**b) capture with stdout/stderr kept SEPARATE.** *Never* merge:
-```odin
-// exit 0  → parse STDOUT
-// exit !=0 → parse STDERR for {"error":{"code","message"}}
-// NEVER `2>&1` before a JSON parse — the Rust panic path also writes to stderr.
-Capture :: struct { code: i32, out: []u8, err: []u8 }
-run_capture :: proc(argv: []string, timeout: duration) -> Capture
-```
-
-**Exit-code contract:** `0` ok · `1` herdr error (stderr JSON) · `2` CLI syntax/validation ·
-`101` tty-init panic (Rust panic, **not** JSON) · `124` our timeout · `127` no herdr on remote ·
-`255` ssh transport/auth. Map each to a distinct `{Error}` string.
-
-**c) name validation** — `^[A-Za-z0-9._-]+$`, non-empty, not `.`/`..`, never `default`.
-
-**d) `cleanup_policy` seam (D2 PARKED):**
-```odin
-CleanupPolicy :: enum { never, only_created, always }
-DEFAULT_CLEANUP: CleanupPolicy = .never   // PARKED pending latest-herdr behaviour. Nothing destroyed.
-// Rationale: `prefix+q` only DETACHES — the server and panes keep running. Auto-destroying a session
-// the user merely peeked at is data loss. Revisit when the user's box runs latest herdr.
-```
-
-**Acceptance:** unit-testable outside the TUI. `scrub_env` on the real `os.environ` returns a map with
-**no `HERDR_*` keys but with `TERM` present**. *ISC-2*.
-
----
+> **STATUS: ✅ DONE (2026-10-19) — `src/app/herdr.odin`.** Every herdr invocation in
+> the product goes through `run_capture` (captured, non-interactive) or the T1.2
+> handoff (interactive); nothing else spawns herdr — enforced by the grep in
+> `dev/app-smoke.sh` §3 (*"herdr" is named only by `src/app/herdr.odin`*).
+> **214 PASS / 0 FAIL** (`BIN=./result/bin/herdr-session ./dev/app-smoke.sh`),
+> 133 of them unit + 59 live against the real 0.8.2 binary.
+>
+> **a) env scrub** — reuses `terminal.build_scrubbed_env` (T1.2), prefix-based on
+> `terminal.HERDR_NAMESPACE`, never re-implemented. Proven at the level that
+> matters — what the **child** reports:
+> ```
+> our own env: HERDR_ENV="1" HERDR_SESSION="2026-08-11-23-37-41-812" (nesting is live here)
+> [PASS] child sees NO HERDR_* variable   leaked=[]
+> [PASS] child still has TERM             TERM=xterm-256color
+> ```
+> The **differential** that makes the scrub load-bearing rather than decorative
+> (case `app-live`):
+> ```
+> scrubbed   `herdr --session hs-t-phase3-probe` → exit 101   (nesting never fired; died later on the absent tty)
+> injected   HERDR_ENV=1 `herdr --session …`     → exit 1     "error: nested herdr is disabled by default."
+> ```
+>
+> **b) capture with the streams kept APART.** `Capture{code,out,err,timed_out,spawned,argv}`;
+> child's stdout→pipe A, stderr→pipe B (never dup2'd onto each other), both drained
+> non-blocking under a deadline, then reaped with `WNOHANG`. The stream choice lives
+> in **one** function so ISC-A-1 is structural, not a habit:
+> ```
+> [PASS] stdout holds ONLY the stdout marker   stdout="STDOUT_ONLY\n" (12 bytes)
+> [PASS] stderr holds ONLY the stderr marker   stderr="STDERR_ONLY\n" (12 bytes)
+> [PASS] payload came from stderr, not stdout  payload=errjson        (exit 1 child)
+> [PASS] no merged streams before a JSON parse (ISC-A-1) — src/app, src/render, src/terminal, main.odin
+> ```
+> **Exit-code contract, all 8 codes distinct** (`eq "all 8 exit codes map to distinct meanings" 8`)
+> and each reproduced live where reproducible:
+> ```
+   0 ok · 1 herdr error (stderr {"error":{"code":"session_stop_failed",…}}, stdout 0 bytes)
+   2 bad command line (unknown subcommand) · 101 terminal-init panic (ratatui init.rs:299, NOT JSON)
+   124 ours (`sleep 30` under a 400 ms budget → returned in 402 ms, reaped)
+   127 no herdr there · 255 ssh transport/auth (ssh to 192.0.2.201 → exit 255)
+> ```
+>
+> **c) name validation** — `^[A-Za-z0-9._-]+$`, non-empty, not `.`/`..`, never
+> `default`, ≤ `NAME_MAX_LEN` (64). 15 cases incl. colon, slash, `$`, space, non-ASCII.
+> Every builder returns **no argv at all** on an invalid name:
+> ```
+> [PASS] invalid name "bad:name" produces no launch/attach argv   launch_ok=false attach_ok=false
+> [PASS] delete of `default` is refused by name (D12)
+> ```
+>
+> **d) `cleanup_policy` seam** — `Cleanup_Policy{never, only_created, always}`,
+> `DEFAULT_CLEANUP_POLICY = never` (D2 **still parked**). Settable at runtime, so
+> un-parking is one assignment; `default` is refused under **every** policy.
+>
+> **New traps found (not in the header):**
+> 1. ⚠️ **`HERDR_ENV=0` is NOT the documented "presence is the trigger".** Re-run
+>    today: `HERDR_ENV=1` → exit 1 nesting refusal, but `HERDR_ENV=0` **walks past
+>    the nesting check** and dies later on the tty (101). The header's claim is only
+>    true for a truthy value. Consequence: never rely on setting `HERDR_ENV=0` —
+>    remove the whole namespace (which is what `build_scrubbed_env` does), because
+>    that is correct whatever herdr's truthiness rules are.
+> 2. ⚠️ **`execvp` searches PATH with the inherited env.** Resolve the program in
+>    the **parent** (`terminal.resolve_program`) before swapping in the scrubbed
+>    env, or the scrub is silently defeated (same lesson as T1.2, re-verified here).
+> 3. ⚠️ **A timeout that closes the pipes but never reaps is a zombie factory.**
+>    `run_capture` SIGKILLs at the deadline **and** reaps on a bounded
+>    `WNOHANG` spin, so a killed probe cannot outlive the call.
 
 ### T3.2 — Timestamp parsed from the session name (D3)
 
-**Create:** in `src/app/model.odin`
-
-```odin
-// herdr provides NO timestamp anywhere — verified: not in `session list --json`, not in session.json.
-// Our created names follow herdr-cycle's format (herdr-cycle.sh:28,137):
-//   bare new session : %Y-%m-%d-%H-%M-%S-%3N
-//   named new session: "<typed>-<timestamp>"
-parse_ts_from_name :: proc(name: string) -> ?time.Time
-// match the trailing  YYYY-MM-DD-HH-MM-SS-mmm  group
-// non-matching name  →  null  →  display "—"  →  sorted LAST within its device group
-```
-This gives us the timestamp column with **zero extra stat / ssh round-trips**.
-
-**Acceptance:** `"api-2026-10-18-20-30-45-123"` → parses; `"mydb"` → null → `—`.
-
----
+> **STATUS: ✅ DONE (2026-10-19) — `src/app/model.odin` (`ts_from_name`).**
+> Parsed out of the **name**, so the timestamp column costs **zero extra `stat`
+> and zero extra ssh round-trips**. Fixed-width positional check (`TS_SUFFIX_LEN=23`,
+> dashes at 4/7/10/13/16/19) plus `time.components_to_time` for calendar validity —
+> never a regexp.
+> ```
+> [PASS] bare cycle ts parses                 2026-10-18-20-30-45-123 → 2026-10-18 20:30:45.123
+> [PASS] named cycle ts parses                api-2026-10-18-20-30-45-123 → 2026-10-18 20:30:45.123
+> [PASS] no ts -> em dash                    mydb → —
+> [PASS] no separator -> em dash             mydb2026-10-18-20-30-45-12 → —
+> [PASS] wrong width -> em dash              2026-10-18-20-30-45-12 → —
+> [PASS] impossible calendar date → em dash  2026-13-45-99-99-99-000 → —  (no silent rollover)
+> [PASS] feb 30 -> em dash                   2026-02-30-12-00-00-000 → —
+> [PASS] ts ascending, unknown last within group
+>        a-2026-10-17…, b-2026-10-18…, aaa-no-ts, zzz-no-ts
+> ```
+> `format_cycle_timestamp` is the **same** implementation the parser reads back,
+> so the D11 names we generate round-trip; `new_session_name(prefix, taken)`
+> regenerates on collision (3 generated, 0 collisions).
+>
+> **Deviation, forced by the toolchain:** the header writes `-> ?time.Time`. This
+> Odin has **no `?T`** — `#maybe` was merged into `union` upstream. `Ts :: union
+> {time.Time, Unknown_Timestamp}` is the equivalent, and turned out better: the
+> unknown case is a *type*, so every consumer must handle it, and the sort
+> sentinel is `I64_MAX` (a `0` sentinel would sort "—" **above** real sessions).
 
 ### T3.3 — Local session list → model
 
-**Create:** `src/app/model.odin`
-
-```odin
-Session :: struct {
-    device : string,   // "local", or the VERBATIM configured ssh target string
-    name   : string,
-    running: bool,     // from --json: a LIVE socket connect-probe, not a file check
-    ts     : ?time.Time,
-    label  : string,   // device display label
-}
-// Identity is (device, name) — NEVER name alone. Names are scoped per (host, unix-user)
-// and herdr output has NO host field.
-Key :: proc(s: ^Session) -> (string, string) { return (s.device, s.name) }
-
-// Parse `herdr session list --json` → {"sessions":[{default,name,running,session_dir,socket_path}]}
-// NEVER parse the plain-text form — its columns are misaligned.
-// FILTER OUT default:true entirely (D12 — herdr refuses to delete it).
-```
-**Acceptance:** running from inside this herdr pane, `local` rows appear for the two live sessions
-(`2026-08-11-…`, `2026-08-30-…`) and **`default` is absent**. *ISC-18*.
-
----
+> **STATUS: ✅ DONE (2026-10-19) — `src/app/model.odin` (`Session`, `Key`,
+> `parse_session_list`).** Reads `--json` only; `default` is dropped **inside the
+> parser**, so no caller can offer one.
+> ```
+> raw stdout: {"sessions":[{"default":true,"name":"default",…}, …]}  (644 bytes)
+> [PASS] list parses   2 rows
+>   row device=local name=2026-08-11-23-37-41-812 running=true ts=2026-08-11 23:37:41.812
+>   row device=local name=2026-08-30-14-59-10-730 running=true ts=2026-08-30 14:59:10.730
+> [PASS] NO row is `default` (D12)
+> [PASS] every row carries device=local
+> ```
+> *ISC-18* satisfied from inside a real herdr pane. Identity is the **pair**:
+> ```
+> [PASS] three rows survive because device differs      workbox/api, homebox/api, local/api
+> [PASS] local/api is found by (device,name)  got 2 · workbox/api got 0 · homebox/api got 1
+> [PASS] a device the model does not know is NOT found  — identity is the pair, not the name
+> [PASS] local first, groups contiguous, ts ascending inside each   local/alpha/zeta/zeta/
+> ```
+> Degradation is tested payload by payload: 6 malformed bodies (plain text, empty,
+> `"sessions":"nope"`, `[1,2,3]`, an ANSI banner) each return `ok=false` **and
+> no rows** — an unexpected payload costs that device its group, never the app.
+> Forward-compatible: unknown extra JSON keys are ignored, not fatal.
+>
+> **New traps found:**
+> 1. ⚠️ **Filter `default` on the FLAG, not the name.** A
+>    `{"default":true,"name":"weird"}` entry is still filtered — asserted.
+> 2. ⚠️ **`running` is a live connect-probe, not a file check.** Pass it through
+>    verbatim; never re-derive it from the presence of a socket file.
 
 ### T3.4 — Remotes from `herdr machine list --json`, with fallback (D1)
 
-**Create:** `src/app/remotes.odin`
+> **STATUS: ✅ DONE (2026-10-19) — `src/app/remotes.odin`.** Read-only registry
+> consumer + shape gate + config fallback. *ISC-5 / ISC-16 / ISC-17* are covered
+> by the delete pre-check and the in-app refusal in `herdr.odin`, both proven
+> live (see T3.1's evidence block).
+>
+> **The gate is a JSON-shape check, not an exit-code check** — asserted both ways:
+> ```
+> [PASS] 0.8.2 'unknown command' text → NO registry
+> [PASS] help banner with exit 0 is NOT a registry        (the trap this exists for)
+> [PASS] object with machines array → registry            (shape alone)
+> [PASS] object WITHOUT a machines array → no registry
+> [PASS] gate decision is made on shape, independent of the exit code   exit=2 shape=false
+> ```
+> Precedence and the VERBATIM rule:
+> ```
+> [PASS] device string is never normalised   Alice@Work.Box.Example:2222 stays byte-for-byte
+> [PASS] registry wins as the source; its label wins over the config label
+> [PASS] local is never in the remote list   (the local group is implicit in the table)
+> [PASS] registry + config merge, deduped on the device string
+> [PASS] empty registry → config fallback
+> [PASS] the fetch uses the device string verbatim in argv
+>        ssh -T -o BatchMode=yes -o ConnectTimeout=5 <device> 'herdr session list --json'
+> ```
+> Live against the fixture (`HERDR_SESSION_TEST_REMOTE=localhost`), rows parsed with
+> the remote as `device`, `default` filtered there too:
+> ```
+> remote row device=localhost name=2026-08-11-23-37-41-812 running=true ts=2026-08-11 23:37:41.812
+> [PASS] every remote row carries the remote device, not 'local'
+> [PASS] `default` is filtered from the REMOTE list too (D12 applies everywhere)
+> ```
+> **Device-discriminator preview (T6.3)** — the same machine reached by TWO target
+> strings, which is the only way to catch a name-keyed model on one box:
+> ```
+> [PASS] the two targets really do reach identical sessions (only `device` differs)
+> [PASS] identical names stay DISTINCT rows (device is part of the key)   got 6 want 6
+> [PASS] an alias-scoped identity survives independently of the primary target
+> [PASS] launch argv keeps the primary target verbatim    herdr --remote localhost --session …
+> [PASS] launch argv keeps the alias target verbatim      herdr --remote 192.168.0.45 --session …
+> ```
+>
+> **Corrections to this todo's own text (both re-verified today):**
+> 1. ⚠️ The header says *"on herdr 0.8.2 `machine list` prints the help banner
+>    with EXIT 0."* **It does not.** The installed 0.8.2 answers
+>    `unknown command: machine` / `run 'herdr --help' for usage` with **exit 2**,
+>    empty stdout. The shape gate is still the right defence — and the exit-0
+>    help-banner case is asserted separately so it stays covered if a future build
+>    behaves the way the header described.
+> 2. The sample `detect_machine_list` reads the exit code first. **Implemented as
+>    `machine_registry_available(payload) -> bool`** taking *bytes, not a Capture*,
+>    so a caller cannot accidentally reintroduce a code-based gate.
+> 3. `Remote :: struct {id, label, ssh_target}` → implemented as
+>    `Remote{device, label}`, with the registry read generously
+>    (`ssh_target` → `host` → `name` → `alias`) because no contract fixes those
+>    field names and the build here has never shipped the registry. `id` is
+>    accepted but is **never** an identity: `device` is the only key.
 
-```odin
-// herdr 0.9.x only. Our TUI ONLY READS the registry — `machine add` needs an interactive
-// terminal and stays the user's job.
-Remote :: struct { id: string, label: string, ssh_target: string }
-// device  = ssh_target VERBATIM. Normalising to FQDN/hostname BREAKS the --remote return path.
-// display = label (else the ssh target)
-
-// ⚠️ FEATURE DETECTION MUST NOT USE THE EXIT CODE.
-// On herdr 0.8.2, `herdr machine list` prints the help banner with EXIT 0.
-// Gate on JSON SHAPE instead:
-detect_machine_list :: proc() -> bool {
-    c := herdr.run_capture([...]string{"herdr","machine","list","--json"}, 5*time.Second)
-    if c.code != 0 { return false }
-    return parses_as_expected_shape(c.out)   // object with a machine array
-}
-// Fallback chain: machine registry  →  our config `remotes = [...]`  →  ~/.ssh/config Host stanzas
-```
-**Note:** `--machine` does **not** forward `session` commands, and `herdr --remote X session list` is
-exit 2. Remote session enumeration is always our own `ssh -T` (T4.1).
-
-**Acceptance:** on this box (0.8.2, no `machine` verb) the shape gate correctly returns `false` and the
-config fallback supplies the list. *ISC-20*. Footer debug line shows **which path was taken**.
-
----
 
 # PHASE 4 — Parallel fetch fan-out (no threads)
 

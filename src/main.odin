@@ -300,6 +300,8 @@ usage :: proc() {
   child <cwd> <argv...>       generic handoff with any child
   sig-term                    park in the alt screen for a SIGTERM
   measure                     Clay measure_text in display columns
+  app-unit                    Phase 3 model/validation/exit-contract unit checks
+  app-live                    Phase 3 against the real herdr binary + ssh fixture
   render                      Clay commands -> cells: border, rule, alignment, colour
   clip                        scissor containment
   clay-error                  duplicate id survives the C frame
@@ -324,6 +326,8 @@ main :: proc() {
 	case "handoff":  ok = case_handoff()
 	case "sig-term": ok = case_sig_term()
 	case "measure":    ok = case_measure()
+	case "app-unit":  ok = case_app_unit()
+	case "app-live":  ok = case_app_live()
 	case "render":     ok = case_render()
 	case "clip":       ok = case_clip()
 	case "clay-error": ok = case_clay_error()
