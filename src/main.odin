@@ -302,6 +302,9 @@ usage :: proc() {
   measure                     Clay measure_text in display columns
   app-unit                    Phase 3 model/validation/exit-contract unit checks
   app-live                    Phase 3 against the real herdr binary + ssh fixture
+  fetch-unit                  Phase 4 merge identity/isolation/selection (offline)
+  fetch-live                  Phase 4 fan-out vs real ssh: concurrency, deadlines,
+                              no zombies (needs HERDR_SESSION_TEST_REMOTE=…)
   render                      Clay commands -> cells: border, rule, alignment, colour
   clip                        scissor containment
   clay-error                  duplicate id survives the C frame
@@ -328,6 +331,8 @@ main :: proc() {
 	case "measure":    ok = case_measure()
 	case "app-unit":  ok = case_app_unit()
 	case "app-live":  ok = case_app_live()
+	case "fetch-unit":  ok = case_fetch_unit()
+	case "fetch-live":  ok = case_fetch_live()
 	case "render":     ok = case_render()
 	case "clip":       ok = case_clip()
 	case "clay-error": ok = case_clay_error()

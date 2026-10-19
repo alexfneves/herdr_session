@@ -169,7 +169,12 @@ unit_names :: proc() {
 		got := app.validate_name(name)
 		want_reason := ""
 		if !want { want_reason = got.reason }
-		check(fmt.tprintf("name {} -> {}", name), got.ok == want,
+		// Two placeholders, two arguments. The previous version passed only `name`
+		// into `"name {} -> {}"`, so every one of these lines printed
+		// `%!(MISSING ARGUMENT)` in place of the verdict — 13 cases of evidence
+		// that looked present but said nothing. Caught by the `%!` guard added to
+		// dev/app-smoke.sh.
+		check(fmt.tprintf("name '{}' -> ok={}", name, got.ok), got.ok == want,
 			fmt.tprintf("{} ({}); reason={}", want, why, want_reason))
 	}
 

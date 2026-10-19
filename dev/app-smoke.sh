@@ -66,11 +66,47 @@ trap cleanup_scratch EXIT INT TERM
 PASS_TOTAL=0
 FAIL_TOTAL=0
 
+# assert_formatted LABEL LOG — fail if the log contains Go/Odin printf fallout
+# (`%!`, `%!f(int=0)`, `%!d(MISSING)` …). A mistyped format string otherwise
+# produces a plausible-looking line whose NUMBERS are wrong or absent, which is
+# the worst possible failure mode for a timing claim: the check still passes, the
+# evidence beside it is garbage. Caught exactly that here — a wall-time line was
+# printing the pending count into a `{:.0f}` slot.
+assert_formatted() {
+	local label="$1" log="$2" bad
+	bad=$(grep -ac '%!' "$log" 2>/dev/null || true)
+	if [ "${bad:-0}" = "0" ]; then
+		printf '    [PASS] %s — no printf format fallout\n' "$label"
+		PASS_TOTAL=$((PASS_TOTAL + 1))
+	else
+		printf '    [FAIL] %s — %s malformed format expansion(s)\n' "$label" "$bad"
+		grep -a '%!' "$log" 2>/dev/null | head -3 | sed 's/^/      /'
+		FAIL_TOTAL=$((FAIL_TOTAL + 1))
+	fi
+}
+
 # tally LABEL LOG — count the driver's own PASS/FAIL lines into the total.
+#
+# A log with zero [PASS] lines is a FAILURE, not a pass. Without this rule a
+# wrong/stale $BIN silently fell through to the driver's default case and every
+# section reported "0 PASS / 0 FAIL" while the run still went green — a harness
+# that cannot tell "everything passed" from "nothing ran" is worse than none.
 tally() {
 	local label="$1" log="$2" p f
+	if [ ! -f "$log" ]; then
+		printf '\n== %s: NO LOG (treated as FAIL)\n' "$label"
+		FAIL_TOTAL=$((FAIL_TOTAL + 1))
+		return
+	fi
 	p=$(grep -ac '\[PASS\]' "$log" || true)
 	f=$(grep -ac '\[FAIL\]' "$log" || true)
+	if [ "$p" = "0" ] && [ "$f" = "0" ]; then
+		printf '\n== %s: 0 PASS / 0 FAIL — nothing ran (treated as FAIL)\n' "$label"
+		printf '    the binary probably has no such case. head of its log:\n'
+		head -3 "$log" | sed 's/^/      /'
+		FAIL_TOTAL=$((FAIL_TOTAL + 1))
+		return
+	fi
 	PASS_TOTAL=$((PASS_TOTAL + p))
 	FAIL_TOTAL=$((FAIL_TOTAL + f))
 	printf '\n== %s: %s PASS / %s FAIL\n' "$label" "$p" "$f"
@@ -81,19 +117,20 @@ tally() {
 # ---------------------------------------------------------------------------
 echo
 echo "────────────────────────────────────────────────────────────────────────"
-echo " 1/3  app-unit — model, validation, exit-code contract (no subprocess)"
+echo " 1/4  app-unit — model, validation, exit-code contract (no subprocess)"
 echo "────────────────────────────────────────────────────────────────────────"
 "$BIN" app-unit > "$OUT/app-unit.log" 2>&1
 echo "    driver exit code: $?"
 grep -aE '\[(PASS|FAIL)\]|=== RESULT' "$OUT/app-unit.log" | sed 's/^/    /'
-tally "app-unit" "$OUT/app-unit.log"
+assert_formatted "app-unit" "$OUT/app-unit.log"
+	tally "app-unit" "$OUT/app-unit.log"
 
 # ---------------------------------------------------------------------------
 # 2. Live layer — the real herdr binary, raw bytes preserved
 # ---------------------------------------------------------------------------
 echo
 echo "────────────────────────────────────────────────────────────────────────"
-echo " 2/3  app-live — the real herdr binary + ssh fixture"
+echo " 2/4  app-live — the real herdr binary + ssh fixture"
 echo "────────────────────────────────────────────────────────────────────────"
 if [ -z "${HERDR_SESSION_TEST_REMOTE:-}" ]; then
 	echo "    NOTE: HERDR_SESSION_TEST_REMOTE unset — the remote + discriminator"
@@ -105,14 +142,56 @@ env HERDR_SESSION_TEST_REMOTE="${HERDR_SESSION_TEST_REMOTE:-}" \
 	"$BIN" app-live > "$OUT/app-live.log" 2>&1
 echo "    driver exit code: $?"
 grep -aE '\[(PASS|FAIL)\]|=== RESULT|raw stdout|raw stderr|  captured |→ exit|  SKIP' "$OUT/app-live.log" | sed 's/^/    /'
-tally "app-live" "$OUT/app-live.log"
+assert_formatted "app-live" "$OUT/app-live.log"
+	tally "app-live" "$OUT/app-live.log"
 
 # ---------------------------------------------------------------------------
-# 3. Anti-criteria greps — the rules that must hold textually, not just at runtime
+# 3-4. Fetch layer — the parallel fan-out (T4.1 / T4.2)
+#
+# fetch-unit is offline (local `sh -c` stand-ins) so the merge / identity /
+# status logic is proven even with no fixture. fetch-live needs real ssh; it is
+# the only place the concurrency, timeout-bound and no-zombie claims get
+# MEASURED, so its numbers are reported, not just its verdicts.
 # ---------------------------------------------------------------------------
 echo
 echo "────────────────────────────────────────────────────────────────────────"
-echo " 3/3  anti-criteria greps over product sources"
+echo " 3/5  fetch-unit — merge identity, isolation, selection, status mapping"
+echo "────────────────────────────────────────────────────────────────────────"
+"$BIN" fetch-unit > "$OUT/fetch-unit.log" 2>&1
+echo "    driver exit code: $?"
+grep -aE '\[(PASS|FAIL)\]|=== RESULT' "$OUT/fetch-unit.log" | sed 's/^/    /'
+assert_formatted "fetch-unit" "$OUT/fetch-unit.log"
+	tally "fetch-unit" "$OUT/fetch-unit.log"
+
+echo
+echo "────────────────────────────────────────────────────────────────────────"
+echo " 4/5  fetch-live — real ssh children: concurrency, deadlines, no zombies"
+echo "────────────────────────────────────────────────────────────────────────"
+if [ -z "${HERDR_SESSION_TEST_REMOTE:-}" ]; then
+	echo "    SKIPPED — HERDR_SESSION_TEST_REMOTE is unset."
+	echo "    This section is the ONLY proof of concurrency, of the timeout bound"
+	echo "    and of zero zombie children. Unarmed, those claims are unproven, so"
+	echo "    run it armed (dev/test-remote.md)."
+else
+	env HERDR_SESSION_TEST_REMOTE="${HERDR_SESSION_TEST_REMOTE:-}" \
+		HERDR_SESSION_TEST_REMOTE_ALIAS="${HERDR_SESSION_TEST_REMOTE_ALIAS:-}" \
+		HERDR_SESSION_TEST_UNREACHABLE="${HERDR_SESSION_TEST_UNREACHABLE:-192.0.2.201}" \
+		"$BIN" fetch-live > "$OUT/fetch-live.log" 2>&1
+	echo "    driver exit code: $?"
+	# Show the measured numbers too (wall times, fd/thread/zombie counts), not
+	# just the verdicts: "it was concurrent" is only evidence with the
+	# milliseconds next to it.
+	grep -aE '\[(PASS|FAIL)\]|=== RESULT|^    ' "$OUT/fetch-live.log" | sed 's/^/    /'
+	assert_formatted "fetch-live" "$OUT/fetch-live.log"
+	tally "fetch-live" "$OUT/fetch-live.log"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Anti-criteria greps — the rules that must hold textually, not just at runtime
+# ---------------------------------------------------------------------------
+echo
+echo "────────────────────────────────────────────────────────────────────────"
+echo " 5/5  anti-criteria greps over product sources"
 echo "────────────────────────────────────────────────────────────────────────"
 SRC_ROOT="$(cd "$(dirname "$0")/../src" && pwd)"
 # Product sources = everything EXCEPT the *_cases / *_live drivers. The drivers

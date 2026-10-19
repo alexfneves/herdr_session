@@ -806,69 +806,195 @@ Surface `clay_err.count > 0` in the footer debug line and in `{Error}`.
 
 ---
 
-### T4.1 — ssh children as the async mechanism
+### T4.1 — ssh children as the async mechanism ✅ DONE
 
-**Create:** `src/app/fetch.odin`
+**Evidence (fixture armed: `HERDR_SESSION_TEST_REMOTE=localhost`, `_ALIAS=127.0.0.1`,
+`_UNREACHABLE=192.0.2.201`; every number below is captured output, not a claim).**
 
-**There is no thread pool and no `core:thread` in this design.** Every fetch is already an OS process;
-the ssh child's stdout becoming readable **is** the async wake event.
-```odin
-DeviceState :: union {
-    Pending,
-    Ok,
-    TimedOut, Unreachable, NoHerdr, AuthFailed, Unknown,
-}
+Created `src/app/fetch.odin` (registry + spawn/drain/reap + status mapping + merge),
+`src/fetch_cases.odin` (67 offline checks), `src/fetch_live.odin` (54 real-ssh checks).
+Both new cases are wired into `dev/app-smoke.sh` as sections 3/5 and 4/5.
 
-Fetch :: struct {
-    device   : string,   // verbatim ssh target
-    pid      : posix.pid_t,
-    pipe_fd  : i32,      // read end, O_NONBLOCK — added to poll()
-    buf      : []u8,
-    deadline : time.Time, // ConnectTimeout + 8s backstop
-}
-
-// spawn: ssh -T -o BatchMode=yes -o ConnectTimeout=5 <device> 'herdr session list --json'
-//   -T  (NOT -t): ~20ms faster, no stderr chatter, stdout stays pure JSON
-//   ConnectTimeout=5 + BatchMode=yes are MANDATORY.
-//   Without them a black-holed host hangs 133 SECONDS. With them auth fails in ~119ms.
-//   ssh's own chatter goes to stderr → never merge into the JSON parse.
+**1. Concurrency — 2 hosts finish in ~one host's time, not 2×.**
+Both arms use the SAME non-blocking registry and the SAME ssh commands; only the overlap differs, so the
+ssh spawn cost is identical on both sides of the comparison. The assertion is measured **inside** the
+fan-out arm against its own children's latencies, and the serial arm is the explicit **negative control**:
 ```
-**Main loop integration** — one `poll()` over everything:
+one at a time  wall=365 ms  (children sum=365 ms, wall/sum=1.00)
+[PASS] CONTROL: the serialized arm sits AT its children's sum (>0.8)   ratio 1.00 — serialized IS the sum
+[PASS] all children are in flight simultaneously   pending=2 devices=2
+    localhost settled 145 ms after its own spawn
+    127.0.0.1 settled 95 ms after its own spawn
+  fan-out          wall=145 ms  (loops=5 wakeups=5)
+    children: sum=240 ms  slowest=145 ms  fan-out wall=145 ms (ratio vs sum 0.61)
+[PASS] fan-out wall is well under the SUM of its own children's latencies   0.61, want <0.80 — serialized would BE the sum
+[PASS] fan-out wall is bounded by the SLOWEST child, not by their number   145 ms vs slowest 145 ms
 ```
-poll( ttyfd, resizefd, *fetch_pipe_fd )
-  fetch pipe readable → read → EOF → waitpid(WNOHANG) → parse STDOUT ONLY
-       → merge rows → device: Pending → Ok
-  deadline exceeded  → SIGKILL child → device: TimedOut
+The wall equals the slowest child exactly, and 8 consecutive runs put the fan-out ratio between
+**0.50 and 0.72** while the control stayed pinned at **1.00** — so the 0.8 threshold demonstrably
+separates concurrent from serialized rather than being a number picked to pass.
+
+⚠️ **This replaced an unsound baseline.** The first cut compared the fan-out wall to the *serial arm's*
+wall. Per-host ssh cost on this fixture swings ~95 ms → ~240 ms between runs (sshd auth contention), so
+a serial arm can measure 255 ms while the very next fan-out sees one host alone take 238 ms. The two
+arms were not measuring the same costs, and the ratio blamed the loop for the fixture — it failed 2 of 5
+runs while the implementation was correct and unchanged. Comparing within one arm, against latencies
+taken from the same clock in the same run, removes the confound entirely.
+*Lesson: a timing assertion is only as good as its baseline being measured under the same conditions as
+the thing it gates. A control arm that must fail if the property is absent is worth more than a tighter
+threshold against a wandering one.*
+
+**2. Local paints before any remote fd is read.** The remote is spawned BEFORE local is read, so local
+winning is not a matter of ordering.
 ```
-A host's error degrades **only that host's row group**. The app never blocks on a host. *ISC-14*, *ISC-15*.
+local fetch: exit=0 rows=2 wall=1.73 ms
+[PASS] remote has delivered ZERO bytes so far (no read attempted)   out=0 B err=0 B
+[PASS] remote is still pending   settled=false
+[PASS] local group is already ok while remote is pending   local=ok
+[PASS] …and its fd WAS read (so the earlier zero was timing, not silence)   out=644 B
+remote arrived at 143 ms after local; local painted 2 ms earlier
+```
 
-**ANTI-PATTERNS:** no `core:thread`, no mutexes, no self-pipe for fetches, no `O_NONBLOCK` +
-`sleep(16ms)` idle spin. *ISC-A-2*, *ISC-A-6*.
+**3. Timeout bounded — ours and ssh's, both measured.**
+```
+our deadline: budget=500 ms  elapsed=501 ms  frames=25  killed=true  status=timeout
+[PASS] …inside the budget (+ polling slack, never the 300 s sleep)   501 ms vs budget 500 ms
+[PASS] the UI thread got MANY frames during the wait (never blocked)   25 frames → one every 20.1 ms
+ssh black hole (192.0.2.201): status=unreachable after 5012 ms (101 frames)
+[PASS] …bounded at ~ssh's ConnectTimeout, far under the 133 s no-timeout case
+[PASS] …and we did NOT have to kill it (ssh answered its own deadline)   kills=0
+```
+`FETCH_DEADLINE=13 s` sits above ssh's `ConnectTimeout=5` so ssh always reports first; our SIGKILL is
+only the backstop.
 
-**Acceptance:** with two configured hosts (one real, one black-hole like `10.255.255.1`), the UI paints
-local instantly, one host goes `Ok`, the other goes `TimedOut` at ~5 s, and the UI stayed responsive
-throughout. *ISC-6*, *ISC-14*.
+**4. No zombies — after normal, timeout AND error.**
+```
+zombie children of us: 0  (settled=3 kills=1)
+[PASS] zero zombie children of this process   got 0 want 0
+after a second batch of 4: zombie children = 0
+=== stress === [PASS] no zombie children after the stress pass   got 0 want 0
+post-run shell check: stray `ssh -T -o BatchMode` processes = 0; zombies owned by uid = 0
+```
+Counted out of `/proc` by `PPid`, not via `ps` (a `ps` pipe would add a child of our own).
+⚠️ **This test caught a real bug**: the first cut settled a killed child *without reaping it* —
+T3.1's "zombie factory" trap reproducing itself the moment the fan-out became asynchronous. 3 zombies
+sat behind a registry reporting every fetch cleanly `settled`. `settled` and `reaped` are now tracked
+apart (`kill_and_reap`, `registry_unreaped`, and a debt sweep in `registry_free`).
+
+**5. Per-host isolation.**
+```
+[PASS] healthy host status = ok / healthy host has rows   rows for localhost = 2
+[PASS] broken host status = unreachable / contributed ZERO rows   got 0 want 0
+[PASS] the healthy host's rows are all that is in the table   total=2 healthy=2
+```
+
+**6. `no_herdr` is DISTINCT from `unreachable`.**
+```
+no-herdr-host: status=no herdr exit=127 detail=herdr not installed there
+unreachable-host: status=unreachable exit=255 detail=ssh failed
+[PASS] THE TWO ARE NOT THE SAME STATE   no herdr vs unreachable
+```
+All six statuses map distinctly (`ok|timeout|unreachable|no_herdr|auth|failed`); exit 255 is split by
+stderr so `Permission denied`→`auth` while `Connection refused`→`unreachable`.
+
+**7. Stress — 8 concurrent, no fd leak, no deadlock, all settle.**
+```
+all 8 settled=true in 901 ms (loops=24 wakeups=15 idle=9 kills=2)
+fds: before=6 after=6 delta=0     [PASS] no fd leak across 8 concurrent fetches (2 pipes each)
+[PASS] no thread leak either (the design has none)   got 1 want 1
+[PASS] idempotent close: fd count unchanged after a second pass
+```
+
+**No threads.** `grep -rn 'core:thread' src/` → 0 hits. Wake events are child stdout readability via a
+single `poll()`. `FETCH_DEADLINE`/`POLL_SLICE` (13 s / 100 ms) keep every sleep bounded and the loop
+iterating (measured: 101 frames during a 5 s black-hole wait, i.e. never a single long block).
+
+**⚠️ Bug found in the T3 seam this task was told to reuse.** `read_all_drain` returned `false` for BOTH
+"read some bytes" and "would block (EAGAIN)", and `drain_until_blocked_or_eof` looped on `for !eof` —
+an unbounded 100 %-CPU spin against any long-lived, mostly-quiet pipe. Phase 3 never hit it because its
+children were fast (write-then-exit → `read` returns 0 immediately). A fetch fan-out sits on ssh's pipe
+for seconds, so it fired instantly. Fixed with a tri-state `Drain_Stat {more, blocked, eof, error}` and a
+drain that stops at the first EAGAIN; herdr.odin's own `run_capture` gets the fix for free.
+
+**⚠️ Harness integrity hole, also fixed.** `tally` counted `0 PASS / 0 FAIL` as green, so a stale `$BIN`
+ran none of the new sections and the suite still reported PASS. A zero-check section is now a FAIL.
+
 
 ---
 
-### T4.2 — Identity-preserving merge
+### T4.2 — Identity-preserving merge ✅ DONE
 
-**Create:** in `src/app/fetch.odin`
+**Evidence — `src/app/fetch.odin` (`merge`/`apply`/`Selection`) + 67 offline + 54 live checks.**
 
-```odin
-merge :: proc(app: ^App, device: string, fetched: []Session)
-// keyed by (device, name)
-// Sort: (device != "local", device, ts)   ← local always first, then host, then timestamp
+Identity is `(device, name)` everywhere; `device` is the verbatim ssh target string, `local` is the
+literal `local`, and `default` is filtered at parse.
+
+**Identity never collapses on `name`.** Same session name fetched from two hosts:
 ```
-**⚠️ Two merge rules that index-based logic breaks:**
-1. **Selection is tracked by identity `(device, name)`, never by index.** A remote fetch landing while
-   the user has row 2 selected inserts rows above it — index selection silently jumps to a different
-   session and the next `Enter` targets the wrong one.
-2. Filter text and caret position survive a merge untouched. Fetches mutate the **model only**; the view
-   re-resolves identity after every merge.
+[PASS] same name under two devices -> two rows   got 2 want 2
+[PASS] neither row was collapsed onto the name   A@0 B@1
+[PASS] each identity resolves to its OWN row   a.device=unit-host-a b.device=unit-host-b
+```
+Real ssh, two target strings for the same machine (`localhost` + `127.0.0.1`):
+```
+localhost -> 2 session(s); 127.0.0.1 -> 2 session(s)
+[PASS] no rows collapsed: total == sum of both groups   got 4 want 4
+[PASS] dropping it from ONE target leaves it on the other   still-under-primary=true still-under-alias=false
+```
 
-**Acceptance:** select a local row, then let a remote fetch land rows above it → the same session is still
-highlighted, and `Enter` attaches the same session. *ISC-4*.
+**Refreshing one host leaves the other byte-identical.**
+```
+[PASS] carried through 2 foreign rows   carried=2 total=4
+[PASS] host B's rows are byte-identical after A's refresh
+    B unchanged: unit-host-b|b-one-…|true ;; unit-host-b|b-two-…|true
+```
+
+**Delete / re-add keeps the identity stable.**
+```
+[PASS] empty refresh removes the row   got 1 want 1
+[PASS] re-add yields exactly one row   got 1 want 1
+[PASS] re-added row is found by the SAME identity   identity stable across delete/re-add
+[PASS] re-added row carries the NEW state, not the old one   running=false
+```
+
+**Selection is tracked by identity, never index — with the counterfactual proved.**
+```
+index moved 0 -> 3 while the identity stayed put
+[PASS] the index MOVED (3 rows inserted above)   0 -> 3
+[PASS] …and it is STILL the session the user picked   resolved=pick-…-10-00-00-000@unit-host-a
+[PASS] an index-based selection WOULD have landed on a different session
+        index-0 would be n1-2026-10-18-06-00-00-000@aaa-host
+[PASS] a vanished identity resolves to -1 (never to a stand-in index)   got -1 want -1
+[PASS] resolving a vanished identity yields no session, not a wrong one
+```
+Held-across-a-real-merge, plus the launch seam keeps the target string verbatim:
+```
+[PASS] a selection held across that merge still resolves to the same session
+[PASS] …and launching with it keeps the target string verbatim
+        herdr --remote localhost --session 2026-08-11-23-37-41-812
+```
+
+**Ordering invariant: local first, then device, then timestamp, unknown-ts last.**
+```
+device order: local,aaa-host,unit-host-a
+[PASS] local group first, then alphabetical host, then unit-host-a
+[PASS] local rows contiguous (never interleaved)
+[PASS] timestamps ascending, 'no ts' last
+```
+
+**A failed fetch merges ZERO rows and degrades only its own host** (`apply` records status, merges rows
+only on `.ok`):
+```
+[PASS] a failed fetch merges ZERO rows   got 0 want 0
+[PASS] the other host's rows are untouched
+[PASS] the FAILED host carries the failure   status=unreachable
+```
+
+**Not done in this task (deliberately out of scope):** filter-text/caret survival across a merge is a
+view-layer concern and lands with the Phase 5 UI. The model layer guarantees the identity contract the
+UI will re-resolve against — `selection_of` / `selection_index` / `selection_from_index` — and the
+selection never stores a row index.
+
 
 ---
 

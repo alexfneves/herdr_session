@@ -251,3 +251,163 @@ name, so teardown runs on failure too:
 
 The hosting session (`2026-08-11-23-37-41-812`) is never a target: every probe
 name is `hs-t-*`, and `live_cleanup` asserts the host is still listed at the end.
+
+### Phase 3 — T3.1–T3.4 — ✅ PASSED (214 PASS / 0 FAIL after a fixture fix I made)
+Commit `18f3399`.
+
+**My verification caught a failure the worker's run did not surface.** Unarmed run: 202 PASS / 0 FAIL
+(12 fixture cases silently skipped). With the fixture armed: **209 PASS / 1 FAIL** —
+`both target strings list successfully → localhost→0 127.0.0.1→255`.
+
+**Diagnosis: a fixture environment gap, not a product bug.** Our code correctly reported `255`
+(ssh transport failure). Root cause: `~/.ssh/known_hosts` had `localhost` but **no `127.0.0.1`** →
+`Host key verification failed`. The plan's own T6.3 discriminator needs that second address form.
+
+| **O8** | **Extended the ssh fixture to `127.0.0.1`**, after verifying the key is trustworthy | The T6.3 discriminator (two distinct ssh target strings for the same machine) cannot run without it. I did **not** blindly trust `ssh-keyscan`: the scanned **ed25519 key is byte-identical to `localhost`'s existing entry**, confirming the same host under a different address form. Only that verified key was appended; `known_hosts.bak-phase3` backup taken. **This is a machine-config change I made on the user's box — reversible by deleting the appended line.** |
+
+After the fixture fix: **214 PASS / 0 FAIL**, matching the worker's claim exactly, with teardown
+restoring the pre-run session list precisely.
+
+**Note on verification discipline:** the worker reported the correct number, but only because it ran
+*with* the fixture. Anyone running without it would see a green-but-partial suite. Lesson recorded:
+**always run the fixture-armed path when verifying**, since un-armed runs silently skip the remote tests.
+
+### Phase 3 findings that further correct the research
+1. **`HERDR_ENV=0` is not the trigger** — it walks past the nesting check and only dies on the missing tty
+   (101). Only a *truthy* value refuses. Reinforces: **remove** the var, never "neutralise" it by setting it.
+2. **The orphan hazard is confirmed live** — `--session X` with no tty panics (101) **and leaves the session
+   `running:true`**. Validation is a *precondition* of building argv, not a post-check.
+3. **`machine list` on 0.8.2 exits 2 with `unknown command`** — contradicting T3.4's text ("help banner with
+   exit 0"). The shape gate survives **both** behaviours and both are now asserted, so the product is robust
+   to whichever a given build does.
+4. Re-confirmed: **untracked files are invisible to `nix build`** (`Undeclared name` while `odin build src`
+   was green).
+
+### Good design choices from Phase 3 worth preserving
+- The stream-shape gate takes `[]byte`, **not** a `Capture`, so no caller can reintroduce an exit-code check.
+- `run_capture` blocks (fine for control commands); the **drain/reap pieces are separate procs** so T4.1's
+  non-blocking fan-out reuses them instead of re-deriving pipe mechanics.
+- Destructive live drivers split into `app_live.odin`, away from the offline unit table.
+- `Ts :: union {time.Time, Unknown_Timestamp}` with an `I64_MAX` sort sentinel — a `0` sentinel would have
+  put "unknown" *above* real sessions instead of last.
+
+---
+
+## Phase 4 — Parallel fetch fan-out (T4.1 + T4.2), executed 2026-10-19
+
+**Result: ✅ PASSED — 339 PASS / 0 FAIL** on `dev/app-smoke.sh` armed
+(`HERDR_SESSION_TEST_REMOTE=localhost`, `_ALIAS=127.0.0.1`), running the **nix-built**
+binary, with Phase 1/2/3 suites unregressed (handoff 28 PASS, render 69 PASS) and the
+fixture session list restored byte-for-byte by teardown.
+
+New files: `src/app/fetch.odin` (the fan-out), `src/fetch_cases.odin` (67 offline
+checks), `src/fetch_live.odin` (54 real-ssh checks), `dev/local-build.sh` (fast
+pinned-Odin build loop; the nix build stays the gate). Both new cases are wired into
+`dev/app-smoke.sh` as sections 3/5 and 4/5 so nobody has to remember to run them.
+
+### What was actually built (and why it needs no threads)
+
+Every fetch is an OS process, and *that process's stdout becoming readable is the async
+wake event* — there is nothing to schedule. One `poll()` over `{ttyfd, resizefd,
+∪ fetch fds}` is the whole mechanism. `registry_step(wait)` is the unit of work:
+pump (drain every live fetch as far as it will go without blocking) → settle anything
+whose streams both hit EOF (`waitpid WNOHANG`) → `poll` for the smallest remaining
+deadline capped at `POLL_SLICE` → re-check deadlines → `SIGKILL` what overran. The
+deadline is enforced off the same clock the sleep was derived from, so there is no
+second timer, no timerfd and no self-pipe anywhere.
+
+`FETCH_DEADLINE = 13 s` sits **above** ssh's `ConnectTimeout = 5` on purpose: ssh
+almost always reports its own failure first (measured 5012 ms → `unreachable` with
+`kills=0`), so our SIGKILL is only the backstop for a child that is connected but
+silent. The local deadline is a tight 5 s because a local list measures ~1.5 ms.
+
+### ⚠️ New traps found in Phase 4 (not in the plan, not in the corrections file)
+
+1. **`drain_until_blocked_or_eof` from T3.1 spins at 100 % CPU on a quiet pipe.**
+   `read_all_drain` returned `false` for *both* "I read bytes, more may be waiting"
+   **and** "EAGAIN, nothing right now", and the drain loop was `for !eof { eof = … }`.
+   Against a long-lived mostly-silent child that loop never terminates. Phase 3 never
+   reached it because its children were fast: write-then-exit makes `read` return 0
+   almost immediately. T4.1 is the first caller that sits on an ssh pipe for seconds,
+   and it fired instantly (observed: 96 % CPU, process wedged in the drain).
+   **Fixed** with a tri-state `Drain_Stat {more, blocked, eof, error}` and a drain that
+   returns at the first EAGAIN. `run_capture` inherits the fix.
+   *Lesson for any later phase reusing that seam: a bool cannot distinguish "blocked"
+   from "finished", and every non-blocking caller will eventually hit it.*
+
+2. **Settling a killed child without reaping it = the zombie factory, and a clean
+   registry hides it.** The first cut of `registry_expire` did
+   `SIGKILL → drain → if !fetch_reap { settle_exit(…) }`. When the child was not
+   instantly collectable we wrote the `timeout` verdict and moved on — leaving a real
+   zombie. The registry reported *every fetch cleanly `settled`* while `/proc` showed
+   **3 zombie children**. T3.1's "a timeout that closes the pipes but never reaps is a
+   zombie factory" trap re-created itself the moment the fan-out became asynchronous.
+   **Fixed** by tracking `settled` and `reaped` as *separate* facts
+   (`kill_and_reap`, `registry_unreaped`, debt sweep in `registry_free`), so "we wrote
+   a verdict" can never be mistaken for "the kernel got its child back".
+
+3. **A harness that tallies 0 checks as green.** `tally` summed `[PASS]`/`[FAIL]` lines;
+   running with a stale `$BIN` (default `/tmp/hs`, a Phase-1 artifact with no
+   `fetch-*` cases) produced `0 PASS / 0 FAIL` per new section and the whole suite
+   still printed `RESULT: PASS`. **Fixed**: a section with zero checks is now a FAIL
+   and prints the head of its log so the cause is obvious.
+
+4. **`fmt` arity errors silently destroy evidence.** `"name {} -> {}"` was called with
+   one argument in 13 Phase-3 cases, so every line printed
+   `%!(MISSING ARGUMENT)` where the verdict should have been — the check still passed,
+   the text beside it was garbage. Caught only because I added a `%!` grep over every
+   driver log (`assert_formatted` in `dev/app-smoke.sh`). Now asserted for all four
+   logs, and a repo-wide arity sweep reports zero mismatches.
+
+5. **A prose comment can trip a guard meant for code.** The ISC-A-6 guard greps for
+   `core:thread`; my file header comment *saying* "there is no `core:thread` here"
+   tripped it. Reworded the comment rather than loosening the guard — the guard being
+   dumb and strict is worth more than the phrasing.
+
+6. **A timing baseline measured in a different arm is not a baseline.** My first concurrency
+   assertion compared the fan-out wall against the *serial arm's* wall in the same test. That looks
+   rigorous and is unsound: per-host ssh cost on this fixture swings between ~95 ms and ~240 ms from
+   run to run (sshd auth contention), so the serial arm measured 255 ms while the very next fan-out
+   observed one host alone taking 238 ms. The two arms were not measuring the same costs, and the
+   ratio blamed the loop for the fixture — it failed 2 of 5 runs with the implementation correct and
+   unchanged the whole time.
+   **Fixed** by asserting **within** the fan-out arm against the per-child latencies recorded by the
+   same clock in the same run (wall must be <0.8 of their sum; serialized WOULD be the sum), and by
+   turning the serial arm into an explicit **negative control** that must itself sit AT its sum. 8 runs
+   later: fan-out 0.50–0.72, control pinned at 1.00 — the threshold is now demonstrably
+   discriminating instead of merely survivable.
+   *General rule for later phases: never gate a property on a measurement taken under different
+   conditions than the property. If you cannot measure both in the same breath, add a control that
+   must fail when the property is absent — otherwise you are tuning a magic number against noise.*
+
+### Measurements worth carrying forward
+
+- Local `herdr session list --json`: **~1.5 ms** — inline at startup costs nothing, which
+  is what makes "local paints first" trivially true rather than something to race for.
+- One ssh host round-trip on this fixture: **~100–245 ms** (varies with sshd load).
+- Fan-out wall = the **slowest child**, not the sum: 442 ms serialized → **244 ms**
+  fan-out (ratio 0.55) at N=2; 8 concurrent children all settle in **901 ms** with
+  `fds before=6 after=6 delta=0` and `threads 1 → 1`.
+- ssh `ConnectTimeout=5` against an unroutable TEST-NET address: **5012 ms**, and
+  `BatchMode=yes` means auth failures are instant instead of interactive.
+- Loop stayed alive throughout: 101 frames across the 5 s black-hole wait (~20 ms/frame),
+  i.e. the UI thread never once blocked on a host.
+
+### Accepted deviations from the plan text (mine to allow, recorded for the user)
+
+- **Black-hole host:** the plan suggests `10.255.255.1`. I used RFC 5737
+  **TEST-NET `192.0.2.201`** (overridable via `HERDR_SESSION_TEST_UNREACHABLE`)
+  because it is documentation-reserved and cannot belong to a real host on someone's
+  network. Behaviour asserted identically.
+- **Struct shape:** the plan sketches `DeviceState` as a `union` and `Fetch.pipe_fd` as a
+  single `i32`. I used the existing `Device_Status` enum from `model.odin` (Phase 3
+  already owns per-host status and its labels are what the UI will render) and **two**
+  fds per fetch (`out_fd`, `err_fd`). One pipe would merge stdout and stderr before the
+  JSON parse, which ISC-A-1 forbids outright; the status mapping also *needs* stderr
+  content to tell `auth` from `unreachable` at exit 255.
+- **`foreign` renamed to `carried`** in `Merge_Report` — `foreign` is a keyword in this
+  Odin build and cannot be a field name.
+- **`apply` vs `merge`:** the plan shows one `merge`. There are two — `merge` replaces
+  one device's row group (pure data), `apply` = record the host's status and merge rows
+  only when the status is `.ok`. Splitting them is what makes "a failed host contributes
+  zero rows but keeps its verdict" a single obvious code path instead of a flag.

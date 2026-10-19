@@ -199,22 +199,40 @@ Capture :: struct {
 	argv      : []string,
 }
 
-// read_all_drain pulls a non-blocking fd until EOF, appending into `buf`.
-// Returns true at EOF (or hard error, which we treat as "stop polling").
-// EAGAIN means "nothing right now", not EOF and not a failure.
-read_all_drain :: proc(fd: posix.FD, buf: ^[dynamic]byte) -> bool {
+// Drain_Stat is the tri-state result of one non-blocking read.
+//
+// ⚠️ TRAP (found while wiring T4.1,Phase 3's tests never reached it): a bool
+// cannot carry this. The original `read_all_drain` returned `false` for BOTH
+// "I read some bytes, more may be waiting" AND "there is nothing here right
+// now", and `drain_until_blocked_or_eof` looped on `for !eof`. Against a child
+// that goes quiet mid-flight (ssh after its banner, `sleep`, anything that
+// writes then pauses) that loop never terminates: it is a 100 %-CPU spin on
+// EAGAIN inside the UI thread, which is the exact thing ISC-A-2 forbids.
+//
+// Phase 3 got away with it because its children were all fast — they wrote and
+// exited, so `read` returned 0 almost immediately. A fetch fan-out is the first
+// caller that sits on a long-lived, mostly-silent pipe.
+Drain_Stat :: enum {
+	more,     // bytes read; call again
+	blocked,  // EAGAIN/EWOULDBLOCK — nothing right now, go back to poll()
+	eof,      // the writer closed
+	error,    // a real error; treat as "stop polling this fd"
+}
+
+// read_all_drain pulls one chunk from a non-blocking fd, appending into `buf`.
+// Prefer `drain_until_blocked_or_eof` for the "empty the pipe" job.
+read_all_drain :: proc(fd: posix.FD, buf: ^[dynamic]byte) -> Drain_Stat {
 	chunk: [16 * 1024]byte
 	n := posix.read(fd, &chunk[0], c.size_t(len(chunk)))
 	if n > 0 {
 		append(buf, ..chunk[:int(n)])
-		return false // more may be waiting; caller keeps polling
+		return .more // more may be waiting; caller keeps reading
 	}
-	if n == 0 { return true } // EOF
+	if n == 0 { return .eof }
 	e := posix.errno()
-	if e == posix.Errno.EAGAIN || e == posix.Errno.EINTR {
-		return false
-	}
-	return true
+	if e == posix.Errno.EAGAIN || e == posix.Errno.EWOULDBLOCK { return .blocked }
+	if e == posix.Errno.EINTR { return .blocked } // retried by the caller's loop
+	return .error
 }
 
 set_nonblocking :: proc(fd: posix.FD) {
@@ -353,14 +371,25 @@ run_capture :: proc(argv: []string, timeout: time.Duration) -> Capture {
 	return res
 }
 
-// drain_until_blocked_or_eof empties a non-blocking fd completely, so a single
-// poll wakeup cannot leave bytes stranded behind a still-open pipe.
+// drain_until_blocked_or_eof empties a non-blocking fd, stopping at the FIRST
+// EAGAIN. Returns true only at EOF (or a hard error, which we also stop on).
+//
+// "Blocked" and "EOF" have to be different answers: a caller sitting on a pipe
+// whose writer is merely quiet must return to poll(), not keep reading. The
+// previous bool-only version conflated them and spun. (See `Drain_Stat`.)
 drain_until_blocked_or_eof :: proc(fd: posix.FD, buf: ^[dynamic]byte) -> bool {
-	eof := false
-	for !eof {
-		eof = read_all_drain(fd, buf)
+	for {
+		switch read_all_drain(fd, buf) {
+		case .more:
+			continue
+		case .blocked:
+			return false
+		case .eof:
+			return true
+		case .error:
+			return true
+		}
 	}
-	return eof
 }
 
 // reap_child waits for `pid` on a bounded WNOHANG spin — it never turns into a
