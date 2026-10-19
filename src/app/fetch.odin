@@ -133,6 +133,10 @@ Fetch :: struct {
 	reaped  : bool, // the OS has actually collected the child. `settled` WITHOUT
 	                // `reaped` is a zombie, so the two are tracked apart and
 	                // `registry_free` refuses to let that stand.
+	merged  : bool, // T5.5: this settled child's rows have been folded into the
+	                // Table exactly once. The poll loop looks at every child on
+	                // every wake, so without this a settled fetch would be
+	                // re-merged (and re-dirtied the screen) forever.
 	status    : Device_Status,
 	detail    : string,
 	rows      : []Session,

@@ -1229,29 +1229,145 @@ same binary: **app 339 · ui 90 checks · render 69 · handoff 28**.
 
 ---
 
-### T5.5 — Executor: launch / attach with validation
+### T5.5 — Executor + the real poll loop: `nix run .` is a terminal program — ✅ DONE
 
-**Create:** in `src/main.odin`
+**Created:** `src/app/exec.odin` (the only place a `Command` becomes a process),
+`dev/tui_drive.py` (pty harness that models the screen), `dev/tui-smoke.sh` (runner).
+**Modified:** `src/main.odin` (the TUI: boot, poll loop, projection, tty gate — the
+default argv case is now `tui`, every prior smoke case still reachable by name),
+`src/app/herdr.odin` (`control_argv` — remote control is our own `ssh -T`),
+`src/app/fetch.odin` (`merged` flag: a settled child merges exactly once).
 
-**Two hard requirements, both verified failure modes:**
-1. **Never attach to an unvalidated name.** A crashed-on-tty-init attach **still creates** a live orphan
-   session (the server spawns before terminal init). Check the target against the currently-loaded model first.
-2. **`delete` lies.** Unknown name → `exit 0` + `{"deleted":true}`. Pre-check existence in the model;
-   if running, `stop` then `delete` (parity with `herdr-cycle.cleanup_session`). Never offer `default`.
+**99 PASS / 0 FAIL** on `nix build`'s own binary, and again on `dev/local-build.sh`.
+The prior suites are unchanged against the same binaries: **state 198 · app 339 ·
+ui 90 · render 69 · handoff 28 = 724 PASS / 0 FAIL.**
 
-Launch argv:
+| Definition of done | Captured evidence |
+|---|---|
+| **`nix run .` starts the TUI** (ISC-1, ISC-2) | `script -q -c 'result/bin/herdr-session tui'` renders header + filter line in a real tty; bare invocation with stdin from `/dev/null` prints one human line and exits **3** — no panic, no escape sequences leaked, no mangled terminal |
+| **Create → attach → detach → delete, end to end** (ISC-5, ISC-10) | `roundtrip` (17 checks): `n` + typed prefix → **herdr CREATED** `hs-t-tui-rt-<ts>` (D11: prefix + cycle timestamp, so the typed text is never the final name) → the child owns the tty → `ctrl-b q` → **22 491 bytes** streamed as the app re-enters the alt screen and fully repaints → the new row is already in the list → `d` + filter + `Tab` + `Enter` → **gone from herdr itself**, verified by `herdr session list --json`, not by our screen |
+| **Attach never targets an unvalidated name** (ISC-17) | `attach_guard` refuses any `(device,name)` not in the model — *"attaching an unknown name would CREATE it"* — and the proof is not the boolean: `waitpid(-1, WNOHANG) = -1 errno=10 (ECHILD)` in the same process, i.e. **nothing was ever forked**. `default` refused with D12 named in the reason |
+| **`delete` pre-checks existence, never trusts `deleted:true`** (ISC-16) | `delete_guard` refuses an unknown name with *"nothing was deleted"* **before** any argv is built; ECHILD again proves no call was attempted. A known running row goes `stop` → `delete`, and the runner asserts absence against herdr afterwards |
+| **Local rows before any remote fetch** (ISC-6) | `boot-remote` footer timeline: `local_ok=0.05s` vs `remote_ok=0.20–0.30s`. Boot order is: local snapshot **inline**, first frame painted, *then* fan out the remotes |
+| **No remote can block the UI; worst case = `ConnectTimeout=5`** (ISC-14) | black-hole host `192.0.2.201` reports `down` at **+5.06 s** (`first_bytes=+5016ms` — that is ssh's own timeout, not ours), while a keypress mid-flight is still answered |
+| **A host failure degrades only that host** (ISC-15) | same run, from `HS_TUI_TRACE`: `device local status=1 rows=3 · device localhost status=1 rows=3 · device 192.0.2.201 status=3 rows=0` — the dead host is one footer badge, nothing else notices |
+| **Terminal restored on every exit path** (ISC-9) | `boot-local` (Ctrl+C, exit 0), `sigterm` (shell-visible **143**), `roundtrip` (create+attach+delete then quit): each asserts `\x1b[?1049l` in the byte stream **and** `tcgetattr(after) == tcgetattr(before)` — read back from the pty *slave*, so it is the kernel's answer, not ours |
+| **Resize updates the screen with no key input** (ISC-13) | harness issues `TIOCSWINSZ` and writes **zero** bytes; first repaint byte lands ~**50 ms** after the ioctl (the resize self-pipe, discovered via `tb_get_fds`) |
+| **No idle spin, no threads, no merged streams** (ISC-A-6 + plan constraints) | idle CPU over 5 s of a live TUI = **0 clock ticks**; `tb_get_fds` + `poll` only, `timeout = -1` when the registry is empty; every fetch keeps stdout and stderr on **separate pipes** (`out=866B err=0B` / `out=0B err=64B` in the trace) so JSON is never polluted |
+| **The state layer stayed pure** | nothing in `state.odin` changed. `update(&machine, key) -> Command` still owns every decision; `execute(cmd, rows, home, budget)` is the only consumer and it is called from exactly one place (`tui_run_command`) |
+| **Cleanup policy still `never`** (D2 parked) | the seam is *wired and visible*: after a launch the footer reads `herdr exited with code 0 — cleanup_policy=never: hs-t-tui-rt-<ts> left running`. Nothing is destroyed behind the user's back. Teardown of scratch sessions is the **runner's** job, not the product's |
+
+**Trace artifact** (`HS_TUI_TRACE`, boot + one remote + one black-hole host):
+
 ```
-local  new   : herdr --session <name>
-local  attach: herdr session attach <name>     # CREATE-OR-ATTACH — hence the validation above
-remote new/attach: herdr --remote <device-verbatim> --session <name>
-   → use `herdr --remote` (herdr owns ssh multiplexing/keepalive/config), NOT hand-rolled ssh
-   → caveat: no way to pass a custom -F, so the device string must resolve via default ~/.ssh/config
-child cwd = $HOME  (created session's identity_cwd = spawner cwd)
-env = scrub_env(os.environ)   ← see T3.1
-then: terminal.handoff_run(...)   ← see T1.2
+total=17252ms frames=4 polls=56 hits=7 idles=49 errs=0 remote_fans=2 local_ms=1 first_paint_ms=5
+fetch localhost kind=1 pid=1356252 eof_out=true eof_err=true settled=true reaped=true status=1 killed=false first_bytes=+157ms settled_at=+259ms exit=0 out=866B err=0B
+fetch 192.0.2.201 kind=1 pid=1356253 eof_out=true eof_err=true settled=true reaped=true status=3 killed=false first_bytes=+5016ms settled_at=+5018ms exit=255 out=0B err=64B
+device local status=1 rows=3
+device localhost status=1 rows=3
+device 192.0.2.201 status=3 rows=0
 ```
-**Acceptance:** *ISC-5*, *ISC-16*, *ISC-17*. Attempting to attach a name that is not in the model is
-**refused in-app** and creates nothing.
+
+Four frames for the whole run: first paint, local landed, remote landed, dead host
+bounded. Not one repaint per poll.
+
+**Design decisions made here (the spec is silent on each):**
+
+1. **The TUI is a module singleton (`tui`), not a threaded parameter.** This Odin
+   gives no capturing closures and the repaint callback comes from `terminal`, so
+   the choice was one struct owned in one place or `^App` on every signature. One
+   struct, greppable, and the smoke drivers still run without it.
+2. **One repaint hook, switched by `TUI_ACTIVE`.** Handoff owns a full-repaint hook;
+   smoke drivers painted the old frame and the TUI paints the real one. Registering
+   the wrong one is a silent black screen, so the switch sits next to both and is
+   set/cleared around the loop, not inferred.
+3. **The machine owns all text; the view syncs from it each frame** (`tui_sync_text`).
+   T5.4 made this the rule and T5.5 honours it — the editors are paint targets, not
+   sources of truth.
+4. **Every keypress marks the view dirty.** Most keys change machine state with no
+   visible argv effect (cursor moves, filter text, notice clearing). A "smart"
+   dirty-tracking scheme cost a whole symptom ("some keys do nothing") before the
+   dumb rule was worth it, and the renderer diffs anyway so the cost is noise.
+5. **Remote attach = `launch_argv(device, name)`.** Observed herdr 0.8.2 rejects
+   `--remote X session attach`; `--remote` pairs only with the default launch
+   command, which *is* create-or-attach on that host — the ISC-5 shape exactly.
+6. **Remote stop/delete are wrapped in our own `ssh -T` (`control_argv`).** Same
+   0.8.2 limitation (`--remote X session delete` is not a valid command), and the
+   direction of the failure matters more than the elegance: if the device is not
+   part of the argv, a *remote* delete can silently destroy a **local** same-named
+   session.
+7. **Theme is applied, not persisted.** `set_theme` records and paints; writing
+   `~/.config/herdr_session.json` is T6.1, and the executor says so in its own
+   effect message rather than pretending to have done it.
+8. **Guard reasons are user-facing prose that names the rule** (D12 for `default`,
+   "would CREATE it" for unknown attach, "nothing was deleted" for unknown delete).
+   A refusal that only says "invalid" makes the user guess which of four safety
+   rules just fired.
+9. **`default` never leaves the guard alive.** Not filtered from the list (the user
+   must see it) — but no `Command` built through `execute` can ever aim at it, so
+   D12 holds at the choke point rather than at the paint layer.
+
+**Traps found here (each cost a real cycle; all Odin dev-2026-09 unless stated):**
+
+1. **A fetch that has hit EOF is not a fetch that has been reaped — and if it drops
+   out of the poll set, nothing will ever wake the loop for it again.** Measured: a
+   healthy fetch had both EOFs at **+155 ms** and did not settle until **+5014 ms**,
+   unblocked only when an unrelated host's ssh exited. At that instant the fetch has
+   no fd left in the set, so no I/O event can refer to it again. Fix: while anything
+   is in flight, cap the sleep at `POLL_SLICE` (100 ms) — the same discipline
+   `registry_step` already used for the same reason. `timeout = -1` is reserved for
+   an *empty* registry, which is what keeps idle CPU at 0. This is the trap that
+   would have shipped as "the app freezes for thirteen seconds".
+2. **Grepping the pty byte stream cannot verify a diffing renderer.** termbox writes
+   only changed cells, so a string unmistakably on screen never appears in the stream
+   (`filt` + `r:` arriving from two different frames). Every early claim was a false
+   negative. Fix: `dev/tui_drive.py` keeps a `Screen` model — cursor addressing,
+   erase, OSC/BEL, `ESC ( B` charset designation — and asserts on *the screen*.
+3. **Sequential `wait_for(A); wait_for(B)` reports B as late even when both were
+   instant.** The first wait burns the whole timeout when A never arrives, so B's
+   number becomes a lie about *ordering* — the one thing ISC-6 is about. Fix:
+   `watch_screen` watches all labels in one loop and records each arrival.
+4. **Odin's `for x, i in collection` binds `x` = element, `i` = index** (Go-style).
+   Assuming the reverse reads `shown[0]`, `shown[1]`… as positions rather than the
+   indices they are. It compiles, it runs, it paints an empty table.
+5. **`return string(buf[:])` under a `defer delete(buf)` is a use-after-free that
+   renders as garbage instead of crashing.** The footer printed mojibake. Fixed by
+   building the string with `fmt.tprintf` and owning it in the caller.
+6. **A silent harness is not a passing harness.** "0 bytes read" read as "the app is
+   waiting politely" when the app had died at startup. Every scenario now asserts
+   liveness (`p.alive()`, exit code) *before* interpreting silence.
+7. **`check` takes exactly three arguments** — name, cond, already-formatted detail.
+   `check("x", c, "a {} b", v)` is a hard error; `fmt.tprintf` the detail yourself.
+8. **A fixture that points at *this* machine legitimately duplicates rows.** With
+   the loopback fixture, the same session is a row under `local` *and* under the
+   aliased device — two distinct `(device, name)` identities. Row-count assertions
+   must be **device-exact** (`line.split()[0] == "local"`), and the duplicate is
+   worth asserting on its own: name-alone identity is exactly the bug that would
+   make two hosts' sessions indistinguishable.
+9. **herdr generates the name from the prefix** (D11). The typed `hs-t-tui-rt`
+   becomes `hs-t-tui-rt-2026-10-19-21-56-44-516`; a test matching the literal
+   typed string either fails wrongly or — worse — "passes" a delete that never
+   happened because the name never existed. Track the *created* name; clean up by
+   prefix.
+10. **The fixture-host grep catches prose.** The `localhost` grep hit two *comments*
+    in `main.odin`. Correct behaviour: the rule is "no fixture host names in `src/`",
+    comments included. Reworded to "loopback".
+11. **`nix build` builds the git tree, not the working directory.** An untracked
+    `src/app/exec.odin` is invisible to it — the failure shows up as "undeclared:
+    app.execute" against a file that plainly exists. `git add` new sources before the
+    first `nix build`.
+12. **Minor, one compile each:** `posix.pollfd.fd` needs `posix.FD(...)`;
+    `posix.waitpid` takes a *bitset* (`{.NOHANG}`) not an int; `posix.isatty`
+    returns `b32` and needs `bool(...)`; a struct field still needs its trailing `,`
+    when the following line is a comment; `os.get_env` does not exist here —
+    `os.get_env_alloc`.
+
+**Instrumentation left in place (off by default, dev-only):** `HS_TUI_TRACE=<file>`
+dumps the run at exit — frames, poll hits/idles/errors, per-fetch first-byte and
+settle times, per-device status and row counts. `HS_TUI_DEBUG` (per-iteration
+append) was deliberately removed: file I/O inside the loop moves the timing of the
+very races the loop is made of, and it reported a starvation bug that then vanished
+whenever it was watching.
 
 ---
 
@@ -1410,8 +1526,8 @@ T0.1 → T0.2                    ← toolchain risk retired; `nix run .` works  
   → T4.1 → T4.2                ← parallel fan-out (no threads)                 ✅
   → T5.1 → T5.2 → T5.3         ← views + frame (RCH-1 applied: no outer border) ✅
   → T5.4                       ← the state machine (side-effect-free)      ✅
-  → T5.5                       ← executor + poll loop (NOT built in T5.4)  ← next
-  → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6
+  → T5.5  ✅ DONE                ← executor + real poll loop; `nix run .` is a terminal program
+  → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6   ← config/themes/resize, next up
 ```
 `nix build` must stay green at every arrow. **Do not reorder T1.2 later** — it is the assumption the whole
 plan rests on (premortem **A1**) and it is cheapest to validate before feature work exists.

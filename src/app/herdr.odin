@@ -585,6 +585,32 @@ list_argv :: proc() -> []string {
 	return argv[:]
 }
 
+// control_argv routes a herdr *control* command to `device`.
+//
+// A local device gets the argv back unchanged. A remote device gets the same
+// command wrapped in OUR OWN `ssh -T …`, for the same reason `remote_list_argv`
+// exists: `herdr --remote X session delete` is rejected outright (verbatim rule
+// 11 — `--remote` only pairs with the default launch command).
+//
+// Without this the identity rule breaks in the worst available way: a delete on
+// a REMOTE row would run `herdr session delete <name>` HERE and destroy a
+// same-named LOCAL session. The device is part of the identity, so it has to be
+// part of the argv too.
+//
+// The inner command travels as a single quoted argument. Every name inside it
+// has already cleared `validate_name` ([A-Za-z0-9._-]), so no shell
+// metacharacter can exist in it; the quoting is defence in depth, not the guard.
+control_argv :: proc(device: string, inner: []string) -> []string {
+	if is_local_device(device) { return inner }
+	cmd := strings.join(inner, " ")
+	argv := make([dynamic]string, 0, len(SSH_BASE_ARGS)+3)
+	append(&argv, SSH_BIN)
+	for a in SSH_BASE_ARGS { append(&argv, a) }
+	append(&argv, device)
+	append(&argv, fmt.tprintf("'%s'", cmd))
+	return argv[:]
+}
+
 //-----------------------------------------------------------------------------
 // The delete path, with the honesty pre-check (rules 3, 4, 5)
 //-----------------------------------------------------------------------------
@@ -641,10 +667,10 @@ delete_session :: proc(sessions: []Session, device: string, name: string,
 	// have gone away between listing and acting, and the delete is the
 	// authoritative step.
 	if was_running {
-		run_capture(stop_argv(name), timeout)
+		run_capture(control_argv(device, stop_argv(name)), timeout)
 	}
 
-	del := run_capture(delete_argv(name), timeout)
+	del := run_capture(control_argv(device, delete_argv(name)), timeout)
 	herr := parse_error_envelope(del.err)
 
 	if del.code != 0 {
