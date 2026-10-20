@@ -344,3 +344,46 @@ dev/stream_order.py           stream-order     → Odin
 5. Delete `dev/lib.sh` and every `*-smoke.sh` last, once nothing references them.
 6. Wire `nix flake check`.
 7. Re-run the whole thing and report the honest new total vs the current ~1,354 baseline.
+
+---
+
+# RCH-7 — Scope pin for the migration: TESTS ONLY  (supersedes any folder reorg)
+
+**User instruction (2026-10-20):** *"Forget about changing folder structure for now, and only make
+changes related to tests."*
+
+## Explicitly OUT of scope — do not do these
+- **Renaming `vendor/` → `bindings/`.** (Discussed after this instruction; withdrawn.)
+- Creating `libs/`, `assets/`, or reshaping `src/`'s subsystem layout.
+- Moving `docs/`, changing `nix/package.nix`'s **filter** semantics, or touching import paths of
+  Clay/termbox2 for cosmetic layout reasons.
+- Any refactor whose motivation is "the folder layout should look like X".
+
+**Existing layout stays as-is:** `src/` (product), `vendor/termbox2-odin/` (termbox2 FFI wrapper),
+`clay-odin/` (build-time materialized, gitignored), `dev/`, `docs/`, `nix/`.
+
+## In scope — everything that is *about tests*
+The RCH-5 / RCH-6 mandate stands, and `tests/` is created **because it is the tests' home**, not as a
+layout exercise:
+1. **Test code must leave the product.** Delete the `argv[1]` case dispatch from `main` — the shipped
+   binary must not contain ~30 runnable test entrypoints.
+2. **`tests/` folder, Odin only, `core:testing`.** Port the 8,255 lines currently in
+   `src/*_cases.odin` / `src/*_live.odin`.
+3. **Replace every test-related `.sh` and `.py` with Odin tests** (RCH-6 inventory).
+4. **`nix flake check` runs them** — there is no check phase today.
+
+## Baseline to preserve (verified by the orchestrator, fixture armed, 2026-10-20 ~21:50)
+```
+state 259 · app+disc 532 · tui 172 · theme 171 · resize 138 · ui 90 (6/6) · render 69 · handoff 35
+TOTAL: 1461 PASS / 0 FAIL
+```
+**RCH-3 and RCH-4 are DONE and independently verified** (source inspection + full suite run), despite the
+worker's completion report arriving empty:
+- **R1** `only_created` is the cleanup default · **R2** `at_mode_selection` has **no** filter append
+  (the only one lives in `filter_navigate`, reached solely by the four editable states)
+- **R3** `KEY_DELETE` mapped · **RCH-4** `{Mode selection}` highlights nothing
+So the plan does **not** need to "finish" RCH-3/4 — only to **keep parity** with them.
+
+## Migration rule that matters more than the layout
+> **Assertion-count parity per suite.** Port one suite, count before/after, commit. Fewer assertions
+> after = **regression**, said out loud. Plus: guard against `core:testing` scoring **0 tests as a pass**.
