@@ -355,7 +355,20 @@ Tui :: struct {
 	notice   : string, // last executor line; cleared by the next keypress
 	coalescer : terminal.Coalescer, // T6.5 resize/coalescing accounting
 	dirty    : bool,
-	quitting : bool
+	quitting : bool,
+
+	// When the table was last actually RE-READ, and whether that ever happened.
+	// The footer renders this as "list 4s" so a snapshot never passes itself off
+	// as live: a session created or destroyed elsewhere is invisible until
+	// something re-reads, and the user can only judge what they are looking at
+	// if the age of it is on screen.
+	//
+	// It is stamped at PAINT time and the loop never wakes on a timer (ISC-A-2:
+	// 0 ticks idle), so the number is "the age as of the last frame" — which is
+	// exactly when it matters, because the frame that shows a big age is the
+	// frame the user is reading after not touching the app for that long.
+	list_at   : time.Time,
+	list_seen : bool
 }
 
 tui : Tui
@@ -480,6 +493,67 @@ tui_refresh :: proc() {
 	app.local_snapshot(&tui.table, app.LOCAL_FETCH_DEADLINE)
 	tui_fan_out()
 	tui_sync_model()
+	tui_stamp_list()
+}
+
+// tui_stamp_list records that the table was re-read just now.
+tui_stamp_list :: proc() {
+	tui.list_at = time.now()
+	tui.list_seen = true
+}
+
+// tui_list_age is the footer's honesty token: how old the rows on screen are.
+tui_list_age :: proc() -> string {
+	if !tui.list_seen { return "list never" }
+	d := time.since(tui.list_at)
+	if d < 2 * time.Second { return "list now" }
+	s := int(d / time.Second)
+	if s < 60 { return fmt.tprintf("list {}s", s) }
+	m := s / 60
+	if m < 60 { return fmt.tprintf("list {}m", m) }
+	return fmt.tprintf("list {}h", m / 60)
+}
+
+// tui_refresh_for_entry re-reads the list when the user ENTERS a state whose
+// whole content is "pick a session".
+//
+// The list is a snapshot, and these are the two states where acting on a stale
+// row costs something real: attaching to a name that was deleted elsewhere
+// CREATEs it (the orphan rule), and deleting a row that no longer exists is a
+// lie either way. Entering is the last moment a refresh is free — local is
+// ~3 ms, and remote rows keep whatever the last fetch landed with rather than
+// blocking the transition on an ssh round-trip.
+tui_refresh_for_entry :: proc(prev: app.State) {
+	cur := tui.machine.state
+	if cur != prev && app.state_needs_refresh(cur) {
+		tui_refresh()
+	}
+}
+
+// tui_revalidate_attach re-runs the attach guard against the freshest view the
+// loop holds, immediately before the spawn.
+//
+// For the LOCAL device that means an inline re-read: one `herdr session list
+// --json` is ~3 ms, and it turns "the model said so two minutes ago" into "herdr
+// says so right now", which is the only honest thing to put in front of an
+// attach. For a REMOTE device a re-read would be an ssh round-trip on the spawn
+// path; the row is instead validated against the freshest MERGED view — which
+// was refreshed on entering the state and re-merged by every fetch that lands
+// while the user is picking.
+//
+// If the local re-read does not answer with a session list, we keep the existing
+// rows rather than newly refusing: a transient `herdr` hiccup must not become
+// "cannot attach to a session that is plainly on screen". `execute`'s own guard
+// still runs over whatever we hand it.
+tui_revalidate_attach :: proc(device, name: string) -> app.Guard {
+	if app.is_local_device(device) {
+		_, c := app.local_snapshot(&tui.table, app.LOCAL_FETCH_DEADLINE)
+		if c.code == 0 {
+			tui_stamp_list()
+			tui_sync_model()
+		}
+	}
+	return app.revalidate_attach(tui.table.rows[:], device, name)
 }
 
 // tui_sync_model repoints the machine at the live rows and re-places the
@@ -506,7 +580,43 @@ tui_run_command :: proc(cmd: app.Command) {
 	case: break
 	}
 
-	eff := app.execute(cmd, tui.table.rows[:], home_dir(), app.CAPTURE_TIMEOUT)
+	#partial switch cmd.kind {
+	case .refresh:
+		// Ctrl+L: the user asked to see what is really there. Re-read now and
+		// say so, because a silent refresh is indistinguishable from one that
+		// did nothing.
+		tui_refresh()
+		tui.notice = fmt.tprintf("list re-read — {}", tui_list_age())
+		tui.dirty = true
+		return
+
+	case .attach:
+		// The last check before the spawn. A stale row here is how an attach
+		// becomes an accidental CREATE, so the identity is re-confirmed now,
+		// not at the moment the row was drawn.
+		g := tui_revalidate_attach(cmd.device, cmd.name)
+		if !g.ok {
+			app.to_error(&tui.machine, g.reason)
+			tui.dirty = true
+			return
+		}
+
+	case .delete:
+		// A delete blocks: stop, then delete, each capped at the transport bound
+		// (6 s against ssh's ConnectTimeout=5), so the loop cannot repaint while
+		// it runs. Without this frame the user gets a screen frozen on the OLD
+		// list for up to 12 s and no way to tell "working" from "hung".
+		//
+		// The paint has to happen BEFORE the call, and `tui_paint` presents the
+		// buffer, so this frame is on the tty before the first child starts.
+		tui.notice = fmt.tprintf("working: stop + delete {} on {} (up to {}s)…",
+			cmd.name, cmd.device, int(app.CONTROL_TIMEOUT / time.Second))
+		tui_paint()
+	case:
+		break
+	}
+
+	eff := app.execute(cmd, tui.table.rows[:], home_dir(), app.CONTROL_TIMEOUT)
 
 	#partial switch eff.kind {
 	case .refused:
@@ -574,7 +684,12 @@ tui_persist_theme :: proc(name: string) -> string {
 
 tui_on_key :: proc(k: input.Key) {
 	tui.notice = ""            // the last key always supersedes the last verdict
+	prev := tui.machine.state
 	cmd := app.update(&tui.machine, k)
+	// Entering a pick-a-session state re-reads the list, because the row the
+	// user is about to choose may not exist any more. Done here rather than in
+	// `update` because the machine is pure and cannot fetch.
+	tui_refresh_for_entry(prev)
 	// Dirty on EVERY key, not only on the keys that triggered an effect: most
 	// keys change the machine (state, filter, cursor) and nothing else will tell
 	// the painter about it. The renderer diffs, so a key that changed nothing
@@ -834,7 +949,8 @@ tui_state_text :: proc() -> string {
 		return fmt.tprintf("\u26a0 {}  ·  {}  ·  {}", warn,
 			app.state_label(tui.machine.state), tui_host_line())
 	}
-	return fmt.tprintf("{}  ·  {}", app.state_label(tui.machine.state), tui_host_line())
+	return fmt.tprintf("{}  ·  {}  ·  {}", app.state_label(tui.machine.state),
+		tui_host_line(), tui_list_age())
 }
 
 tui_paint :: proc() {
@@ -1215,6 +1331,7 @@ tui_boot :: proc() -> bool {
 	//     the first frame waits on.
 	local_t0 := time.now()
 	app.local_snapshot(&tui.table, app.LOCAL_FETCH_DEADLINE)
+	tui_stamp_list()  // the footer's age token starts here, not at the first refresh
 	tui_sync_model()
 	TUI_LOCAL_MS = i64(time.duration_milliseconds(time.since(local_t0)))
 

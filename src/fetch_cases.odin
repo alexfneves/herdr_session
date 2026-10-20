@@ -20,6 +20,7 @@ package main
 import app "./app"
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:time"
 
@@ -44,6 +45,7 @@ case_fetch_unit :: proc() -> bool {
 	unit_status_mapping()
 	unit_failed_fetch_merges_nothing()
 	unit_registry_lifecycle()
+	unit_reap_debt()
 	unit_deadline_policy()
 
 	return !any_failed
@@ -538,6 +540,107 @@ unit_registry_lifecycle :: proc() {
 hang_killed :: proc(r: ^app.Registry) -> bool {
 	for f in r.items {
 		if f.device == "unit-hang" { return f.killed }
+	}
+	return false
+}
+
+
+// ---------------------------------------------------------------------------
+// P2-6 — a settled-but-never-reaped fetch must still get its waitpid
+// ---------------------------------------------------------------------------
+
+// unit_reap_debt is the repayment proof.
+//
+// `kill_and_reap` can legitimately give up: it drains and waits for
+// KILL_REAP_BUDGET and, when that expires, it FORCE-SETTLES the fetch and says
+// so honestly with `f.reaped = false`. That debt was supposed to be paid later
+// by `registry_reap_debts`, which selects exactly `spawned && !reaped`. But
+// `fetch_reap`'s own guard was `!spawned || settled`, so every one of those
+// debts arrived there and short-circuited: no waitpid, `reaped` never flipped,
+// the child stayed a zombie, and `registry_unreaped` — which requires
+// `settled && !reaped` — kept counting it forever. The debt was on the books
+// and could never be paid, and the reaper written to pay it was the thing that
+// skipped it.
+//
+// The fix is the guard `settled && reaped`. This drives a REAL child through
+// the REAL reaper, and checks the KERNEL's opinion at both ends, so the
+// repayment is observed rather than asserted.
+unit_reap_debt :: proc() {
+	say("  — a settled-but-unreaped fetch is repaid by registry_reap_debts (P2-6)")
+
+	f := app.spawn_fetch("debt-probe", "debt-probe", .local,
+		{"sh", "-c", `printf '{"sessions":[{"default":true,"name":"default","running":false}]}'`},
+		5 * time.Second)
+	check("the debt child spawned", f != nil && f.spawned, "")
+	if f == nil || !f.spawned { return }
+	pid := int(f.pid)
+
+	// Drain to EOF: the child has certainly finished writing. Then settle the
+	// verdict WITHOUT collecting the child, which is precisely the state the
+	// kill path leaves behind when its budget expires.
+	for _ in 0 ..< 400 {
+		app.fetch_drain(f)
+		if app.fetch_drained(f) { break }
+		time.sleep(5 * time.Millisecond)
+	}
+	app.settle_exit(f, 0)
+	f.reaped = false
+
+	check("…the fetch is SETTLED", f.settled, "")
+	check("…and NOT reaped — the debt is open", !f.reaped, "")
+	check("…and the kernel still holds the child as OUR zombie (exited, uncollected)",
+		wait_zombie(pid), fmt.tprintf("pid={} state={}", pid, proc_state(pid)))
+
+	reg : app.Registry = {}
+	defer app.registry_free(&reg)
+	app.registry_add(&reg, f)
+
+	eq_int("registry_unreaped sees the debt", app.registry_unreaped(&reg), 1)
+
+	// The repayment. Under the old guard this call changed nothing at all.
+	app.registry_reap_debts(&reg)
+
+	check("registry_reap_debts REPAID it: fetch.reaped is now true", f.reaped,
+		fmt.tprintf("settled={} reaped={}", f.settled, f.reaped))
+	eq_int("registry_unreaped is now clean", app.registry_unreaped(&reg), 0)
+	check("…and the kernel agrees: our zombie is gone, we collected our own child",
+		proc_state(pid) == 0, fmt.tprintf("pid={} state={}", pid, proc_state(pid)))
+	check("…the settled verdict survived the repayment (no re-settle, no lost verdict)",
+		f.settled && f.status == .ok,
+		fmt.tprintf("settled={} status={}", f.settled, app.device_status_label(f.status)))
+
+	// A second sweep must be a no-op rather than a second waitpid on a pid we
+	// no longer own. Idempotence is what makes it safe to call every frame.
+	app.registry_reap_debts(&reg)
+	eq_int("a second sweep changes nothing", app.registry_unreaped(&reg), 0)
+	check("…and reaped stays true", f.reaped, "")
+}
+
+// proc_state reads the state field of /proc/<pid>/stat: 'R' running, 'S'
+// sleeping, 'Z' zombie, 0 when there is no such process.
+//
+// /proc and NOT waitpid on purpose: waitpid would COLLECT the child and destroy
+// the very debt under test. The comm field may contain spaces and parens, so the
+// state is taken after the LAST ')' on the line — the only unambiguous split.
+proc_state :: proc(pid: int) -> u8 {
+	path := fmt.tprintf("/proc/{}/stat", pid)
+	data, err := os.read_entire_file(path, context.allocator)
+	if err != nil || len(data) == 0 { return 0 }
+	last_close := -1
+	for i in 0 ..< len(data) {
+		if data[i] == byte(')') { last_close = i }
+	}
+	// +1 skips the ')' itself, +2 skips the single space before the state byte.
+	if last_close < 0 || last_close + 2 >= len(data) { return 0 }
+	return data[last_close+2]
+}
+
+// wait_zombie parks until the kernel holds the child as a zombie (exited and
+// uncollected), or gives up after ~1 s.
+wait_zombie :: proc(pid: int) -> bool {
+	for _ in 0 ..< 200 {
+		if proc_state(pid) == byte('Z') { return true }
+		time.sleep(5 * time.Millisecond)
 	}
 	return false
 }

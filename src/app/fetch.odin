@@ -346,8 +346,23 @@ fetch_fds_watched :: proc(f: ^Fetch, fds: ^[dynamic]posix.pollfd) {
 // block is not a reap, it is a hidden `wait()`.
 //
 // Returns true when the child is gone (and the fetch is therefore settled).
+//
+// The guard is `settled && reaped`, NOT `settled`. With `f.settled` alone, a
+// fetch that the kill path settled whose reap then ran out of budget came
+// straight back here as "already finished": `reaped` stayed false, no waitpid
+// was ever issued, and `registry_reap_debts` — which selects exactly that case
+// — short-circuited on it too. The child stayed a zombie forever while every
+// reader of the registry believed the debt was repaid.
+//
+// "Settled but never reaped" is the whole bug; the waitpid below is the
+// repayment. Settling a fetch answers "what did it say"; reaping it answers
+// "is our child gone", and a settled fetch still has to be waited for.
 fetch_reap :: proc(f: ^Fetch) -> bool {
-	if !f.spawned || f.settled { return f.settled }
+	if !f.spawned {
+		f.reaped = true
+		return f.settled
+	}
+	if f.settled && f.reaped { return f.settled }
 	status : c.int = 0
 	r := posix.waitpid(f.pid, &status, {.NOHANG})
 	if r < 0 {

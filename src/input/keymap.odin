@@ -43,6 +43,7 @@ Key_Kind :: enum {
 	left,
 	right,
 	ctrl_c,   // byte 0x03, arriving as data because ISIG is off
+	refresh,  // Ctrl+L: re-read the session list (see main.odin's tui_refresh)
 }
 
 // Key is one decoded keystroke. `r` is only meaningful for `.character`; every
@@ -89,6 +90,12 @@ map_code :: proc(code: u16) -> Key_Kind {
 	case termbox2.KEY_ARROW_LEFT:  return .left
 	case termbox2.KEY_ARROW_RIGHT: return .right
 	case termbox2.KEY_CTRL_C:     return .ctrl_c     // 0x03, data not signal
+	// Ctrl+L is the refresh key. It has to be a CONTROL key and not a printable
+	// one: every printable character is already spoken for by the filter, and in
+	// {Attach}/{Delete} the filter is how the user narrows a long list, so a
+	// printable "r" can never mean "refresh" there. Ctrl+L is the redraw verb
+	// the user already knows from less/vim.
+	case termbox2.KEY_CTRL_L:    return .refresh    // 0x0c
 	}
 	return .none
 }

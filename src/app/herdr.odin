@@ -209,6 +209,21 @@ child_environment :: proc() -> [^]cstring {
 // costs when no timeout is set at all.
 CAPTURE_TIMEOUT :: 10 * time.Second
 
+// CONTROL_TIMEOUT is the budget for ONE control command the user is WAITING on
+// with a frozen screen. It is derived from the transport, not picked: the
+// mandatory ssh form carries `-o ConnectTimeout=5`, so a host that is gone
+// answers in ~5 s and a live host answers in milliseconds. 6 s is that bound
+// plus a second of slack, and it is the longest honest "working…" the delete
+// path may ever show.
+//
+// The 10 s CAPTURE_TIMEOUT was DOUBLE what the ssh bound advertises: a delete
+// aimed at a host that went away held a frozen UI for 10 s on `stop` and then
+// 10 s on `delete`, for an answer that cannot arrive later than 5 s after each.
+//
+// Background fetches do NOT use this. They are bounded the other way (deadlines
+// and floors, ISC-3) because there a late answer is still worth keeping.
+CONTROL_TIMEOUT :: 6 * time.Second
+
 // CAPTURE_EXIT_TIMEOUT is reported when *we* killed a long-running child. 124 is
 // the `timeout(1)` convention so it cannot be mistaken for a herdr answer.
 CAPTURE_EXIT_TIMEOUT :: 124

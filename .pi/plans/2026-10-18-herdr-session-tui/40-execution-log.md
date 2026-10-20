@@ -618,3 +618,136 @@ until `+5014 ms`, released only when an unrelated host's ssh exited. Fixed by ca
 `POLL_SLICE` while anything is unreaped (keeping `-1` only for an empty registry).
 **Notable: `HS_TUI_DEBUG` was removed deliberately because the bug vanished whenever it was watched** —
 a genuine Heisenbug, caught by timing rather than by logging.
+
+---
+
+## Review remediation — 2026-10-20 (P1 + the product-side P2s)
+
+Reviewer verdict was *ready with caveats*, gated on one **P1** and four **P2s**
+(`review-2026-10-20.md`). All five are closed. Baseline before the work:
+`b9f5d4b`, 1090 PASS / 0 FAIL. After: **1195 PASS / 0 FAIL**, same suites,
+nothing re-scoped.
+
+### P1 — `cleanup_policy` deleted sessions on the wrong host
+
+`post_detach(name, we_created)` called `stop_argv` / `delete_argv` directly.
+Both are **local by construction**, so `always` (or `only_created`) after
+detaching from a **remote** row stopped and deleted the **local** session that
+shared the name, and reported success. The delete path already had the right
+shape (`control_argv(device, …)`); the detach path just never used it.
+
+- `post_detach(device, name, we_created)`, routed through a new pure
+  `cleanup_argv(device, name)` → `control_argv` for both commands.
+- **Never claims a cleanup it did not perform.** The `delete` answer is the
+  authority (a failed `stop` is normal); if the delete did not land the notice
+  reads `… <name> on <device> NOT cleaned (<reason>)`. Before this, an
+  unreachable remote read "stopped and deleted" while nothing happened.
+- Evidence — `app-unit`: the remote cleanup argv carries the device in the
+  host slot for **both** stop and delete; the local cleanup argv carries **no**
+  ssh; and the remote argv is asserted **not equal** to the bare local argv the
+  old code used. `app-live`: a real local scratch session **survives** a
+  cleanup aimed at the unreachable device, before/after lists printed.
+- **Fixture honesty:** the loop-back fixture cannot stage two distinct machines
+  under one name (`localhost` *is* this box), so the "local namesake survives"
+  half is staged with a device whose cleanup cannot be performed locally. The
+  positive half (a reachable device routes over ssh, verbatim) is pinned at argv
+  level in the same case, because running it would delete the same local row.
+- `README.md` no longer says "set `always` to get the old behaviour back"
+  without saying the old behaviour was wrong here; the new *Cleanup follows the
+  device* section names the failure mode and tells people to check for sessions
+  they did not mean to lose.
+
+### P2-4 — staleness was invisible
+
+- **Refresh on entering `{Attach}` and `{Delete}`** (`state_needs_refresh`, a
+  predicate on the state so the rule cannot drift from the state table). Local
+  is re-read inline (~3 ms); remote rows keep the freshest fetch that landed
+  rather than blocking a state transition on an ssh round-trip.
+- **`Ctrl-L` refreshes from every state**, and says so (`list re-read — list now`).
+  It is a control key because every printable key in those states is the filter.
+- **The footer shows the list's age** (`… · 4s`). The loop still never wakes on
+  a timer (ISC-A-2 idle stays at 0 ticks), so the number is "age as of the
+  frame you are reading" — which is the frame that matters.
+- **Re-validation before the spawn**: `tui_revalidate_attach` re-runs the guard
+  against the freshest view immediately before `run_child`, local re-read
+  included. A transient local failure falls back to the existing rows rather
+  than newly refusing, so a hiccup cannot block attaching to a session that is
+  plainly on screen.
+- ⚠️ **Overrode one reviewer suggestion**: `attach_guard` does **not** require
+  `running == true`. Attaching to a stopped session is what `herdr session
+  attach` *resumes* — the core action. The "stopped may mean deleted" concern
+  is answered by the refresh + last-moment re-check above, not by forbidding
+  the target. Pinned both ways in `app-unit`: stopped-and-known passes guard and
+  revalidate; unknown fails both, with the same message.
+
+### P2-5 — a delete could freeze the UI for 10–20 s
+
+- New `CONTROL_TIMEOUT = 6 s`, **derived** from the transport
+  (`ConnectTimeout=5` + slack), not picked. `do_delete` caps its budget at it
+  as well as the call site, so nobody can hand a delete the long leash again.
+  `app-unit` reads the bound out of `SSH_BASE_ARGS` rather than hardcoding 5,
+  so the check moves if the argv does.
+- **The "working…" frame is painted before the blocking call**, not after.
+  Proven in a real pty (`delete-notice`): against a shim that stalls stop and
+  delete by 2 s each, `working:` is on the tty **+0.05 s** after Enter and the
+  verdict lands **+4.04 s**. `app-live` measures a single black-hole control
+  command at **5.01 s** against the 6 s cap — ssh's own bound, not ours, and
+  under the old 10 s allowance.
+- The scenario is hermetic by construction: the shim never forwards to the real
+  herdr, the fixture hosts are blanked, and the only selectable row on screen
+  is fabricated — so no real session (least of all the one hosting this agent)
+  has a path to being touched.
+
+### P2-6 — `registry_reap_debts` could not repay
+
+`fetch_reap`'s guard was `!spawned || settled`. A fetch the kill path settled
+whose reap then ran out of budget came back as "already finished": no waitpid,
+`reaped` never flipped, and the reaper that selects exactly that case skipped
+it. Zombie forever, debt counted as repaid. Guard is now `settled && reaped`.
+`fetch-unit` drives a **real** child through the **real** reaper and reads the
+kernel's opinion at both ends — `/proc/<pid>/stat` is `Z` before the sweep and
+gone after, verdict intact, second sweep a no-op. `/proc` and not `waitpid` on
+purpose: `waitpid` would collect the child and destroy the thing under test.
+
+### P2-7 — a device starting with `-` was ssh option injection
+
+`-F/tmp/evil` as a remote made ssh read an attacker-chosen config file, which
+**replaces** `BatchMode=yes` / `ConnectTimeout=5` — every D5 guarantee void.
+Refused at the parse site (with a footer warning that names the target) and
+again by `remote_is_valid` via a new `remote_invalid_reason`, so the gate and
+the sentence cannot disagree. `user@host` stays legal.
+
+**Deliberately did NOT add `--` to the ssh argv.** The class is closed before
+any argv is built — every device reaches `remote_list_argv` / `control_argv` /
+`launch_argv` through `remote_is_valid` (`discover_resolved` filters both the
+config and the registry path, and `parse_remotes` drops it with the warning) —
+and `--` would change a byte-exact argv that ISC-4's evidence pins. Rejected
+input beats escaped input when only one of them is tested.
+
+### Totals (fixture-armed)
+
+| Suite | Before | After | Delta |
+|---|---|---|---|
+| `app-smoke.sh` (fixture-armed) | 400 | **487** | +87 |
+| `tui-smoke.sh` (fixture-armed) | 99 | **117** | +18 |
+| `state-smoke.sh` | 198 | 198 | — |
+| `theme-smoke.sh` | 166 | 166 | — |
+| `render-smoke.sh` | 69 | 69 | — |
+| `handoff-smoke.sh` | 28 | 28 | — |
+| `ui-smoke.sh` | 90 (6/6 cases) | 90 (6/6) | — |
+| `resize-smoke.sh` | 120 (15/15 runs) | 120 (15/15) | — |
+| **Total, counted as `[PASS]` lines** | **1170** | **1275** | **+105** |
+| **Total, on the plan's convention** (resize counted as its old 5 runs = 40) | **1090** | **1195** | **+105** |
+
+**Counting note, recorded rather than smoothed over.** The plan's 1090 predates
+T6.5/T6.6, when `resize-smoke` grew from 5 runs to 15 (40 checks -> 120).
+Counted the same way at both ends the delta is **+105 either way**; only the
+absolute total depends on which resize convention is used. Every suite is
+**0 FAIL** at both ends. Report the per-suite numbers, not the headline.
+
+Hygiene re-checked: `~/.config/herdr_session.json` still absent, no `hs-*`
+session left behind, no binary or blob staged, `grep -rn 'localhost\|127.0.0.1'
+src/` empty (my own first draft of the new tests violated that and was fixed to
+RFC 5737 documentation space — the guard caught it, which is the guard
+working). O11/O12/O13, the poll set, idle CPU, fd/zombie/cloexec hygiene and
+the no-new-threads rule are untouched and still green.

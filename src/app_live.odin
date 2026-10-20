@@ -76,6 +76,8 @@ case_app_live :: proc() -> bool {
 	live_remote_list()
 	live_device_discriminator()
 	live_timeout()
+	live_detach_routes_to_the_device()
+	live_control_budget_live()
 	live_cleanup()
 
 	return !any_failed
@@ -762,6 +764,162 @@ live_cleanup :: proc() {
 			contains_name(list_now(), host),
 			fmt.tprintf("host={} names={}", host, names_of(list_now())))
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// P1 LIVE — the cleanup goes to the device that owns the session, and the local
+// same-named session SURVIVES
+// ---------------------------------------------------------------------------
+
+// live_detach_routes_to_the_device is the P1 acceptance run against real
+// processes and real ssh.
+//
+// The bug: `cleanup_policy = "always"` after a detach ran the BARE local
+// `herdr session stop/delete <name>`, so cleaning up a REMOTE row destroyed the
+// LOCAL session that shared the name.
+//
+// The loop-back fixture cannot stage two distinct machines under one name: the
+// "remote" IS this box, so a remote scratch and a local scratch are literally
+// the same session and taking one down legitimately takes both. What CAN stage the class
+// exactly is a device whose cleanup cannot be performed locally: an
+// unreachable host. If the cleanup is device-routed, the local same-named
+// session survives it and the notice says the remote cleanup FAILED. If it is
+// not routed — which is what the review reproduced — the local session dies.
+live_detach_routes_to_the_device :: proc() {
+	say("  — P1 LIVE: detach cleanup is routed to the row's device")
+
+	victim := "hs-t-p1-namesake"
+	teardown_scratch_named(victim, "pre-run safety")
+	if !spawn_scratch_session_pty(victim) {
+		say("    SKIP: could not create the local scratch session under a pty")
+		return
+	}
+
+	before := list_now()
+	check("the LOCAL same-named session exists before the remote cleanup",
+		contains_name(before, victim), fmt.tprintf("local names={}", names_of(before)))
+
+	dead := fx_unreachable_live()
+	app.set_cleanup_policy(.always)
+	defer app.set_cleanup_policy(app.DEFAULT_CLEANUP_POLICY)
+
+	t0 := time.now()
+	msg := app.post_detach(dead, victim, true)
+	elapsed := time.since(t0)
+	say(fmt.tprintf("    cleanup aimed at unreachable device {} in {}s",
+		dead, f64(i64(elapsed / time.Millisecond)) / 1000.0))
+	say(fmt.tprintf("    post_detach notice: {}", msg))
+
+	check("the notice reports the cleanup did NOT land (never claims success)",
+		strings.contains(msg, "NOT cleaned"), fmt.tprintf("notice={}", msg))
+	check("the notice names the device the cleanup was aimed at",
+		strings.contains(msg, dead), fmt.tprintf("notice={}", msg))
+	check("the notice never claims it stopped and deleted",
+		!strings.contains(msg, "stopped and deleted"), fmt.tprintf("notice={}", msg))
+	check("the cleanup stayed inside the control budget",
+		elapsed <= app.CONTROL_TIMEOUT * 2 + 2 * time.Second,
+		fmt.tprintf("elapsed={}", f64(i64(elapsed / time.Millisecond)) / 1000.0))
+
+	after := list_now()
+	say(fmt.tprintf("    local sessions BEFORE: {}", names_of(before)))
+	say(fmt.tprintf("    local sessions AFTER : {}", names_of(after)))
+	check("THE LOCAL SAME-NAMED SESSION SURVIVED the remote cleanup (P1)",
+		contains_name(after, victim), fmt.tprintf("local names={}", names_of(after)))
+
+	teardown_scratch_named(victim, "end of the P1 live case")
+	check("teardown removed the scratch session",
+		!contains_name(list_now(), victim), fmt.tprintf("names={}", names_of(list_now())))
+
+	// The positive half, pinned at argv level (running it for real would delete
+	// the same local session on this loopback fixture): a REACHABLE device's
+	// cleanup goes out over ssh, to that device, verbatim.
+	r := live_remote()
+	if r != "" {
+		ok_stop, ok_del := app.cleanup_argv(r, victim)
+		eq("reachable remote cleanup stop goes through ssh", ok_stop[0], "ssh")
+		eq("reachable remote cleanup delete goes through ssh", ok_del[0], "ssh")
+		eq("reachable remote cleanup stop targets the device verbatim",
+			ok_stop[len(app.SSH_BASE_ARGS)+1], r)
+		eq("reachable remote cleanup delete targets the device verbatim",
+			ok_del[len(app.SSH_BASE_ARGS)+1], r)
+		say(fmt.tprintf("    live remote cleanup stop argv:   {}", app_argv_text(ok_stop)))
+		say(fmt.tprintf("    live remote cleanup delete argv: {}", app_argv_text(ok_del)))
+	}
+}
+
+// live_control_budget_live measures the control path against the black-holed
+// fixture so the delete "working…" bound is a measurement and not a promise.
+live_control_budget_live :: proc() {
+	say("  — P2-5 LIVE: one control command against a black-holed host")
+	dead := fx_unreachable_live()
+
+	argv := app.control_argv(dead, app.delete_argv("hs-t-nope"))
+	t0 := time.now()
+	c := app.run_capture(argv, app.CONTROL_TIMEOUT)
+	elapsed := time.since(t0)
+	secs := f64(i64(elapsed / time.Millisecond)) / 1000.0
+	say(fmt.tprintf("    {} -> exit {} in {}s", app_argv_text(argv), c.code, secs))
+
+	check("the command returned (no hang)", c.spawned && !c.timed_out,
+		fmt.tprintf("spawned={} timed_out={}", c.spawned, c.timed_out))
+	check("…inside the CONTROL_TIMEOUT budget", elapsed <= app.CONTROL_TIMEOUT,
+		fmt.tprintf("elapsed={}s budget={}s", secs, f64(app.CONTROL_TIMEOUT / time.Second)))
+	check("…and it took ssh's own bound, not ours (ssh answers at ConnectTimeout)",
+		secs >= 4.0 && secs <= 6.0, fmt.tprintf("elapsed={}s", secs))
+	check("…which is UNDER the old 10 s CAPTURE_TIMEOUT this used to be allowed",
+		elapsed < app.CAPTURE_TIMEOUT,
+		fmt.tprintf("elapsed={}s capture={}s", secs, f64(app.CAPTURE_TIMEOUT / time.Second)))
+}
+
+// spawn_scratch_session_pty creates a REAL running session from a driver that
+// has no terminal of its own. herdr refuses to attach without a usable tty, so
+// `script` supplies one and `stty` gives it a size herdr will accept; the
+// timeout then kills the *client* and the session's server stays up.
+//
+// Refuses any name outside the `hs-t-` scratch prefix. Nothing in this file may
+// create a session it cannot also tear down.
+spawn_scratch_session_pty :: proc(name: string) -> bool {
+	if !strings.has_prefix(name, SCRATCH_PREFIX) {
+		say(fmt.tprintf("    REFUSED to create non-scratch session {}", name))
+		return false
+	}
+	cmd := fmt.tprintf(
+		"timeout 5 script -q -c 'stty rows 24 cols 80; {} --session {}' /dev/null >/dev/null 2>&1 || true",
+		app.HERDR_BIN, name)
+	app.run_capture({"sh", "-c", cmd}, 20 * time.Second)
+	for _ in 0 ..< 10 {
+		if contains_name(list_now(), name) { return true }
+		time.sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+// fx_unreachable_live mirrors fetch_live's fixture reader: TEST-NET-1 is
+// unroutable by construction, so it black-holes instead of refusing, which is
+// the case that used to be reported as a *completed* cleanup.
+fx_unreachable_live :: proc() -> string {
+	v := os.get_env_alloc("HERDR_SESSION_TEST_UNREACHABLE", context.allocator)
+	if v != "" { return v }
+	return "192.0.2.201"
+}
+
+// teardown_scratch_named stops+deletes one `hs-t-*` name through OUR code path
+// and says what it did. Names outside the scratch prefix are refused.
+teardown_scratch_named :: proc(name: string, stage: string) {
+	if !strings.has_prefix(name, SCRATCH_PREFIX) {
+		say(fmt.tprintf("    REFUSED teardown of non-scratch name {}: {}", name, stage))
+		return
+	}
+	rows := list_now()
+	if !contains_name(rows, name) { return }
+	run := false
+	for r in rows { if r.name == name { run = r.running } }
+	if run {
+		app.run_capture(app.stop_argv(name), app.CONTROL_TIMEOUT)
+	}
+	app.run_capture(app.delete_argv(name), app.CONTROL_TIMEOUT)
+	say(fmt.tprintf("    teardown ({}): stopped+deleted {} (was running: {})", stage, name, run))
 }
 
 // cleanup_scratch stops and deletes the scratch session through OUR code path, so

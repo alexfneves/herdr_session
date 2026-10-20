@@ -102,6 +102,26 @@ attach_guard :: proc(rows: []Session, device: string, name: string) -> Guard {
 	return Guard{ok = true}
 }
 
+// DELIBERATE OVERRIDE of one review suggestion: `attach_guard` does NOT add
+// `running == true`. Attaching to a session herdr reports as *stopped* is a
+// core action here — `herdr session attach` resumes it — and a blanket "only
+// running rows may be attached" rule would disable the main thing the TUI
+// exists for. The review's underlying concern (a snapshot's "stopped" may
+// really mean "deleted since the fetch") is real, but it belongs to FRESHNESS,
+// not to a permission rule: the model is re-read when the user enters the
+// attach state and again immediately before the spawn, so the guard runs
+// against a fresh read rather than a frozen one. A name that is genuinely gone
+// still fails closed, exactly as before.
+//
+// revalidate_attach IS that second read: `attach_guard` re-run over the freshest
+// view the poll loop holds, at the last moment before the spawn. The separate
+// name exists so the call site says out loud that the identity was checked
+// twice, and so `app-unit` can pin both halves: a STOPPED-but-known row passes
+// both, an unknown row fails both.
+revalidate_attach :: proc(rows: []Session, device: string, name: string) -> Guard {
+	return attach_guard(rows, device, name)
+}
+
 // delete_guard mirrors the model's answer before we ask herdr anything. The
 // wording matters: "nothing was deleted" is the truth for a name we never saw,
 // where herdr would have said "deleted".
@@ -144,6 +164,14 @@ execute :: proc(cmd: Command, rows: []Session, home: string,
 	case .quit:
 		return Effect{kind = .quit}
 
+	case .refresh:
+		// The loop that issued this command is the same loop that owns the
+		// children, so the executor has nothing left to do: tui_run_command
+		// performed the re-read before delegating. Arriving here means a caller
+		// forgot that, and the honest answer is "nothing happened" rather than a
+		// second refresh.
+		return Effect{kind = .none}
+
 	case .launch_local, .launch_remote:
 		return do_launch(cmd, home)
 
@@ -178,7 +206,7 @@ do_launch :: proc(cmd: Command, home: string) -> Effect {
 	// We asked for this name to exist, so it is the one candidate for cleanup
 	// once the child is gone. Under the parked policy this is a no-op sentence.
 	if eff.kind == .child {
-		eff.message = fmt.tprintf("{} — {}", eff.message, post_detach(cmd.name, true))
+		eff.message = fmt.tprintf("{} — {}", eff.message, post_detach(cmd.device, cmd.name, true))
 	}
 	return eff
 }
@@ -234,7 +262,7 @@ do_attach :: proc(cmd: Command, rows: []Session, home: string) -> Effect {
 	// touches nothing. Passing we_created = false is what makes that distinction
 	// real rather than assumed.
 	if eff.kind == .child {
-		eff.message = fmt.tprintf("{} — {}", eff.message, post_detach(cmd.name, false))
+		eff.message = fmt.tprintf("{} — {}", eff.message, post_detach(cmd.device, cmd.name, false))
 	}
 	return eff
 }
@@ -244,6 +272,12 @@ do_attach :: proc(cmd: Command, rows: []Session, home: string) -> Effect {
 // -----------------------------------------------------------------------------
 
 do_delete :: proc(cmd: Command, rows: []Session, budget: time.Duration) -> Effect {
+	// A delete is the one control command the user watches the screen for, so its
+	// budget is capped at the transport bound instead of the generic 10 s capture
+	// ceiling: 2 commands x 6 s is the worst honest "working…", where 2 x 10 s
+	// was twice what `ConnectTimeout=5` advertises. Capped here as well as at the
+	// call site, so no caller can hand a delete the long leash again.
+	capped := min(budget, CONTROL_TIMEOUT)
 	// The guard runs first so an unknown name never even reaches herdr.
 	// `delete_session` re-checks internally (defence in depth) and refuses the
 	// same way; both layers must agree, and `app-unit` pins that.
@@ -252,7 +286,7 @@ do_delete :: proc(cmd: Command, rows: []Session, budget: time.Duration) -> Effec
 		return Effect{kind = .refused, message = g.reason}
 	}
 
-	r := delete_session(rows, cmd.device, cmd.name, budget)
+	r := delete_session(rows, cmd.device, cmd.name, capped)
 	if r.refused {
 		return Effect{kind = .refused, message = r.reason}
 	}
@@ -311,19 +345,64 @@ run_child :: proc(argv: []string, home: string) -> Effect {
 // The D2 seam — wired, not invented
 // -----------------------------------------------------------------------------
 
+// cleanup_argv decides what "destroy this session" MEANS on one device: the bare
+// herdr control command locally, the mandatory ssh-wrapped form remotely. Pure,
+// no spawn and no config read, because it is the P1 proof.
+//
+// The detach path used to call `stop_argv` / `delete_argv` directly, and both are
+// LOCAL by construction. `cleanup_policy = "always"` after detaching from a
+// REMOTE row therefore stopped and deleted the LOCAL session that happened to
+// share the name. (device, name) is the identity (D8): a cleanup that drops the
+// device half of the pair destroys the wrong session. This is the same class the
+// delete path already guards with `control_argv`, which is what routes here now.
+cleanup_argv :: proc(device: string, name: string) -> (stop: []string, del: []string) {
+	stop = control_argv(device, stop_argv(name))
+	del = control_argv(device, delete_argv(name))
+	return
+}
+
+// cleanup_target_label renders the device for the notice: "local" for the local
+// device, the verbatim target for everything else.
+cleanup_target_label :: proc(device: string) -> string {
+	if is_local_device(device) { return "local" }
+	return device
+}
+
 // post_detach runs right after a handoff returns, and asks the policy whether the
 // session we just left should be destroyed. With D2 parked at `never` it destroys
 // nothing and reports that, which is the point: the seam is exercised on every
 // detach so the day D2 is decided it is one constant, not a code hunt.
-post_detach :: proc(name: string, we_created: bool) -> string {
+//
+// It takes the DEVICE because the cleanup has to happen on the host that owns the
+// session, and it never claims a cleanup it did not perform. The `delete` answer
+// is the authority (a failed `stop` is normal — the session may already be
+// down): if the delete did not land, the notice says NOT cleaned and why, so a
+// remote host that went away mid-attach shows up on the footer as a live problem
+// instead of a silent "done". Without that, `always` against an unreachable
+// remote read "stopped and deleted" while nothing was stopped, nothing was
+// deleted, and the local namesake was gone.
+post_detach :: proc(device: string, name: string, we_created: bool) -> string {
 	p := cleanup_policy()
 	if !cleanup_should_run(p, name, we_created) {
 		return fmt.tprintf("cleanup_policy={}: {} left running",
 			cleanup_policy_label(p), name)
 	}
-	run_capture(stop_argv(name), CAPTURE_TIMEOUT)
-	run_capture(delete_argv(name), CAPTURE_TIMEOUT)
-	return fmt.tprintf("cleanup_policy={}: {} stopped and deleted", cleanup_policy_label(p), name)
+	label := cleanup_target_label(device)
+	stop_cmd, delete_cmd := cleanup_argv(device, name)
+	stop := run_capture(stop_cmd, CONTROL_TIMEOUT)
+	del := run_capture(delete_cmd, CONTROL_TIMEOUT)
+	if del.code != 0 {
+		why := parse_error_envelope(del.err).message
+		if why == "" { why = fmt.tprintf("exit {}", del.code) }
+		if del.timed_out {
+			why = fmt.tprintf("{} (timed out at {}s)", why, int(CONTROL_TIMEOUT / time.Second))
+		}
+		return fmt.tprintf("cleanup_policy={}: {} on {} NOT cleaned ({})",
+			cleanup_policy_label(p), name, label, why)
+	}
+	_ = stop
+	return fmt.tprintf("cleanup_policy={}: {} on {} stopped and deleted",
+		cleanup_policy_label(p), name, label)
 }
 
 cleanup_policy_label :: proc(p: Cleanup_Policy) -> string {

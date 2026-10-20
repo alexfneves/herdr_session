@@ -808,12 +808,202 @@ def scenario_no_orphan():
           "ECHILD again: no child, no `session delete` call")
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A herdr that is SLOW on purpose
+#
+# The delete path's "working…" repaint is a claim about ORDER: the frame must be
+# on the tty BEFORE the blocking control commands run, and the screen must stay
+# readable while they do. Against a local herdr that answers in 20 ms the whole
+# thing is over before the harness can look, so the property cannot be observed.
+#
+# This shim makes it observable. It answers `session list` with ONE fabricated
+# scratch row and answers stop/delete by sleeping, so:
+#
+#   * nothing real is addressed — the shim never forwards to the real herdr, so
+#     no real session (certainly not the one hosting this agent) can be stopped
+#     or deleted by this scenario;
+#   * the delete takes seconds, and the frames around it can be timed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SLOW_HERDR = r"""#!/bin/sh
+# dev-only shim. argv: %s
+PAYLOAD='{"sessions":[{"default":false,"name":"hs-t-slowdel","running":true,
+  "session_dir":"/tmp/hs-slowdel","socket_path":"/tmp/hs-slowdel/herdr.sock"}]}'
+case "$*" in
+  *"session list"*)   printf '%s\n' "$PAYLOAD"; exit 0 ;;
+  *"machine list"*)   printf '[]\n'; exit 0 ;;
+  *"session stop"*)   sleep 2; printf '{}\n'; exit 0 ;;
+  *"session delete"*) sleep 2; printf '{"deleted":true}\n'; exit 0 ;;
+  *)                  exit 0 ;;
+esac
+"""
+
+
+def slow_herdr_dir():
+    """An on-PATH directory holding a `herdr` that stalls the control commands.
+
+    Returns (dir, fake_home) with PATH already pointing at the shim first, so
+    the app's own resolve_program finds it before the real binary.
+    """
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="hs-slow-herdr-")
+    home = tempfile.mkdtemp(prefix="hs-slow-home-")
+    script = os.path.join(d, "herdr")
+    with open(script, "w") as fh:
+        fh.write(SLOW_HERDR)
+    os.chmod(script, 0o755)
+    return d, home
+
+
+def scenario_delete_notice():
+    """P2-5: a delete must PAINT before it blocks, not after.
+
+    The delete is two sequential control commands the user watches with a
+    frozen screen. Without a "working…" frame painted first, the screen holds
+    the OLD list for the whole wait and there is no way to tell working from
+    hung. Driven against the stalling shim so the wait is real and the order is
+    measurable.
+    """
+    shim, home = slow_herdr_dir()
+    live_before = session_names()
+    try:
+        # HERMETIC on purpose. The fixture hosts are blanked so the app has ONE
+        # device (local) and ONE row (the shim's fabricated session): a delete
+        # in this scenario has no path — not even a mistaken one — to a real
+        # session. Passing `env` to Pty merges over os.environ, so blanking has
+        # to be explicit for the scrub to actually stick.
+        env = base_env({
+            "PATH": shim + ":" + env_path(),
+            "XDG_CONFIG_HOME": home,
+            "HOME": home,
+            "HERDR_SESSION_TEST_REMOTE": "",
+            "HERDR_SESSION_TEST_REMOTE_ALIAS": "",
+            "HERDR_SESSION_TEST_UNREACHABLE": "",
+        })
+        p = Pty(["tui"], env=env, rows=30, cols=110)
+        try:
+            check("boot with the stalling herdr shim",
+                  p.wait_screen("herdr-session", 6.0) is not None, p.exit_info())
+            check("only the local device is configured (fixture blanked for safety)",
+                  "localhost" not in p.screen.text(),
+                  "footer: {}".format(last_line(p.screen.text())))
+            p.keys("d", pause=0.4, settle=0.8)
+            check("delete state is up", "delete_session" in p.screen.text(),
+                  "footer: {}".format(last_line(p.screen.text())))
+            check("…and the ONLY selectable row is the shim's fabricated scratch session",
+                  "hs-t-slowdel" in p.screen.text(),
+                  "screen rows: {}".format(
+                      [l.strip() for l in p.screen.text().splitlines()
+                       if l.strip() and l.startswith(" local")]))
+
+            # Down as ONE write (char-by-char would put ESC on its own through
+            # the decoder and bounce us out of the state), Enter as CR.
+            p.send("\x1b[B")
+            time.sleep(0.25)
+            p.read(0.1)
+            # Timed from the KEYPRESS, not from spawn: watch_screen reports
+            # spawn-relative times, and the claim under test is "the frame was on
+            # the tty before the blocking control commands ran".
+            t_press = time.monotonic()
+            p.send("\r")
+            seen = p.watch_screen({"work": "working:", "done": "deleted from"},
+                                timeout=14.0)
+            off = t_press - p.t0
+            el_work = None if seen.get("work") is None else seen["work"] - off
+            el_done = None if seen.get("done") is None else seen["done"] - off
+            print("    'working:' {:+.2f}s after Enter · final notice {:+.2f}s after Enter".format(
+                -1 if el_work is None else el_work,
+                -1 if el_done is None else el_done))
+
+            check("the 'working…' frame reached the tty", el_work is not None,
+                  "never saw 'working:'")
+            check("…and it reached it BEFORE any control command could have finished",
+                  el_work is not None and el_work < 1.0,
+                  "first seen at +{}".format(el_work))
+            check("the delete then COMPLETED and repainted its verdict",
+                  el_done is not None, "never saw 'deleted from'")
+            if el_work is not None and el_done is not None:
+                gap = el_done - el_work
+                check("…the working frame was visible for the whole wait (shim: 2 x 2 s)",
+                      gap >= 2.0, "visible for {:.2f}s".format(gap))
+                check("…and the whole delete stayed inside the 2 x CONTROL_TIMEOUT budget",
+                      el_done < 12.0, "done at +{:.2f}s".format(el_done))
+            check("no REAL session was stopped or deleted by this scenario",
+                  session_names() == live_before,
+                  "live list before={} after={}".format(live_before, session_names()))
+        finally:
+            p.kill()
+            p.close()
+    finally:
+        import shutil
+        shutil.rmtree(shim, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def scenario_refresh_key():
+    """P2-4: Ctrl-L re-reads, and the footer says how old the rows are."""
+    p = Pty(["tui"], env=base_env(), rows=32, cols=110)
+    try:
+        check("boot", p.wait_screen("herdr-session", 6.0) is not None, p.exit_info())
+        check("the footer carries a list-age token from the start",
+              "list " in p.screen.text(),
+              "footer: {}".format(last_line(p.screen.text())))
+
+        # Let the snapshot go visibly stale without touching anything.
+        time.sleep(2.5)
+        p.keys("\x15", pause=0.05, settle=0.4)  # Ctrl-U: a repaint-only key
+        txt = p.screen.text()
+        check("after 2.5 s idle the footer AGE is not 'now' (staleness is visible)",
+              "list now" not in last_line(txt) and "list never" not in last_line(txt),
+              "footer: {}".format(last_line(txt)))
+
+        p.send("\x0c")  # Ctrl-L
+        t = p.wait_screen("list re-read", 4.0)
+        check("Ctrl-L re-read the list and said so", t is not None,
+              "never saw 'list re-read'")
+        check("…and the age went back to 'now'", "list now" in p.screen.text(),
+              "footer: {}".format(last_line(p.screen.text())))
+
+        # Entering Attach must refresh by itself: the row is about to be acted on.
+        time.sleep(2.5)
+        p.keys("a", pause=0.3, settle=0.6)
+        check("entering {Attach} re-read the list (age back to 'now')",
+              "list now" in p.screen.text(),
+              "footer: {}".format(last_line(p.screen.text())))
+        check("…and we are in the attach state", "attach" in p.screen.text(),
+              "footer: {}".format(last_line(p.screen.text())))
+
+        time.sleep(2.5)
+        p.keys("\x1b", pause=0.2, settle=0.4)   # Esc back to mode selection
+        p.keys("d", pause=0.3, settle=0.6)
+        check("entering {Delete} re-read the list too",
+              "list now" in p.screen.text(),
+              "footer: {}".format(last_line(p.screen.text())))
+    finally:
+        p.kill()
+        p.close()
+
+
+def env_path():
+    return os.environ.get("PATH", "/usr/bin:/bin")
+
+
+def last_line(text):
+    lines = [l for l in text.splitlines() if l.strip()]
+    return lines[-1] if lines else ""
+
+
 SCENARIOS = {
     "boot-local": scenario_boot_local,
     "boot-remote": scenario_boot_remote,
     "sigterm": scenario_sigterm,
     "no-orphan": scenario_no_orphan,
     "roundtrip": scenario_roundtrip,
+    "delete-notice": scenario_delete_notice,
+    "refresh-key": scenario_refresh_key,
 }
 for _s in STATE_KEYS:
     SCENARIOS["state-" + _s] = (lambda n=_s: scenario_state(n))

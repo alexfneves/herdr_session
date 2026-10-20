@@ -84,15 +84,44 @@ remote_label :: proc(r: Remote) -> string {
 	return r.device
 }
 
-// remote_is_valid rejects empty and whitespace-laden targets before they become
-// argv. This is *not* the session-name charset rule — ssh targets legitimately
-// contain `@` and `:`, which session names may not.
-remote_is_valid :: proc(r: Remote) -> bool {
-	if len(r.device) == 0 { return false }
-	for b in transmute([]byte)(r.device) {
-		if b == ' ' || b == '\t' || b == '\n' || b == 0 { return false }
+// remote_invalid_reason says, in words a user can act on, why a target is
+// refused. "" means the target is usable. One source for the rule and the
+// sentence, so the footer can never disagree with the gate.
+//
+// The leading-`-` rule is OPTION INJECTION, not tidiness. The device travels as
+// an operand of `ssh -T ... <device> '<cmd>'` (remote_list_argv, control_argv)
+// and of `herdr --remote <device> ...` (launch_argv). A target that begins with
+// `-` is read by the transport as an OPTION instead of a host:
+//
+//	-F/tmp/evil       -> ssh reads an attacker-chosen config file, which
+//	                 REPLACES BatchMode=yes / ConnectTimeout=5 with whatever
+//	                 that file says. Every D5 guarantee is then void.
+//	-oProxyCommand=.. -> arbitrary command run by the transport itself.
+//
+// The class is closed at validation rather than by quoting, because the same
+// string has to work as an ssh operand, as `--remote`'s value and as a registry
+// key, and no single escape fixes all three. A device starting with `-` is not a
+// host anybody typed on purpose. `alice@host` mid-string stays legal.
+remote_invalid_reason :: proc(r: Remote) -> string {
+	if len(r.device) == 0 { return "empty device" }
+	if r.device[0] == '-' {
+		return fmt.tprintf(
+			"device '{}' starts with '-' and would be read by ssh / herdr as an OPTION, not a host - refused",
+			r.device)
 	}
-	return true
+	for b in transmute([]byte)(r.device) {
+		if b == ' ' || b == '\t' || b == '\n' || b == 0 {
+			return fmt.tprintf("device '{}' contains whitespace - refused", r.device)
+		}
+	}
+	return ""
+}
+
+// remote_is_valid rejects empty, whitespace-laden and option-looking targets
+// before they become argv. This is *not* the session-name charset rule — ssh
+// targets legitimately contain `@` and `:`, which session names may not.
+remote_is_valid :: proc(r: Remote) -> bool {
+	return remote_invalid_reason(r) == ""
 }
 
 //-----------------------------------------------------------------------------

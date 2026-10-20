@@ -298,6 +298,19 @@ parse_remotes :: proc(arr: json.Array) -> ([]Remote, []string) {
 		// "local" entry must not produce two rows for one device.
 		if target == DEVICE_LOCAL { continue }
 
+		// A target that starts with `-` is not a host, it is an OPTION wearing
+		// a host's clothes: `ssh -T … -F/tmp/evil …` reads an attacker-chosen
+		// config file, which REPLACES the mandatory BatchMode=yes /
+		// ConnectTimeout=5 that every D5 guarantee rests on. Refused at the
+		// parse site so the footer says why, and refused again by
+		// `remote_is_valid` for the registry path.
+		if len(target) > 0 && target[0] == '-' {
+			append(&notes, fmt.tprintf(
+				"config: remote %q starts with '-' and would be read by ssh as an OPTION, not a host - skipped",
+				target))
+			continue
+		}
+
 		dup := false
 		for sv in seen { if sv == target { dup = true } }
 		if dup { continue }

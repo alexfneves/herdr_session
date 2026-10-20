@@ -47,8 +47,9 @@ prebuilt binaries, and links only glibc (`libc`/`libm`).
 
 ## Key bindings
 
-The app has seven states. Every state can be left with `Esc`, and every state quits
-with `Ctrl-C`.
+The app has seven states. Every state can be left with `Esc`, every state quits
+with `Ctrl-C`, and **`Ctrl-L` re-reads the session list from every state** (see
+[How fresh is the list?](#how-fresh-is-the-list)).
 
 ### 1. Mode selection (the landing screen)
 
@@ -74,7 +75,12 @@ filter line.
 | type | filter |
 | `Enter` | attach (existing sessions only) |
 | `Esc` | back |
+| `Ctrl-L` | re-read the list before you choose |
 | `Ctrl-C` | quit |
+
+Entering this state re-reads the list first: a row you point at must be as current
+as we can make it, because attaching to a name that no longer exists would
+**create** one.
 
 `Enter` attaches only to a session that exists. It will not create one — creation
 is the `Enter`/`n`/`r`/`s` keys on the landing screen, so a stray `Enter` in this
@@ -188,6 +194,15 @@ groups its sessions. Nothing is normalised: no lower-casing, no stripping the us
 no alias resolution. That is deliberate. Rewriting `deploy@10.0.0.7` into
 `10.0.0.7` would attach you to a different machine than the one you configured.
 
+**One target is refused: anything that starts with `-`.** That is not a host, it
+is an ssh *option* wearing a host's clothes — `-F/tmp/evil` makes ssh read a
+config file of someone else's choosing, which replaces the mandatory
+`BatchMode=yes` / `ConnectTimeout=5` that every remote guarantee in this app
+rests on, and `-oProxyCommand=…` runs a command of the transport's own. Such a
+target is refused at config-parse time with a footer warning that names it, and
+refused again by the same rule on the registry path. `user@host` is fine; `-` at
+the front is not.
+
 Two forms, both accepted in the same array:
 
 ```json
@@ -268,7 +283,9 @@ colour is a named field on a palette, not an inline hex.
 > that session is still there in the list when you come back. Deletion is only ever
 > what you explicitly asked for with `d` → `Enter`.
 >
-> If you want the old behaviour back, set `"cleanup_policy": "always"`.
+> If you want the old behaviour back, set `"cleanup_policy": "always"` — but
+> read [Cleanup follows the device](#cleanup-follows-the-device) first, because
+> that is the part of the old behaviour that used to be wrong.
 
 Three accepted values:
 
@@ -289,6 +306,55 @@ The policy check lives in exactly one function
 (`cleanup_should_run` in `src/app/herdr.odin`) and the detach path calls it every
 time, so when D2 is eventually decided the change is one constant rather than a
 hunt through the code.
+
+### Cleanup follows the device
+
+A session's identity is the **pair** `(device, name)`, not the name. The same
+name can exist on this machine and on three remotes at once, and they are four
+different sessions.
+
+So `always` / `only_created` clean up **the device the row came from**:
+
+| Row's device | What the cleanup runs |
+|---|---|
+| local | `herdr session stop --json <name>` / `… delete --json <name>` |
+| remote | `ssh -T -o BatchMode=yes -o ConnectTimeout=5 <device> '<the same command>'` |
+
+**This is a fix, and it is worth knowing about.** Up to and including the
+reviewed build, `cleanup_policy = "always"` ran the *bare local* command no
+matter which device you had detached from — so detaching from
+`gpu-box:mywork` stopped and deleted **your local `mywork`** instead, and
+reported success. If you ran with `always` on a config that had remotes, check
+for sessions you did not mean to lose.
+
+Two honesty rules go with it:
+
+- A cleanup that **did not land** says so: `… <name> on <device> NOT cleaned
+  (<reason>)`. An unreachable host is never reported as "stopped and deleted".
+- Each cleanup command is capped at `CONTROL_TIMEOUT` (6 s), derived from the
+  `ConnectTimeout=5` the ssh form carries, so a dead host answers on its own
+  schedule rather than holding the app for twice as long as advertised.
+
+### How fresh is the list?
+
+The table is a **snapshot**, and a snapshot goes stale the moment someone else
+creates or deletes a session. Three things keep that visible instead of hidden:
+
+- **Entering Attach or Delete re-reads the list.** Those are the two states where
+  a stale row costs something, and entering them is the last moment a refresh is
+  free (~3 ms locally; remote rows keep the freshest fetch that landed rather
+  than blocking on an ssh round-trip).
+- **`Ctrl-L` refreshes from any state**, and says so: `list re-read — list now`.
+- **The footer shows the age of what you are looking at** — `local ok 2 … · 4s`.
+  If the age is large, the picture is old; press `Ctrl-L`. The loop never wakes
+  on a timer, so the number is the age as of the frame you are reading.
+
+One deliberate non-rule: a session herdr reports as **stopped** is still
+attachable. `herdr session attach` *resumes* a stopped session, and forbidding
+it would disable the main thing this tool is for. "Stopped and deleted
+meanwhile" is answered by refreshing (above) and by re-checking the exact row
+immediately before the spawn, not by refusing the target. If the name is
+genuinely gone, the attach is still refused.
 
 ---
 

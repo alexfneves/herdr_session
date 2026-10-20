@@ -101,6 +101,16 @@ State :: enum {
 	error,             // Single text — the last failure
 }
 
+// state_needs_refresh is true for the states whose entire content is "pick a
+// session from the list". Entering one of those is the last moment a refresh is
+// free, and the moment a stale row is most dangerous: attaching to a name that
+// was deleted elsewhere CREATEs it, and deleting a row that is already gone is a
+// lie either way. A predicate on the state (rather than a hardcoded pair in the
+// driver) so the rule is testable and cannot drift from the state table.
+state_needs_refresh :: proc(s: State) -> bool {
+	return s == .attach || s == .delete_session
+}
+
 state_label :: proc(s: State) -> string {
 	switch s {
 	case .mode_selection:    return "mode_selection"
@@ -146,6 +156,7 @@ Cmd_Kind :: enum {
 	show_error,    // surface `value` in the {Error} state
 	clear_filter,  // the filter line must go empty in the UI too
 	clear_field,   // the edit field must go empty in the UI too
+	refresh,       // re-read the session list; the loop owns fetching, not us
 	quit,          // exit the program (terminal restore is the executor's job)
 }
 
@@ -171,6 +182,7 @@ cmd_kind_label :: proc(k: Cmd_Kind) -> string {
 	case .show_error:  return "show_error"
 	case .clear_filter: return "clear_filter"
 	case .clear_field: return "clear_field"
+	case .refresh:    return "refresh"
 	case .quit:        return "quit"
 	}
 	return "?"
@@ -178,6 +190,11 @@ cmd_kind_label :: proc(k: Cmd_Kind) -> string {
 
 no_cmd :: proc() -> Command { return Command{kind = .none} }
 quit_cmd :: proc() -> Command { return Command{kind = .quit} }
+
+// refresh_cmd asks the loop to re-read the session list. It carries no device and
+// no name because it changes nothing about the selection — `rebuild_shown` keeps
+// the cursor on the same (device, name) across the merge.
+refresh_cmd :: proc() -> Command { return Command{kind = .refresh} }
 
 cmd_launch_local :: proc(name: string) -> Command {
 	return Command{kind = .launch_local, device = DEVICE_LOCAL, name = name}
@@ -531,6 +548,16 @@ update :: proc(a: ^App, k: input.Key) -> Command {
 	// line rather than seven.
 	if k.kind == .ctrl_c {
 		return quit_cmd()
+	}
+
+	// Ctrl+L asks for a fresh list from EVERY state, and is checked in the same
+	// place for the same reason. The machine CANNOT fetch — a fetch is a child
+	// process, and `update` is pure (that purity is what makes the 7-state table
+	// testable with no terminal). So it names the intent and the poll loop
+	// performs it. No state transition: refreshing must not move the user out
+	// of the picker they are standing in.
+	if k.kind == .refresh {
+		return refresh_cmd()
 	}
 
 	#partial switch a.state {
