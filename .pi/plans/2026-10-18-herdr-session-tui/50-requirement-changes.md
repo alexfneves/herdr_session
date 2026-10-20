@@ -112,3 +112,71 @@ The worker reported **`app` 336 PASS / 3 FAIL** and **proved** those 3 reproduce
 pre-T6 baseline `d483f86`. So this is **not a T6 regression** — the environment moved underneath a
 green suite. The prior "823 PASS / 0 FAIL" was true when it was measured; it is no longer reproducible
 on this box until O12 is applied.
+
+---
+
+# RCH-3 — Four user requirements post-v1 (2026-10-20)
+
+The user added/corrected four behaviours after the first version. Each was checked against the code
+before being restated; three are **spec-conformance fixes the implementation had rationalised away**.
+
+## R1 — Destroy-on-detach for sessions WE created. **This resolves parked D2.**
+> "After creating/starting a session, then going back (the session was detached), it should delete the
+> session and update the list when going back to the main state. If the session was already deleted
+> there is no error to show."
+
+**Decision: `cleanup_policy` default becomes `only_created`** (was `never`).
+- Delete the session after the handoff returns **only when we created it**.
+- **Attaching to a pre-existing session must NOT delete it** — that is exactly what `only_created`
+  encodes, and why it is the right default rather than `always`.
+- **Refresh the list on return to `{Mode selection}`** — local immediately, remote fan-out merges in.
+- **Delete is idempotent and silent on "already gone".** herdr's `session delete` already returns
+  success for a non-existent name; we must not surface an error for it. A session the user deleted in
+  another terminal is not our problem to report.
+
+*D2 status: RESOLVED. The "parked at `never`" caveat in earlier notes is superseded.*
+
+## R2 — `{Mode selection}` must NOT accept filter typing  *(spec-conformance bug)*
+Spec lists the bindings for `{Mode selection}` as: `Enter`, `n`, `r`, `s`, `a`, `d`, `t`, `Escape`,
+`Ctrl+C`. **There is no "type in the filter" binding for Mode selection.** Only these states have it:
+- `{Select remote server for new remote session}`
+- `{Select session to attach}`
+- `{Select session to delete}`
+- `{Select theme}`
+
+The implementation currently does the opposite, **with a comment rationalising it**
+(`src/app/state.odin` `at_mode_selection`): *"Every other printable key filters the Sessions table …
+which is what keeps the spec's filter line usable in the Sessions view."* It is not what the spec says.
+Any unclaimed printable key leaks into the filter, so a mistyped mode key silently changes the list
+instead of doing nothing.
+
+**Decision:** filter editing lives **only** in the four states above. In `{Mode selection}`, an
+unclaimed printable key is a **no-op** — it must not mutate the filter. The filter **line is still
+displayed** in the Sessions layout (the spec requires it); it just isn't editable from there.
+
+## R3 — Delete key must remove filter characters  *(new requirement, root cause found)*
+**Root cause: `KEY_DELETE` is never mapped.** `src/input/keymap.odin:map_code` handles `KEY_BACKSPACE`
+(0x08) and `KEY_BACKSPACE2` (0x7f) but **not** `KEY_DELETE` (`CSI 3 ~` — the Del key, and fn+Delete on
+a Mac keyboard). It falls through to `.none`, `ch == 0`, and decodes to `NO_KEY`: the keypress is
+silently dropped. The filter's own backspace handler is fine — it just never sees that key.
+
+**Decision:** map `KEY_DELETE` → `.backspace` so it removes the last rune in every filter/edit state
+(`text_backspace` already deletes whole runes, so UTF-8 is safe).
+
+## R4 — Something is always highlighted unless the list is empty  *(new requirement)*
+- **Theme picker:** the **currently applied theme** is highlighted on open — already correct, keep it.
+- **Every other list:** the **first element** is highlighted on entry.
+- Today `rebuild_shown` sets `a.sel = -1`, so lists open with **no highlight**.
+
+**Decision + the invariant that keeps it safe.** The current `-1` exists for a good reason, documented as:
+*"if the selected row is filtered out the cursor must drop to -1, NOT slide onto whatever row shifted
+into its slot — sliding is how Enter ends up acting on a row the user never pointed at."*
+R4 supersedes the `-1`, but the danger is removed a different way by strengthening the real invariant:
+
+> **The highlighted row is always the selection.** After clamping to the first visible row, `held` MUST
+> be re-synced (`sync_cursors`) so `held` always denotes the highlighted row — never a row that was
+> filtered away, never a phantom.
+
+With that, "always highlighted" is *safer* than `-1`, not less safe: Enter can never act on a row that
+isn't visibly pointed at. An **empty** list still yields `sel = -1` with `held` invalid, and Enter is a
+no-op (spec: "If nothing was selected, pressing the key does nothing").
