@@ -1375,51 +1375,214 @@ whenever it was watching.
 
 ---
 
-### T6.1 — JSON config via `core:encoding/json`
+### T6.1 — JSON config via `core:encoding/json` ✅ DONE
 
-**Create:** `src/app/config.odin`
+**Created:** `src/app/config.odin` (+ `src/theme_cases.odin` for the checks,
+`dev/theme-smoke.sh` + `dev/theme_drive.py` as the runners)
 
-**D13: JSON — this removes the TOML dependency entirely. No `Up05/toml_parser`, no hand-rolled TOML.**
-File: **`~/.config/herdr_session.json`** (the spec said `.toml`; renamed by this decision).
-```odin
-Config :: struct {
-    theme   : string,          // default "gruvbox-dark"
-    remotes : []RemoteCfg,     // fallback remote list
-    // cleanup_policy omitted while D2 is parked; add later, defaulting to "never"
-}
-// Path via Odin stdlib XDG — verified resolves $XDG_CONFIG_HOME/herdr_session.json
-dir, cerr := os.user_config_dir(context.allocator)
-path    , _  := os.join_path({dir, "herdr_session.json"}, context.allocator)
+**D13 held: JSON only.** `core:encoding/json` for parse/marshal,
+`os.user_config_dir()` for location, single file
+`~/.config/herdr_session.json`. No TOML parser, no XDG package — the hygiene
+check asserts both (`0 non-comment hit(s)` for `/toml/i`, `0` XDG imports).
+`os.user_config_dir` already implements the whole XDG rule
+(`core/os/user_posix.odin:17`: `$XDG_CONFIG_HOME` → `$HOME/.config`), so the
+"stdlib XDG" line in the original note is literally what is used.
+
+Owned keys: `theme`, `remotes` (verbatim ssh targets), `cleanup_policy`.
+
+**Contract: a bad config must never brick the app.** `config_load` has no error
+return; every mode is absorbed and reported as one visible line. Captured:
+
+| input | captured result |
+|---|---|
+| file absent | `present=false warnings=0 theme='gruvbox-dark'` — **silent**, and `LOADING DID NOT CREATE a config file` |
+| `""` / whitespace | same as absent |
+| `{ this is not json at all` | `config <path> is not valid JSON (Expected_Colon_After_Key) - defaults in use`, `corrupt=true`, defaults still applied, **exactly one** warning |
+| `[1,2,3]` / `42` (root not object) | `config <path> must be a JSON object - defaults in use` |
+| `{"theme":"bogger"}` | `unknown theme 'bogger' - using gruvbox-dark (available: gruvbox-dark, gruvbox-light, catppuccin-latte, …)` |
+| `{"theme":42,"cleanup_policy":["never"],"remotes":"x"}` | 3 warnings, one per wrong-typed key; file **not** called corrupt (`corrupt=false present=true`) |
+| `{"cleanup_policy":"on"}` | `unknown cleanup_policy 'on' - using never` |
+| JSON5 (`// comments`, trailing comma) | loads — the parser's `DEFAULT_SPECIFICATION` is JSON5, which is why a hand-edited file forgives both |
+
+**Unknown keys survive a save — proven, and this is the deliberate design.**
+A save is read-modify-write of the parsed `json.Object`: parse, set our key,
+marshal the whole document. Hand-written file:
+
 ```
-**Corrupt / missing / unknown-theme must not brick the app:** fall back to defaults + surface one warning
-line in the footer. *ISC-19*.
-Saving writes **only the keys we own** — never silently clobber a hand-edited file.
+{ "hand_added_note": "do not eat this", "theme": "catppuccin-latte",
+  "future_key": {"nested": [1,2,3]}, "remotes": ["my-host"] }
+```
+after `config_save_theme(path, "nord")`:
+```json
+{ "cleanup_policy"…(later write), "future_key": {"nested": [1,2,3]},
+  "hand_added_note": "do not eat this", "remotes": ["my-host"], "theme": "nord" }
+```
+Survival re-asserted after a **third** write (`config_save_remotes`) and a
+fourth (`config_save_cleanup`). The saved file also **re-reads** to the theme
+that was saved with **zero warnings** — write and read agree.
 
-**Acceptance:** absent file → defaults; `{ "theme": "nonsense" }` → `gruvbox-dark` + warning, app starts.
+Two consequences recorded in the module header: an *unparseable* file cannot be
+preserved (the save replaces it with only our keys; the corrupt-mode warning
+already said it was invalid), and a key is **not** deleted just because it
+holds the default value — absent and explicit-but-default stay distinguishable.
+
+Writes go temp-file + `os.rename` (atomic within a filesystem), pretty-printed
+2-space with sorted keys so the file a human edits is also a file they can
+diff. `no *.tmp litter left in the config dir` = 0.
+
+**O7 seam filled.** `tui_config_remotes()` used to *be* the configured set
+(built from fixture env vars), leaving `discover_resolved(probe,
+config_remotes)` with a parameter that had no producer. It is now the union of
+`cfg.remotes` (product path) and `tui_fixture_remotes()` (dev path, still the
+only place the fixture env is read, so the fixture-host grep over `src/` stays
+empty). Config wins a device-string collision. `pty:remote-from-config` proves
+the product path independently:
+
+```
+a host named ONLY in the JSON appears in the app   first seen at t=0.05s
+…as its own device row/status entry (not merged into local)
+   'mode_selection · local ok 0  hs-t6-cfghost pending 0 …'
+…carrying a status word (so a dead host is visible, ISC-15)   hs-t6-cfghost pending
+```
+…with **all** `HERDR_SESSION_TEST_*` variables removed from that scenario's
+environment, so the only possible source is the file.
+
+**Every case ran under a temporary `XDG_CONFIG_HOME`.** The runner fingerprints
+the real file before and after:
+`real ~/.config/herdr_session.json untouched   before=ABSENT after=ABSENT`,
+and `our XDG_CONFIG_HOME swap did not leak into the caller  unchanged ('unset')`.
 
 ---
 
-### T6.2 — Compiled-in palettes from terminalcolors.com, `gruvbox-dark` default
+### T6.2 — Compiled-in palettes, `gruvbox-dark` default ✅ DONE
 
-**Create:** `src/app/theme.odin`
+**Created:** `src/app/theme.odin`, `ui.palette_of` in `src/ui/frame.odin`,
+`running`/`stopped` slots wired into `src/ui/sessions.odin`.
 
-**Machine-readable source (verified):** `https://terminalcolors.com/downloads/alacritty/<theme>.toml`
-returns `colors.primary{foreground,background}`, `colors.cursor`, `colors.selection`, `colors.normal{8}`,
-`colors.bright{8}` — e.g. gruvbox-dark `background #282828 / foreground #ebdbb2 / normal.red #cc241d …`
-Fetch at **author time** and emit an Odin table; no runtime TOML.
+**Shipped set (10), captured verbatim from the run:**
 
-Ship: **`gruvbox-dark` (DEFAULT)** + `catppuccin-latte` (required, explicitly *not* default) +
-`catppuccin-mocha`, `nord`, `solarized-dark`, `solarized-light`, `tokyo-night`, `dracula`, `one-dark`,
-`gruvbox-light`. Extend later.
-**`catppuccin-latte` ships with the canonical spelling** (the user typed "catputin"); add an alias list for
-forgiving filtering rather than a wrong canonical name.
-Clay `Color` is `[4]c.float` in **0–255**, not 0.0–1.0. Map hex directly.
-Requires `tb_set_output_mode(TB_OUTPUT_TRUECOLOR)` and `TB_OPT_ATTR_W 32` (see T0.1) or every colour is
-quantised.
+```
+gruvbox-dark, gruvbox-light, catppuccin-latte, catppuccin-frappe,
+catppuccin-macchiato, catppuccin-mocha, tokyonight-night, nord,
+solarized-dark, solarized-light
+```
 
-**Acceptance:** *ISC-8*. Picking a theme repaints every element and persists across restart.
+`gruvbox-dark` is the default (`D4`), asserted three ways: `theme_default()`,
+`THEME_DEFAULT_NAME`, and that the picker's `(current)` marker lands elsewhere
+after a change. `catppuccin-latte` ships, is selectable, and
+**is not the default**. Hex values are transcribed from the sources named in
+`scout-nix-packaging.md` §f (gruvbox_256palette.sh, catppuccin/palette 1.8.0,
+tokyonight.nvim `night.lua`, nord.scss `$nord0..$nord15`, solarized README) —
+none invented; the per-slot *choice* of which documented colour fills which
+role is stated in a comment per theme.
 
----
+**Slot coverage — "no gaps" is an enforced invariant, not an aspiration.**
+`app.PALETTE_SLOTS == 13` and the check that every theme fills every one of
+`bg fg dim border header_fg accent sel_fg caret float_bg float_fg err_fg
+running stopped` reports `0 gap(s) across 10 themes`, plus
+`text is never its own background colour` (fg≠bg and sel_fg≠accent for all 10)
+and `every slot of every theme paints through render.attr_of  0 hole(s)`.
+
+`running` / `stopped` are **new** slots: before this, the sessions table painted
+both states in the default `fg`, so a theme could not distinguish a live
+session from a dormant one — one of the "gaps" the requirement covers.
+
+**Aliases are config-only, never picker rows.** `latte`, `mocha`, `macchiato`,
+`gruvbox`, `catpuccin-latte` (misspelling), `tokyonight`, `solarized`, `NORD`
+all resolve, and `filter: 'latte' narrows to exactly ONE row  1 rows match
+'latte'` proves the alias list cannot inflate the picker.
+
+**Persistence (`ISC-7`) — captured end to end, with a real restart:**
+
+```
+no config file before the theme is chosen              None
+applying reports BOTH the paint and the save   "theme 'catppuccin-latte'
+    applied and saved to /tmp/hs-t6-pty-apply-*/herdr_session.json"
+the config file now EXISTS on disk   { "theme": "catppuccin-latte" }
+after a restart the SAVED theme is the applied one   'catppuccin-latte (current)'
+…which is NOT the compiled-in default                default is gruvbox-dark
+```
+
+The notice carries the **save outcome**, not just the intent: the executor's
+message is `"theme 'X' applied"` and the persistence layer appends `" and
+saved to <path>"` or `" but NOT SAVED: <reason>"`. The message that used to
+ship — `"applied for this run (config persistence arrives with T6.1)"` — was
+true once and then became a lie the app kept telling the user; it is gone.
+
+**Picker pre-select** (`pty:picker-preselect`, 7/7): the picker opens with the
+applied theme highlighted and marked, exactly one row marked, and the theme is
+on the wire **before any keystroke** (`bytes written by us: 0`):
+
+```
+theme picker lists the compiled-in palettes (was: 'nothing matches')   10 rows
+the APPLIED theme is the one the picker is on    'tokyonight-night … (current)'
+exactly ONE row is marked current                1 marked rows
+the selection bar is painted in the theme's accent colour
+    accent SGR 48;2;122;162;247 emitted while the picker is open
+```
+
+**Truecolour / black behaviour, on real bytes** (`pty:sgr-truecolour` 4/4,
+`pty:black-is-black` 3/3, `colour-wire` 11/11):
+
+```
+bg #eff1f5  -> SGR 48;2;239;241;245      fg #4c4f69 -> 38;2;76;79;105
+selection bar #8839ef -> 48;2;136;57;239
+gruvbox bg #282828 -> 48;2;40;40;40      sel_fg #1d2021 -> 38;2;29;32;33
+pure black: attr = 20000000 = TB_HI_BLACK  (TB_DEFAULT = 00000000)
+alpha 0 paints nothing; alpha 255 paints
+0..1 mistake would be visible: 0..1 form -> 20000000; real gruvbox bg -> 282828
+```
+The 0..255 conversion exists in exactly **one** function
+(`ui.clay_colour`/`palette_of`), which is why `theme.odin` stores plain
+`0xRRGGBB` and never a Clay type.
+
+**New traps recorded (all paid for during this todo):**
+
+1. **`json.Object{}` is a NIL map.** Assigning into it is a silent no-op: the
+   save reported success and wrote `{}`. A first-run theme change vanished with
+   no error anywhere. Must `make(json.Object)`.
+2. **`cast(map[string]json.Value)obj^` writes into a DETACHED copy.** It
+   compiles, runs, and the key never reaches the document (`len` never grows) —
+   the same `{}` symptom from a different cause. `obj^[key] = v` is the form
+   that mutates the caller's map.
+3. **A config dir created without `+x` cannot have files created inside it.**
+   `Permissions_Read_All + Permissions_Write_All` made *every* save fail with
+   `permission denied` on a directory we had just created ourselves.
+   `CONFIG_DIR_MODE` is `Read_All + Write_All + Execute_All`.
+4. **Odin procedure literals capture nothing**, so the natural
+   `restore := proc() { … had … }` for a temp-env helper does not compile
+   against the caller's locals. The helper returns a `Cfg_Saved` struct and
+   `end_cfg_home(&saved)` restores it.
+5. **`fmt` has no `{x}` hex verb** (`{x:06x}` and `{x}` render as
+   `%!(MISSING CLOSE BRACE)}`). Use `%x`/`%06x`, and do not mix `{}` with `%`
+   verbs in one string — the plan's existing trap about arg scrambling applies.
+6. **An unprivileged box cannot construct the "unreadable but existing file"
+   case.** A chmod that makes `open` refuse also makes `os.is_file` return
+   false, which is the *missing* branch. The check therefore reports which
+   branch ran instead of faking the unreachable one with root.
+7. **Picker `Enter` on `sel == -1` is a no-op by design**, so a filter that
+   hides the currently-applied theme leaves nothing to apply — the test drives
+   Down then Enter. (Not a bug: pre-select points at the applied theme, and a
+   filter that excludes it means the user is looking at something else.)
+8. **`os.get_env` is an overload group** (alloc/buf) — use
+   `os.lookup_env(key, alloc)` when you need the found flag; `os.getpid` does
+   not exist (`posix.getpid`).
+
+**Suite totals.** New T6 suite: **166 checks, 0 FAIL**
+(`BIN=./result/bin/herdr-session ./dev/theme-smoke.sh`): 6 in-process cases
+(theme-set 14, theme-resolve 23, config-parse 34, config-save 26,
+config-live 20, colour-wire 11) + 7 pty scenarios (picker-preselect 7,
+apply-persist 7, corrupt-warning 5, unknown-theme 5, sgr-truecolour 4,
+black-is-black 3, remote-from-config 5) + 6 hygiene checks.
+
+Prior suites re-run fresh-built and fixture-armed, unchanged from baseline:
+handoff 28/0, render 69/0, state 198/0, ui 90/0 (6/6 green), tui 99/0,
+app 336 PASS / 3 FAIL. **The 3 `app` failures are not from this work**:
+running the identical command against stashed baseline `d483f86` produces the
+byte-identical 3 failures (`no-tty launch panics with 101  got 1 want 101`,
+its label-mapping dependent, and the orphan-rule check counting a
+pre-existing session). They are herdr **0.9.5** behaviour drift against
+checks written for 0.8.2, and they fail the same way with and without T6.
 
 ### T6.3 — ⭐ The acceptance test the loopback fixture CANNOT satisfy
 

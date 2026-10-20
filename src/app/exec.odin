@@ -256,17 +256,20 @@ do_delete :: proc(cmd: Command, rows: []Session, budget: time.Duration) -> Effec
 // -----------------------------------------------------------------------------
 
 do_theme :: proc(cmd: Command) -> Effect {
-	// APPLYING means the palette behind the next frame. T6.2 owns the palette set;
-	// until then there is exactly one palette and applying is recording the name.
-	// PERSISTING means the config writer, which is T6.1 and does not exist yet —
-	// so we say that out loud instead of silently dropping the request.
+	// APPLYING means "the palette behind the next frame", and that is all this
+	// executor can honestly claim. The palette SET is app/theme.odin (T6.2) and
+	// the WRITE is app/config.odin (T6.1); the consumer of this Effect performs
+	// the write and appends its outcome to the notice, because this proc has no
+	// config path and inventing one here would be a wider change than the
+	// feature. What used to live here — "config persistence arrives with T6.1" —
+	// was true once and then became a lie the app kept telling the user.
 	return Effect{
 		kind    = .applied,
 		theme   = cmd.value,
-		message = fmt.tprintf(
-			"theme '{}' applied for this run (config persistence arrives with T6.1)", cmd.value),
+		message = fmt.tprintf("theme '{}' applied", cmd.value),
 	}
 }
+
 
 // -----------------------------------------------------------------------------
 // The single door out to a child and back

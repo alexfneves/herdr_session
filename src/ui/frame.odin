@@ -53,6 +53,7 @@ package ui
 
 import clay "../../clay-odin"
 import render "../render"
+import app "../app"
 
 import "core:c"
 import "core:fmt"
@@ -109,6 +110,14 @@ frame_layout :: proc(cols, rows: i32) -> Frame_Layout {
 // colour builds an OPAQUE clay.Color. Alpha 0 means "do not paint this cell" and
 // is the only meaning alpha has in this codebase — never an identity marker.
 // Palette is the colour contract between the app and the view layer.
+// Palette is the view layer's semantic colour contract. A widget references a
+// ROLE, never a hex value, so a theme swap changes this struct's contents and
+// no widget file changes (that is the whole point of T6.2).
+//
+// Every field must be supplied by every theme. `app.PALETTE_SLOTS` counts them
+// and the theme smoke case asserts the two counts agree, so adding a role here
+// without filling it in every palette fails the build of evidence rather than
+// painting one widget with a zero (transparent) colour.
 Palette :: struct {
 	bg : clay.Color, // terminal background
 	fg : clay.Color, // default text
@@ -121,10 +130,52 @@ Palette :: struct {
 	float_bg : clay.Color,
 	float_fg : clay.Color,
 	err_fg : clay.Color,
+	running : clay.Color, // a session that is up
+	stopped : clay.Color, // a session that is not
+}
+
+// ── the ONE place a theme becomes a palette ───────────────────────────────
+//
+// TRAP (plan, and clay-odin/clay.odin:51): Clay channels are 0..255, NOT
+// 0.0..1.0. `clay.Color` is `[4]c.float` carrying 0..255, so a palette entry
+// 0x282828 becomes {40, 40, 40, 255}. Feeding 0.16 here would paint the
+// entire UI black. Every 0..255 conversion in this app happens in this one
+// proc, which is why the theme module stores plain hex and never a Clay type.
+//
+// Alpha is 255 for every slot by construction: "alpha drives exactly one
+// decision: paint, or don't" (render/renderer.odin:133) and a themed colour is
+// always meant to paint.
+palette_of :: proc(t: app.Theme) -> Palette {
+	return Palette{
+		bg        = clay_colour(t.pal.bg),
+		fg        = clay_colour(t.pal.fg),
+		dim       = clay_colour(t.pal.dim),
+		border    = clay_colour(t.pal.border),
+		header_fg = clay_colour(t.pal.header_fg),
+		accent    = clay_colour(t.pal.accent),
+		sel_fg    = clay_colour(t.pal.sel_fg),
+		caret     = clay_colour(t.pal.caret),
+		float_bg  = clay_colour(t.pal.float_bg),
+		float_fg  = clay_colour(t.pal.float_fg),
+		err_fg    = clay_colour(t.pal.err_fg),
+		running   = clay_colour(t.pal.running),
+		stopped   = clay_colour(t.pal.stopped),
+	}
+}
+
+// clay_colour is the 0xRRGGBB -> 0..255x3 step. Kept separate so the comment
+// about the channel range is attached to the code that could get it wrong.
+clay_colour :: proc(hex: u32) -> clay.Color {
+	r, g, b := app.theme_rgb(hex)
+	return clay.Color{c.float(r), c.float(g), c.float(b), 255}
 }
 
 // DEFAULT_PALETTE is a plain dark stand-in so Phase 5 renders honestly before
 // T6.2 supplies real terminalcolors.com palettes.
+// DEFAULT_PALETTE is the pre-theme stand-in, kept for a nil/absent theme so no
+// code path can paint with zeroed colours. It is NOT a theme and is not in the
+// picker; app.theme.THEME_DEFAULT_NAME (gruvbox-dark) is what a fresh install
+// gets.
 DEFAULT_PALETTE : Palette = Palette{
 	bg        = clay.Color{16, 20, 28, 255},
 	fg        = clay.Color{204, 200, 184, 255},
@@ -137,6 +188,8 @@ DEFAULT_PALETTE : Palette = Palette{
 	float_bg  = clay.Color{26, 30, 40, 255},
 	float_fg  = clay.Color{220, 216, 200, 255},
 	err_fg    = clay.Color{222, 96, 88, 255},
+	running   = clay.Color{120, 190, 120, 255},
+	stopped   = clay.Color{110, 114, 122, 255},
 }
 
 // ── footer vocabulary ──────────────────────────────────────────────────────

@@ -268,7 +268,15 @@ sess_paint_row :: proc(row: app.Session, cols: Sessions_Columns, is_sel: bool, p
 	}) {
 		paint_cell(ellipsize(row.device, cols.device), cols.device, fg)
 		paint_cell(ellipsize(app.ts_display(row.ts), cols.ts), cols.ts, fg)
-		paint_cell(state_text(row.running), cols.state, fg)
+		// The state column is themed, not hardcoded: `running` / `stopped` are
+		// palette roles (T6.2 "no gaps"). Selected rows keep the selection
+		// foreground, because a themed green on the accent bar is how the two
+		// encodings would otherwise collide.
+		state_fg := fg
+		if !is_sel {
+			if row.running { state_fg = pal.running } else { state_fg = pal.stopped }
+		}
+		paint_cell(state_text(row.running), cols.state, state_fg)
 		paint_cell(ellipsize(row.name, cols.name), cols.name, fg)
 	}
 }

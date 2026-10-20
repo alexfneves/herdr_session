@@ -84,3 +84,85 @@ The previous Phase 5b run consumed **~12 hours and produced no files**, spending
 
 If a syntax question turns into more than ~3 throwaway probes, **stop and record the finding** rather than
 continuing to iterate silently.
+
+---
+
+# T6 additions — `encoding/json`, permissions, and the traps that cost real time
+
+All of these were paid for during T6.1/T6.2 on **odin dev-2026-09**, against the
+**current** `core:encoding/json` (whose API is *not* the older
+`json.parse_bytes` + `json.to_object` shape some notes assume).
+
+## `encoding/json` in this build
+
+- `Value` is a **union**: `Null | Integer(i64) | Float(f64) | Boolean | String |
+  Array | Object`, with `Object :: distinct map[string]Value` and
+  `Array :: distinct [dynamic]Value`. There is **no** `json.to_object`,
+  `json.to_string`, `json.object_get` or `json.new_string_value` — use type
+  assertions (`v.(json.Object)`), indexing (`o["theme"]`), and constructors
+  (`json.String("x")`, `json.Array(dv)`).
+- `parse_bytes(data, spec, parse_integers)` returns a **`json.Error` enum**, not
+  a union: test `err != json.Error.None`. The enum name renders readably through
+  `%v` (`Expected_Colon_After_Key`), which is good enough for a user-facing
+  warning line.
+- `DEFAULT_SPECIFICATION` is **JSON5**: `// comments`, `/* comments */` and a
+  trailing comma all load. Asserted rather than assumed.
+- `marshal` options that matter here: `pretty`, `use_spaces`, `spaces`,
+  `sort_maps_by_key` — sorted + pretty is what makes a hand-edited config
+  diffable.
+- Passing `parse_integers=false` means `5` round-trips as
+  `5.0000000000000000`. We pass `true`.
+
+## Three bugs that produced no error message
+
+1. **`json.Object{}` is a NIL map.** `doc_set_string` into it *succeeded* and
+   wrote `{}`. A first-run theme change vanished silently. `make(json.Object)`
+   is mandatory.
+2. **`cast(map[string]json.Value)obj^` writes into a detached copy.** Compiles,
+   runs, `len` never grows, key never reaches the document — the same `{}`
+   symptom via a different cause. `obj^[key] = v` is the form that mutates.
+   (Both were found by asserting on the *file contents* rather than the return
+   code. The return code was `true` for both broken versions.)
+3. **A directory created without `+x` cannot have files created inside it.**
+   `Permissions_Read_All + Permissions_Write_All` made every save fail with
+   `permission denied` **on a directory we had just created ourselves**.
+   `CONFIG_DIR_MODE = Read_All + Write_All + Execute_All`.
+
+## Language / stdlib
+
+- **Procedure literals capture nothing.** The natural
+  `restore := proc() { …saved_var… }` for a temp-env helper does not compile
+  against the caller's locals. Return a struct (`Cfg_Saved`) and restore with
+  an explicit `end_cfg_home(&saved)`.
+- **`fmt` has no `{x}` hex verb.** `{x}` / `{x:06x}` render
+  `%!(MISSING CLOSE BRACE)}`. Use `%x`, `%06x`, `%08x` — and do not mix `{}`
+  and `%` verbs in one format string (the existing arg-scrambling trap).
+- **`os.get_env` is an overload group** (`get_env_alloc` / `get_env_buf`); for
+  the found-flag use `os.lookup_env(key, alloc)`. **`os.getpid` does not
+  exist** → `posix.getpid`.
+- **`mem.free(ptr, allocator)`**, not `(allocator, ptr)`; for a slice use
+  `mem.free_bytes(bytes, allocator)`.
+- **Odins struct fields still need the comma BEFORE a trailing line comment**
+  (`name : string, // note`) — a field followed only by a newline-terminated
+  comment parses as an expression and reports *"Expected a comma, got a
+  newline"*.
+- **Shadowing is a hard build error** in this project's nix flags, including
+  reusing `ok`/`s` across an `else if` chain.
+- **Directory listing** is `os.read_directory(f: ^File, n, alloc) ->
+  ([]File_Info, Error)`; there is no `os.directory_entries`.
+
+## Test-design notes worth carrying forward
+
+- **An unprivileged box cannot construct "file exists but is unreadable".**
+  The chmod that makes `open` refuse also makes `os.is_file` return false —
+  which is the *missing* branch. Report which branch ran rather than faking the
+  unreachable one with root.
+- **Assert on the artifact, not the return value.** Every one of the three
+  silent bugs above returned `true`. The file's bytes are the ground truth.
+- **Config-touching tests must own their `XDG_CONFIG_HOME`.** `os.user_config_dir`
+  is the real resolver, so a temp `XDG_CONFIG_HOME` is what keeps the
+  developer's `~/.config` out of it — fingerprint it before and after and
+  assert equality.
+- **The picker's `Enter` on `sel == -1` is a no-op by design**, so a filter
+  that hides the currently-applied theme leaves nothing to apply. Drive Down
+  then Enter when testing "apply the other one".

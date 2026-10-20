@@ -341,9 +341,12 @@ Tui :: struct {
 	flt      : ui.Float,
 	pal      : ui.Palette,
 
+	cfg     : app.Config, // what ~/.config/herdr_session.json said (T6.1)
+
 	remotes     : []app.Remote,
-	themes      : []string,
-	theme_now   : string,
+	themes      : []string,  // canonical palette names, picker order
+	theme_now   : string,    // the applied theme's canonical name
+	theme       : app.Theme, // its colours, resolved once at boot
 	remote_rows : [dynamic]ui.Picker_Row,
 	theme_rows  : [dynamic]ui.Picker_Row,
 	shown_rows  : [dynamic]app.Session, // machine-filtered projection, reused
@@ -355,8 +358,6 @@ Tui :: struct {
 }
 
 tui : Tui
-
-THEME_DEFAULT :: "default"
 
 // ── terminal ownership ────────────────────────────────────────────────────
 
@@ -374,23 +375,46 @@ tui_die :: proc(msg: string) {
 
 // ── remote discovery ─────────────────────────────────────────────────────
 
-// tui_config_remotes is the T6.1 seam. The JSON config loader does not exist
-// yet, so the configured remote set comes from labelled fixture env vars — the
-// same ones dev/app-smoke.sh and dev/fetch-live use, including the deliberate
-// black-hole host that makes "one host is down" a measurable thing instead of a
-// assertion. Reading them HERE and nowhere else is what keeps
-// the fixture-host-name grep over src/ stays empty while the loopback fixture still exercises
-// the real ssh path.
+// tui_config_remotes is the O7 seam, now actually filled by the loader.
+//
+// Before T6.1 this function WAS the configured set (built from fixture env
+// vars), which is why discovery had a parameter with no producer. It is now the
+// union of two sources with different standing:
+//
+//   1. tui.cfg.remotes — the product path: `"remotes"` in
+//      ~/.config/herdr_session.json, verbatim ssh targets.
+//   2. tui_fixture_remotes() — the DEV path: the loopback fixture the T4/T5
+//      smoke suites already drive over real ssh, appended on top.
+//
+// Both are needed and they are kept visibly separate so nobody mistakes the
+// fixture for a product concept, and so removing the fixture later is deleting
+// one proc rather than re-deriving the seam.
 tui_config_remotes :: proc() -> []app.Remote {
-	out: [dynamic]app.Remote
+	out := make([dynamic]app.Remote, 0, len(tui.cfg.remotes) + 2)
+	for r in tui.cfg.remotes { append(&out, r) }
+	for r in tui_fixture_remotes() {
+		// The config wins a collision: a user who wrote the same target by hand
+		// with a label should not be overwritten by the fixture's bare target.
+		dup := false
+		for have in out { if have.device == r.device { dup = true } }
+		if !dup { append(&out, r) }
+	}
+	return out[:]
+}
+
+// tui_fixture_remotes is the dev-only host set: HERDR_SESSION_TEST_REMOTE (a
+// loopback ssh target), its alias, and HERDR_SESSION_TEST_UNREACHABLE (a
+// black-hole host that makes "one host is down" a measurable thing rather
+// than an assertion). Reading them HERE and nowhere else is what keeps the
+// fixture-host-name grep over src/ empty while the loopback fixture still
+// exercises the real ssh path.
+tui_fixture_remotes :: proc() -> []app.Remote {
+	out := make([dynamic]app.Remote, 0, 2)
 	target := os.get_env_alloc("HERDR_SESSION_TEST_REMOTE", context.allocator)
 	if target != "" {
 		label := os.get_env_alloc("HERDR_SESSION_TEST_REMOTE_ALIAS", context.allocator)
 		append(&out, app.Remote{device = target, label = label})
 	}
-	// The unreachable host is a fixture too, not a product concept: it is here so
-	// the degradation path ("only that host's rows go stale") is driven by the
-	// same environment the T4 live driver already uses.
 	dead := os.get_env_alloc("HERDR_SESSION_TEST_UNREACHABLE", context.allocator)
 	if dead != "" {
 		append(&out, app.Remote{device = dead, label = dead})
@@ -479,8 +503,15 @@ tui_run_command :: proc(cmd: app.Command) {
 	case .quit:
 		tui.quitting = true
 	case .applied:
-		if eff.theme != "" { tui.theme_now = eff.theme }
+		// The executor says what it applied; tui_persist_theme says whether the
+		// choice reached the file. Both halves belong in the notice, and the
+		// second must not be dropped — an unreported failed save is worse than
+		// a reported one.
 		tui.notice = eff.message
+		if eff.theme != "" {
+			suffix := tui_persist_theme(eff.theme)
+			if suffix != "" { tui.notice = fmt.tprintf("{}{}", tui.notice, suffix) }
+		}
 	case .none:
 		break
 	case:
@@ -489,6 +520,42 @@ tui_run_command :: proc(cmd: app.Command) {
 
 	if eff.refresh { tui_refresh() }
 	tui.dirty = true
+}
+
+// tui_apply_theme is the ISC-7 persistence path: paint now, save the choice,
+// and make the notice say whether the save happened.
+//
+// WHY HERE AND NOT IN THE EXECUTOR
+//
+// The executor is the choke point for effects, but its signature
+// `execute(cmd, rows, home, timeout) -> Effect` is pinned by 339 existing app
+// checks, and threading a config path through it for one command is a wider
+// change than the feature is worth. `tui_run_command` is the ONLY consumer of
+// Effect in the program, so there is exactly one place an applied theme can
+// arrive from, and it is this one. The honesty requirement — a save that failed
+// must not be reported as a save — is met by putting the outcome in the notice.
+tui_persist_theme :: proc(name: string) -> string {
+	t, ok := app.theme_named(name)
+	if !ok {
+		// The machine only offers canonical names, so this is a bug and not a
+		// user error; keep the current palette rather than painting with nothing.
+		return fmt.tprintf(" — NOT applied: '{}' is not a compiled-in palette", name)
+	}
+	tui.theme = t
+	tui.theme_now = t.name
+	tui.pal = ui.palette_of(t)
+	saved, err := app.config_save_theme(tui.cfg.path, t.name)
+	if saved {
+		// The file now agrees with the screen, so a load-time warning about an
+		// unknown or broken theme is no longer true and must stop being shown.
+		clear(&tui.cfg.warnings)
+		tui.cfg.theme = t.name
+		tui.cfg.theme_fell_back = false
+		return fmt.tprintf(" and saved to {}", tui.cfg.path)
+	}
+	// Painted but not persisted: say so, because "applied" alone would be a
+	// lie about what the next start does.
+	return fmt.tprintf(" but NOT SAVED: {}", err)
 }
 
 // ── events ───────────────────────────────────────────────────────────────
@@ -616,7 +683,15 @@ pick_device_detail:: proc(r: app.Remote) -> string { return "ssh target (verbati
 
 pick_theme_id     :: proc(s: string) -> string { return s }
 pick_theme_label  :: proc(s: string) -> string { return s }
-pick_theme_detail :: proc(s: string) -> string { return "" }
+
+// pick_theme_detail marks the row that is currently applied, so the picker
+// shows live state and not just a list. The machine's filter is a substring
+// match on the NAME only (state.theme_matches), so this text cannot change
+// which rows are shown — it is purely what the user reads.
+pick_theme_detail :: proc(s: string) -> string {
+	if s == tui.theme_now { return "(current)" }
+	return ""
+}
 
 // tui_project_shown rebuilds the machine-filtered session slice the table view
 // paints. Reused buffer: no allocation per frame, and no aliasing either — the
@@ -687,6 +762,15 @@ tui_host_line :: proc() -> string {
 
 tui_state_text :: proc() -> string {
 	if tui.notice != "" { return tui.notice }
+	// ISC-19: a config problem has to be visible without being fatal. The
+	// warning sits in the state slot (the first thing the eye lands on after
+	// the header) and is superseded by any notice, so it never hides a verdict
+	// the user just earned.
+	warn := app.config_warning_text(tui.cfg)
+	if warn != "" {
+		return fmt.tprintf("\u26a0 {}  ·  {}  ·  {}", warn,
+			app.state_label(tui.machine.state), tui_host_line())
+	}
 	return fmt.tprintf("{}  ·  {}", app.state_label(tui.machine.state), tui_host_line())
 }
 
@@ -956,9 +1040,37 @@ TUI_POLL_ERRS  : int = 0
 tui_boot :: proc() -> bool {
 	BOOT_T0 = time.now()
 	TUI_ACTIVE = true
-	tui.pal = ui.DEFAULT_PALETTE
-	tui.theme_now = THEME_DEFAULT
-	tui.themes = []string{THEME_DEFAULT}
+
+	// ── T6.1/T6.2: read the config BEFORE taking the terminal ──────────
+	//
+	// Order matters twice over. (1) If the config is broken we still want the
+	// warning on screen, and loading first means a config bug cannot manifest as
+	// a half-initialised terminal. (2) config_load never fails, so there is no
+	// reason to defer it — and doing it first means the very first frame is
+	// already painted in the configured theme rather than recolouring under the
+	// user's eyes.
+	tui.cfg = app.config_load()
+	if tui.cfg.path != "" {
+		// Save target even when the file did not exist yet (first run: the
+	// picker still has somewhere to write, and the notice names it).
+		_ = tui.cfg.path
+	}
+
+	// The palette list is static, so it is built once and handed to the machine
+	// as the picker's source of truth. This is also what makes the picker PRE-
+	// SELECT the applied theme: `enter_state(.theme)` places the cursor on
+	// `a.theme`, so the machine has to know the current theme for that to mean
+	// anything.
+	tui.themes, _ = app.theme_names(context.allocator)
+	tui.theme = app.theme_named_or_default(tui.cfg.theme)
+	tui.theme_now = tui.theme.name
+	tui.pal = ui.palette_of(tui.theme)
+	tui.machine.themes = tui.themes
+	tui.machine.theme = tui.theme.name
+
+	// D2: the cleanup policy is config-driven now, with the same safe default.
+	app.set_cleanup_policy(app.cleanup_policy_from_name(tui.cfg.cleanup_policy))
+
 	ui.sessions_init(&tui.sess)
 	ui.edit_init(&tui.name_ed)
 	ui.edit_init(&tui.filter_ed)
@@ -1061,6 +1173,12 @@ usage :: proc() {
   fetch-live                  Phase 4 fan-out vs real ssh: concurrency, deadlines,
                               no zombies (needs HERDR_SESSION_TEST_REMOTE=…)
   render                      Clay commands -> cells: border, rule, alignment, colour
+  theme-set        T6.2 the compiled-in palette table: count, default, slots
+  theme-resolve    T6.2 exact / alias / unknown-name resolution + the warning
+  config-parse     T6.1 every parse mode: missing, corrupt, wrong type, unknown theme
+  config-save      T6.1 the merge rule — unknown hand-added keys survive a save
+  config-live      T6.1 the real loader against real files in a temp XDG_CONFIG_HOME
+  colour-wire      T6.2 0..255 channels + TB_HI_BLACK through the real renderer
   clip                        scissor containment
   clay-error                  duplicate id survives the C frame
   layout-dump                 the raw render command stream
@@ -1172,6 +1290,12 @@ main :: proc() {
 	case "fetch-unit":  ok = case_fetch_unit()
 	case "fetch-live":  ok = case_fetch_live()
 	case "render":     ok = case_render()
+	case "theme-set":     ok = case_theme_set()
+	case "theme-resolve": ok = case_theme_resolve()
+	case "config-parse":  ok = case_config_parse()
+	case "config-save":   ok = case_config_save()
+	case "config-live":   ok = case_config_live()
+	case "colour-wire":   ok = case_colour_wire()
 	case "clip":       ok = case_clip()
 	case "clay-error": ok = case_clay_error()
 	case "layout-dump": ok = case_layout_dump()
