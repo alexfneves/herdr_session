@@ -666,76 +666,95 @@ def scenario_roundtrip():
         back = p.read(5.0)
         check("after prefix+q the app took the terminal back and repainted",
               len(back) > 500, "{} bytes streamed after the detach".format(len(back)))
-        # The footer carries the executor's own honest line about the child, and
-        # it is the D2 seam made visible: `never` means NOTHING was destroyed
-        # behind the user's back.
-        notice = p.wait_screen("cleanup_policy=never", timeout=6.0)
-        check("…back in our own UI, reporting what the child did",
+
+        # ── R1: the footer reports what the destroy-on-detach policy DID ──
+        #
+        # THESE ASSERTIONS ARE INVERTED ON PURPOSE. They used to read
+        # `cleanup_policy=never` / "<name> left running", which was the parked
+        # D2 behaviour. RCH-3/R1 resolved D2 to `only_created`: the session this
+        # app just created is stopped and deleted when the handoff returns, and
+        # the footer is the seam made visible. So the correct sentence is
+        # `cleanup_policy=only_created` + "stopped and deleted", and the OLD
+        # sentence must now be asserted ABSENT — a silent reversion to "left
+        # running" has to fail loudly here.
+        notice = None
+        for _ in range(30):
+            p.read(0.3)
+            if "cleanup_policy=only_created" in p.screen.text():
+                notice = True
+                break
+        txt = p.screen.text()
+        check("back in our own UI, reporting the destroy the policy performed",
               notice is not None and created is not None
-              and "{} left running".format(created) in p.screen.text(),
-              "footer reports the session it just left running")
+              and "stopped and deleted" in txt,
+              "footer did not report the cleanup (looked for "
+              "'cleanup_policy=only_created' + 'stopped and deleted')")
+        check("…and it names OUR session as the thing destroyed",
+              created is not None and created in txt,
+              "{!r} should appear in the cleanup notice".format(created))
+        check("…and the OLD never/'left running' sentence is GONE, not lingering",
+              "cleanup_policy=never" not in txt and "left running" not in txt,
+              "a 'left running' footer here would mean the default reverted")
+        check("…and no error is surfaced (destroy-on-detach is not an error path)",
+              "NOT cleaned" not in txt and "failed" not in txt,
+              "notice must carry no NOT-cleaned/failure wording")
+
+        # ── R1: herdr itself agrees the session is gone, with NO extra key ──
+        gone = session_names()
+        check("herdr itself confirms the created session is DESTROYED",
+              created is not None and created not in gone,
+              "live names: {}".format(gone))
+
         p.send("\x1b[B")
         p.read(0.8)
         check("…the next key clears the notice back to the state name",
               "mode_selection  \u00b7" in p.screen.text(),
               "footer is back at mode_selection")
-        seen = p.wait_screen(created, timeout=10.0)
-        check("…and the refreshed list already shows the new row", seen is not None,
-              "{!r} on screen at t={}".format(created,
-                                            "{:.1f}s".format(seen) if seen else "never"))
 
-        # now delete it through the app: d -> filter -> enter
-        p.keys("d", pause=0.3, settle=0.8)
-        check("the delete picker is up", "delete_session  \u00b7" in p.screen.text(),
-              "footer names delete_session")
-        p.keys(created, pause=0.04, settle=0.9)
-        def device_of(line):
-            parts = line.split()
-            return parts[0] if parts else ""
-
-        rows = [l for l in p.screen.lines() if created in l]
-        local_rows = [l for l in rows if device_of(l) == "local"]
-        check("the filter narrowed the TABLE to that one LOCAL row",
-              len(local_rows) == 1,
-              "{} local row(s): {}".format(len(local_rows),
-                                         " | ".join(r[:100] for r in local_rows)))
-        # If the fixture points at THIS machine, the same session legitimately
-        # shows under a second device identity too. That is the (device, name)
-        # rule being visible rather than papered over — never name-alone.
-        others = [l for l in rows if device_of(l) not in ("local", "")]
-        if others:
-            check("…and any duplicate is a DIFFERENT device identity, never a "
-                  "second local row",
-                  len(local_rows) == 1,
-                  "also seen on: {}".format(sorted({device_of(l) for l in others})))
-        # Nothing was selected yet, and the machine does not act on an unset
-        # selection — Tab is what puts the cursor on the surviving row.
-        p.send("\t")
-        p.read(0.6)
-        p.send("\n")
-        time.sleep(4.0)
-        after = session_names()
-        check("the app STOPPED then DELETED it, verified against herdr itself",
-              created not in after, "{} is gone from herdr".format(created))
-        # The filter line still shows the name we typed — that is the user's own
-        # text, not a row. Look at the TABLE only.
-        def table_rows():
+        # ── R1: the list was ALREADY refreshed on the way back ──
+        #
+        # INVERTED with the rest of the scenario. The old assertion demanded the
+        # refreshed list SHOW the new row. Under R1 the new row was destroyed by
+        # the same detach, so what must be proven is the requirement's other
+        # half: the list the user lands on is already current — it shows no row
+        # for a session herdr no longer has, and the user pressed nothing to make
+        # that true. The filter line is excluded: it is the user's own typed text,
+        # not a row.
+        def created_table_rows():
             out = []
             for l in p.screen.lines():
                 if created not in l:
                     continue
                 parts = l.split()
-                if parts and parts[0] == "local":
+                if parts and parts[0] != "device":
                     out.append(l)
             return out
 
         for _ in range(20):
             p.read(0.25)
-            if not table_rows():
+            if not created_table_rows():
                 break
-        check("…and the table caught up (no row for a deleted session)",
-              not table_rows(), "{} table rows remain; the filter line is our own text".format(
-                  len(table_rows())))
+        check("…and the refreshed list shows NO row for the destroyed session "
+              "with no extra keypress", not created_table_rows(),
+              "{} stale row(s) remain for {!r}".format(len(created_table_rows()),
+                                                     created))
+        # The list is not merely empty-looking: it still shows the sessions that
+        # DO exist, so "no row" means refreshed rather than "nothing painted".
+        still_there = [n for n in session_names() if n != "default"]
+        shown_live = [l for l in p.screen.lines()
+                     if any(n in l for n in still_there)]
+        check("…and the list is genuinely refreshed, not blanked",
+              len(shown_live) > 0,
+              "{} live session(s) still listed, {} of them on screen".format(
+                  len(still_there), len(shown_live)))
+
+        # The created session must not be resurrectable by re-opening the delete
+        # picker and pointing at it: it is gone from herdr AND from our list.
+        p.keys("d", pause=0.3, settle=0.9)
+        check("the delete picker opens on a list with no ghost of it",
+              "delete_session  \u00b7" in p.screen.text()
+              and not created_table_rows(),
+              "ghost row(s): {}".format(len(created_table_rows())))
 
         p.send("\x03")
         time.sleep(0.6)
