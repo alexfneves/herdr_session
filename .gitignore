@@ -13,3 +13,4 @@ result-*
 
 # `script` writes ./typescript by default when given no output file.
 /typescript
+dev/__pycache__/
