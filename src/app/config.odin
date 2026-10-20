@@ -125,7 +125,7 @@ Config :: struct {
 	// --- owned keys, normalised -----------------------------------------
 	theme          : string,   // always a RESOLVED name (never a typo)
 	remotes        : []Remote, // verbatim ssh targets from `remotes`
-	cleanup_policy : string,   // "never" | "only_created" | "always"
+	cleanup_policy : string,   // "never" | "only_created" | "always" (default: only_created)
 
 	// --- provenance ------------------------------------------------------
 	path            : string, // where this came from, for messages ("" if none)
@@ -138,14 +138,20 @@ Config :: struct {
 }
 
 // config_new_defaults: what the app runs on with no configuration at all.
-// gruvbox-dark (D4), no remote hosts, cleanup "never" (D2).
+// gruvbox-dark (D4), no remote hosts, cleanup "only_created" (D2 RESOLVED,
+// RCH-3/R1: sessions this app created are destroyed when the handoff returns;
+// sessions it merely attached to are left alone).
+//
+// NOTE the asymmetry, which is deliberate and documented: ABSENT key -> the
+// default (`only_created`); PRESENT BUT UNRECOGNISED value -> `never`. A typo
+// must never move the user into a MORE destructive mode than they asked for.
 config_new_defaults :: proc() -> Config {
 	// Assigned to a name, then returned: a bare `return Config{...}` is
 	// rejected for a struct containing slices ("unsafe to return a compound
 	// literal of a slice ... uses the current stack frame's memory").
 	out : Config
 	out.theme = THEME_DEFAULT_NAME
-	out.cleanup_policy = CLEANUP_LABEL_NONE
+	out.cleanup_policy = CLEANUP_LABEL_OWNED
 	return out
 }
 
@@ -243,8 +249,14 @@ config_parse_json :: proc(text: string, path: string) -> Config {
 		if !is_str {
 			config_add_warning(&out, "config key 'cleanup_policy' is not a string - ignored")
 		} else if !cleanup_policy_valid(string(pol)) {
+			// A present-but-unrecognised value falls back to `never`, NOT to the
+			// shipped default. `only_created` destroys things; a typo in the file
+			// must not silently move the user into a more destructive mode than
+			// the one they were trying to write. This is why the branch sets the
+			// field explicitly instead of leaving the default in place.
 			config_add_warning(&out, fmt.tprintf(
 				"unknown cleanup_policy '%s' - using %s", string(pol), CLEANUP_LABEL_NONE))
+			out.cleanup_policy = CLEANUP_LABEL_NONE
 		} else {
 			out.cleanup_policy = string(pol)
 		}

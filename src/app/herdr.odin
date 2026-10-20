@@ -805,25 +805,36 @@ delete_session :: proc(sessions: []Session, device: string, name: string,
 }
 
 //-----------------------------------------------------------------------------
-// cleanup_policy seam (D2 — PARKED)
+// Cleanup policy (D2 — RESOLVED by RCH-3/R1)
 //-----------------------------------------------------------------------------
 
 // Cleanup_Policy decides what happens to a session after we detach from it.
 //
-// D2 IS PARKED and the interim answer is `never`. `prefix+q` in herdr only
-// DETACHES — the server and its panes keep running. Auto-destroying a session the
-// user merely peeked at is silent data loss, and the newest herdr's behaviour has
-// not been confirmed on the user's box. When it is, exactly one value changes
-// here and nothing else in the app needs to know.
+// D2 was parked at `never` while herdr's own detach semantics were unknown. The
+// user has since decided the behaviour they want (RCH-3/R1):
+//
+//   "After creating/starting a session, then going back (the session was
+//    detached), it should delete the session and update the list when going back
+//    to the main state. If the session was already deleted there is no error to
+//    show."
+//
+// The default is therefore `only_created`, NOT `always`. That distinction is the
+// whole point of the policy existing: `always` would destroy a session the user
+// merely attached to — a session they had before we ever saw it, with their own
+// work in it. `only_created` destroys exactly the sessions this app generated a
+// name for and asked herdr to start, and lays hands on nothing else.
 Cleanup_Policy :: enum {
-	never,         // ← interim default: deletion is always an explicit user action
-	only_created,  // destroy sessions we created, leave the user's own alone
+	never,         // destroy nothing; deletion is always an explicit user action
+	only_created,  // ← DEFAULT (RCH-3/R1): destroy sessions we created, leave the user's own alone
 	always,        // herdr-cycle's old behaviour: stop+delete after every detach
 }
 
-// DEFAULT_CLEANUP_POLICY keeps the app read-mostly about session lifetime while
-// D2 is undecided.
-DEFAULT_CLEANUP_POLICY :: Cleanup_Policy.never
+// DEFAULT_CLEANUP_POLICY is the shipped default (RCH-3/R1). It is the value the
+// app uses when `cleanup_policy` is ABSENT from the config. A value that is
+// present but unrecognised still falls back to `.never` (see
+// `cleanup_policy_from_name`): an unparseable value must never escalate the user
+// into a more destructive mode than they asked for.
+DEFAULT_CLEANUP_POLICY :: Cleanup_Policy.only_created
 
 cleanup_policy_value : Cleanup_Policy = DEFAULT_CLEANUP_POLICY
 
@@ -836,9 +847,15 @@ set_cleanup_policy :: proc(p: Cleanup_Policy) {
 }
 
 // cleanup_should_run answers whether the detach path should stop+delete `name`.
-// With the parked default this is always false — which is exactly what keeps "we
-// might be wrong about D2" from turning into "we destroyed someone's session".
 // D12 outranks every policy: `default` is never destroyed.
+//
+// The `we_created_it` half is what makes `only_created` (the shipped default)
+// safe. It is supplied by the CALLER at the one place that knows the difference:
+// `do_launch` passes true (the machine generated that name and asked herdr to
+// create it) and `do_attach` passes false (the session belonged to the user
+// before we ever listed it). "I did not create it" is not a guess made after the
+// fact — it is recorded at the spawn site, which is the only moment the two
+// cases are still distinguishable.
 cleanup_should_run :: proc(p: Cleanup_Policy, name: string, we_created_it: bool) -> bool {
 	if is_default_session_name(name) { return false }
 	#partial switch p {

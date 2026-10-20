@@ -83,6 +83,16 @@ map_code :: proc(code: u16) -> Key_Kind {
 	case termbox2.KEY_ESC:       return .esc
 	case termbox2.KEY_BACKSPACE: return .backspace   // 0x08 (Ctrl+H)
 	case termbox2.KEY_BACKSPACE2: return .backspace  // 0x7f — what terminals really send
+	// KEY_DELETE (CSI 3 ~, and fn+Delete on a Mac keyboard) is a REMOVE-TEXT key
+	// to the user, and this app has no caret-in-the-middle model: the filter and
+	// the edit field are both edited AT THE END. So Del and Backspace are the same
+	// action here, and `text_backspace`/`edit_backspace` already delete a WHOLE
+	// RUNME, which is what keeps the multi-byte runes UTF-8 safe.
+	//
+	// Before this case existed the code fell through to `.none`, `ch == 0`, and
+	// decoded to NO_KEY: the keypress was dropped silently and Del did nothing to
+	// the filter. (RCH-3/R3.)
+	case termbox2.KEY_DELETE:  return .backspace
 	case termbox2.KEY_TAB:       return .tab
 	case termbox2.KEY_BACK_TAB:  return .shift_tab   // CSI Z / Shift+Tab
 	case termbox2.KEY_ARROW_UP:    return .up
@@ -116,6 +126,31 @@ control_byte_is_printable :: proc(c: u32) -> bool {
 // consulted (never `key` xor `ch` asserted) because a terminal that puts a
 // control byte in `ch` should still decode as that control key, not as a
 // printable character with a surprising codepoint.
+//
+// THE OTHER "DELETE-SHAPED" CODES, audited rather than left silent (RCH-3/R3).
+// The full termbox2 special-code table was walked to ask what else is a
+// cursor/edit key that this file drops on the floor:
+//
+//   KEY_DELETE   CSI 3 ~  -> MAPPED to `.backspace` (above). It is the only
+//                           remove-a-character key the terminal reports, and
+//                           both editable fields edit at the end of the text.
+//   KEY_INSERT   CSI 2 ~  -> DROPPED ON PURPOSE. Insert/overwrite mode is a
+//                           buffer property this app does not have; every write
+//                           is an append, so there is nothing for Insert to
+//                           change. Mapping it to anything would invent a mode
+//                           the user cannot see or leave.
+//   KEY_HOME / KEY_END     -> DROPPED ON PURPOSE (CSI H / CSI F). This app has
+//                           no caret-in-the-middle model, so Home/End have no
+//                           target. They are also terminfo-ambiguous (many
+//                           terminals send CSI 1 ~ / CSI 4 ~, and some send
+//                           the arrow-key spellings), which is a good reason not
+//                           to build on them for a two-field editor.
+//   KEY_PGUP / KEY_PGDN  -> DROPPED ON PURPOSE. No paging model; the session
+//                           table scrolls with Up/Down and the terminal's own
+//                           scrollback.
+//   KEY_MOUSE_*          -> not keys; no mouse support in this app.
+//
+// Net: exactly one code was missing, and it is the one the user pressed.
 decode :: proc(typ: u8, key: u16, ch: u32, mod: u8) -> Key {
 	if typ != termbox2.EVENT_KEY { return NO_KEY }
 

@@ -334,7 +334,8 @@ case_config_parse :: proc() -> bool {
 	check("missing file: SILENT (no warnings)", len(m.warnings) == 0,
 		fmt.tprintf("{} warning(s)", len(m.warnings)))
 	check("…defaults to gruvbox-dark", m.theme == "gruvbox-dark", m.theme)
-	check("…cleanup never (D2)", m.cleanup_policy == "never", m.cleanup_policy)
+	check("…cleanup only_created (R1 resolves the parked D2)",
+		m.cleanup_policy == "only_created", m.cleanup_policy)
 	check("…no remote hosts", len(m.remotes) == 0, fmt.tprintf("{} remote(s)", len(m.remotes)))
 	check("…reads as absent, not corrupt", !m.present && !m.corrupt,
 		fmt.tprintf("present={} corrupt={}", m.present, m.corrupt))
@@ -348,7 +349,7 @@ case_config_parse :: proc() -> bool {
 	bad := app.config_parse_json("{ this is not json at all", "/tmp/bad")
 	check("corrupt JSON: flagged corrupt", bad.corrupt, fmt.tprintf("corrupt={}", bad.corrupt))
 	check("…still fully usable defaults",
-		bad.theme == "gruvbox-dark" && bad.cleanup_policy == "never",
+		bad.theme == "gruvbox-dark" && bad.cleanup_policy == "only_created",
 		fmt.tprintf("theme='{}' cleanup='{}'", bad.theme, bad.cleanup_policy))
 	check("…exactly ONE warning line (visible, not a stack trace)",
 		len(bad.warnings) == 1, fmt.tprintf("{} warnings: {}", len(bad.warnings), warn_join(bad)))
@@ -393,7 +394,7 @@ case_config_parse :: proc() -> bool {
 	check("wrong-typed keys each get a warning", len(wt.warnings) == 3,
 		fmt.tprintf("{} warnings: {}", len(wt.warnings), warn_join(wt)))
 	check("…defaults still hold for every owned key",
-		wt.theme == "gruvbox-dark" && wt.cleanup_policy == "never" && len(wt.remotes) == 0,
+		wt.theme == "gruvbox-dark" && wt.cleanup_policy == "only_created" && len(wt.remotes) == 0,
 		fmt.tprintf("theme='{}' cleanup='{}' remotes={}", wt.theme, wt.cleanup_policy, len(wt.remotes)))
 	check("…and the file is NOT called corrupt (it parsed fine)",
 		!wt.corrupt && wt.present, fmt.tprintf("corrupt={} present={}", wt.corrupt, wt.present))

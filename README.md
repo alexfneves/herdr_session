@@ -56,6 +56,11 @@ The app has seven states. Every state can be left with `Esc`, every state quits
 with `Ctrl-C`, and **`Ctrl-L` re-reads the session list from every state** (see
 [How fresh is the list?](#how-fresh-is-the-list)).
 
+**Typing only edits the filter in four states** — `r` (pick a remote host), `a`
+(attach), `d` (delete) and `t` (theme). The landing screen binds exactly the keys
+in its own table below; an unclaimed letter there does nothing, so you can never
+accidentally type into a filter you are not aiming at. See [Where you can type](#where-you-can-type).
+
 ### 1. Mode selection (the landing screen)
 
 | Key | Action |
@@ -69,8 +74,10 @@ with `Ctrl-C`, and **`Ctrl-L` re-reads the session list from every state** (see
 | `t` | switch theme |
 | `Esc` | quit |
 
-Arrow keys move the selection; typing narrows the list in the states that have a
-filter line.
+That list is **complete**: `Enter n r s a d t Esc Ctrl-C`. Arrow keys move the
+selection; typing does **not** filter here. The filter line is still drawn above
+the list so the layout matches the states that do filter, but it stays empty and
+uneditable until you enter one of them.
 
 ### 2. Attach (`a`)
 
@@ -144,6 +151,52 @@ silently stripped — herdr's own name grammar is narrower than most shells'.
 single line saying so (with the size you have and the size you need). Enlarge the
 window and the normal UI comes back on the next frame — nothing to reset.
 
+### Where you can type
+
+Typing edits the filter in **exactly four states**:
+
+| State | Reached with | The filter narrows |
+|-------|--------------|--------------------|
+| Pick a remote host | `r`, `s` | the configured remote hosts |
+| Attach | `a` | the session list |
+| Delete | `d` | the session list |
+| Theme | `t` | the theme names |
+
+Everywhere else — the landing screen above all — the typed character is not bound
+to the filter and does nothing. The binding list for Mode selection is
+`Enter n r s a d t Esc Ctrl-C`, full stop. The filter line is still *drawn* in
+the Sessions layout so the screen does not jump between states; it simply stays
+empty until you enter one of the four states above.
+
+**`Del` and `Backspace` both remove the last character.** `Delete` (and
+`fn+Delete` on a Mac keyboard) is mapped to the same remove-last-rune action as
+`Backspace`, because this app always edits at the end of the line — there is no
+caret in the middle for the two keys to disagree about. Deletion is rune-wise, not
+byte-wise: a multi-byte character (an accented letter, a CJK rune, an emoji) goes
+as one whole unit, never as a dangling continuation byte.
+
+Keys this app deliberately does **not** bind, rather than dropping silently:
+`Insert` (there is no overwrite mode), `Home` / `End` (there is no caret-in-the-middle
+to move) and `PgUp` / `PgDn` (the list scrolls with the arrows; there is no paging
+model). They are no-ops by decision, and the decision is recorded in
+`src/input/keymap.odin`.
+
+### The highlighted row *is* the selection
+
+A list is never shown without a highlight unless it is genuinely empty:
+
+- entering a list state highlights the **first** visible row — except the theme
+  picker, which opens on the theme **currently applied**;
+- if a filter removes the row you had selected, the highlight falls back to the
+  first row the filter leaves visible, and the selection moves with it;
+- an empty list has no highlight, and `Enter` there does nothing.
+
+The point of the rule is that `Enter` always acts on precisely the row the screen
+is pointing at. When filtering shifts rows around, the selection is re-derived
+from the highlighted row rather than left pointing at a row that is no longer
+there — so a row can never be deleted or attached "from under" the cursor, and the
+cursor can never sit on nothing.
+
 ---
 
 ## Configuration
@@ -163,7 +216,7 @@ so you can keep your own keys next to ours.
     "deploy@10.0.0.7",
     { "target": "gpu-box", "label": "GPU box" }
   ],
-  "cleanup_policy": "never"
+  "cleanup_policy": "only_created"
 }
 ```
 
@@ -171,7 +224,7 @@ so you can keep your own keys next to ours.
 |-----|------|---------|---------|
 | `theme` | string | `"gruvbox-dark"` | Colour theme. See [Themes](#themes). |
 | `remotes` | array | `[]` | SSH targets. See [Adding a remote](#adding-a-remote). |
-| `cleanup_policy` | string | `"never"` | What happens to a session after you detach. See [Cleanup policy](#cleanup-policy). |
+| `cleanup_policy` | string | `"only_created"` | What happens to a session after you detach. See [Cleanup policy](#cleanup-policy). |
 
 ### Bad config is shown, not thrown
 
@@ -275,41 +328,41 @@ colour is a named field on a palette, not an inline hex.
 
 ## Cleanup policy
 
-> ### ⚠️ `cleanup_policy = "never"` — sessions are NOT destroyed when you detach
+> ### `cleanup_policy = "only_created"` — the session you *created here* is destroyed when you detach
 >
-> This is the **shipped default**, and it is a deliberate behavioural change from
-> the `herdr-cycle` script this replaces.
+> This is the **shipped default**. It restores the destroy-on-detach behaviour of
+> the `herdr-cycle` script this replaces, but only for the half of it that was
+> safe: a session this app generated a name for and asked `herdr` to start is
+> stopped and deleted when the handoff returns. A session you merely **attached**
+> to is left exactly as you found it — that session was yours before this app ever
+> listed it, and `only_created` never touches it.
 >
-> The old `herdr-cycle` **stopped and deleted** the session when you left it
-> (destroy-on-detach). `herdr-session` **leaves it running**.
+> **What this means in practice:** `n` → name → `Enter` → work → `prefix+q` takes
+> you back to the main state *and* the session is gone from the list. Attach with
+> `a`, leave, and it is still there.
 >
-> Why: `herdr`'s own `prefix+q` only *detaches* — the server and its panes keep
-> running. Silently destroying a session someone merely peeked at is data loss, and
-> the exact detach semantics of the herdr build on your machine are not something
-> this app wants to guess about. This is plan decision **D2**, and D2 is *parked*.
+> If the session was already deleted elsewhere, the return is silent — no error.
 >
-> **What this means in practice:** attach to a session, press `Ctrl-C` / leave, and
-> that session is still there in the list when you come back. Deletion is only ever
-> what you explicitly asked for with `d` → `Enter`.
->
-> If you want the old behaviour back, set `"cleanup_policy": "always"` — but
-> read [Cleanup follows the device](#cleanup-follows-the-device) first, because
-> that is the part of the old behaviour that used to be wrong.
+> Choose `"never"` to keep everything running and make deletion strictly an
+> explicit `d` → `Enter`, or `"always"` for the old destroy-after-every-detach
+> behaviour — but read [Cleanup follows the device](#cleanup-follows-the-device)
+> first, because that is the part of the old behaviour that used to be wrong.
 
 Three accepted values:
 
 | Value | Behaviour on detach |
 |-------|--------------------|
-| `"never"` | **(default)** leave the session running. Deletion is always an explicit user action. |
-| `"only_created"` | stop + delete sessions *this app created*; leave sessions you created elsewhere alone. |
+| `"never"` | leave the session running. Deletion is always an explicit user action. |
+| `"only_created"` | **(default)** stop + delete sessions *this app created*; leave sessions you created elsewhere — and any session you only attached to — alone. |
 | `"always"` | stop + delete after every detach — the old `herdr-cycle` behaviour. |
 
 Two invariants that outrank every policy:
 
 - **`default` is never destroyed** by any policy, under any circumstance.
-- An unrecognised value (e.g. `"on"`) falls back to `"never"` and puts a warning
-  in the footer, so you are never silently in a *more* destructive mode than you
-  asked for.
+- An unrecognised value (e.g. `"on"`) falls back to `"never"` — *not* to the
+  `only_created` default — and puts a warning in the footer, so a typo in the file
+  can never silently move you into a *more* destructive mode than the one you were
+  trying to write. Only an **absent** key gets the `only_created` default.
 
 The policy check lives in exactly one function
 (`cleanup_should_run` in `src/app/herdr.odin`) and the detach path calls it every

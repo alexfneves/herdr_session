@@ -157,10 +157,18 @@ prefix_for :: proc(s: app.State) -> []input.Key {
 // sm_new builds a fixture machine in state `s`, with a live selection when the
 // state has a list. Everything — the state AND the selection — arrives through
 // keys, so a cell of the matrix is "what the user's fingers would cause".
+//
+// The `a.sel < 0` guard is RCH-3/R4: entering a state with a non-empty list now
+// HIGHLIGHTS THE FIRST ROW, so a selection already exists and the driver must
+// not press Down on top of it (that would land the cursor on the second row and
+// silently change which item every `select_item: true` cell is about). The Down
+// press is kept for the case the guard can still produce: a list that was empty
+// when the state was entered and had items appear later, or a state entered with
+// the selection cleared.
 sm_new :: proc(s: app.State, select_item: bool) -> app.App {
 	a := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
 	drive(&a, prefix_for(s))
-	if select_item && app.state_is_filter_view(a.state) {
+	if select_item && app.state_is_filter_view(a.state) && a.sel < 0 {
 		app.update(&a, k_down)
 	}
 	return a
@@ -243,6 +251,9 @@ case_state_machine :: proc() -> bool {
 	sm_ctrl_c_everywhere()
 	sm_esc_back()
 	sm_identity_not_sliding()
+	sm_r2_filter_owns_exactly_four_states()
+	sm_r4_highlight_is_the_selection()
+	sm_r3_delete_key_is_backspace()
 	sm_filter_agrees_with_the_view()
 	sm_never_default()
 	sm_empty_world()
@@ -285,6 +296,23 @@ sm_keymap :: proc() {
 		input.decode(termbox2.EVENT_KEY, termbox2.KEY_BACKSPACE2, 0, 0).kind == .backspace, "")
 	check("0x08 (Ctrl-H) decodes to backspace",
 		input.decode(termbox2.EVENT_KEY, termbox2.KEY_BACKSPACE, 0, 0).kind == .backspace, "")
+	// KEY_DELETE (`CSI 3 ~` — the Del key, fn+Delete on a Mac) is RCH-3/R3.
+	// It used to fall through to `.none`, `ch == 0`, and decode to NO_KEY: the
+	// keypress was silently dropped and the filter never shortened.
+	kd := input.decode(termbox2.EVENT_KEY, termbox2.KEY_DELETE, 0, 0)
+	check("KEY_DELETE (CSI 3 ~) decodes to backspace (R3)", kd.kind == .backspace,
+		fmt.tprintf("kind={} code=0x{}", kd.kind, fmt.tprintf("%04X", termbox2.KEY_DELETE)))
+	check("…and it is NOT the no-key it used to be", kd.kind != .none, "")
+	// The codes this file DELIBERATELY leaves unmapped, so "we checked for other
+	// dropped edit keys" is a recorded decision and not a guess. Insert/overwrite
+	// has no target in an append-only field; Home/End have no caret-in-the-middle
+	// model; PgUp/PgDn have no paging model (see the audit in keymap.odin).
+	check("KEY_INSERT stays a deliberate no-op (no overwrite mode exists)",
+		input.decode(termbox2.EVENT_KEY, termbox2.KEY_INSERT, 0, 0).kind == .none, "")
+	check("KEY_HOME stays a deliberate no-op (no caret-in-the-middle model)",
+		input.decode(termbox2.EVENT_KEY, termbox2.KEY_HOME, 0, 0).kind == .none, "")
+	check("KEY_END stays a deliberate no-op (same reason)",
+		input.decode(termbox2.EVENT_KEY, termbox2.KEY_END, 0, 0).kind == .none, "")
 	check("arrow down decodes to down",
 		input.decode(termbox2.EVENT_KEY, termbox2.KEY_ARROW_DOWN, 0, 0).kind == .down, "")
 
@@ -519,9 +547,13 @@ sm_two_step :: proc() {
 	check("  no launch happened yet at the hop", cmd.kind == .none,
 		fmt.tprintf("cmd = {}", app.cmd_kind_label(cmd.kind)))
 
-	app.update(&a, k_down)
-	check("  [down] selects a host", a.sel == 0 && app.shown_count(&a) == 3,
-		fmt.tprintf("sel={} shown={}", a.sel, app.shown_count(&a)))
+	// RCH-3/R4: entering {remote_server} now highlights the FIRST host, so the
+	// pick is already made — no Down needed. That is asserted here rather than
+	// smuggled through the old `k_down`, because which row the cursor is on is
+	// exactly what decides which device gets launched.
+	check("  [entry] highlights the FIRST host (R4: something is always highlighted)",
+		a.sel == 0 && app.shown_count(&a) == 3 && a.cursor_id == SM_DEV_LAB,
+		fmt.tprintf("sel={} shown={} cursor_id=%q", a.sel, app.shown_count(&a), a.cursor_id))
 
 	cmd = app.update(&a, k_enter)
 	expect_state("  [Enter] leaves for the launch", a.state, .mode_selection, "4/4")
@@ -559,7 +591,6 @@ sm_two_step :: proc() {
 	// The unnamed remote path ([r]) must still work with no carried name.
 	d := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
 	drive(&d, []input.Key{kc('r')})
-	app.update(&d, k_down)
 	cmd = app.update(&d, k_enter)
 	expect_cmd("  [r] (unnamed remote) launches with a timestamp-only name", cmd, .launch_remote, "")
 	check("  no carried name leaked into the [r] path",
@@ -757,7 +788,282 @@ sm_identity_not_sliding :: proc() {
 			app.cmd_kind_label(cmd.kind), cmd.device, cmd.name))
 }
 
-// ── 9b. the machine's filter == the view's filter ─────────────────────────
+// ── 9b. R2: the filter belongs to EXACTLY FOUR states ────────────────
+//
+// THE INVERTED TEST. Before RCH-3/R2 this file had no assertion of its own
+// about typing in {Mode selection} — the behaviour lived entirely in
+// `at_mode_selection`, behind a comment arguing that a printable key there
+// "keeps the spec's filter line usable in the Sessions view". The spec's
+// Mode-selection binding list is `Enter n r s a d t Escape Ctrl+C`. There is no
+// "type in the filter" entry. So the assertions below replace the old rationalis
+// from the other side: typing in {Mode selection} must not move the filter, and
+// in each of the four states that DO own the binding it must. If anyone
+// reinstates the old behaviour, `unclaimed printable leaves the filter EMPTY`
+// goes red.
+sm_r2_filter_owns_exactly_four_states :: proc() {
+	say("  [9b] R2: filter typing is bound in FOUR states, and NOT in {Mode selection}")
+
+	// The predicate is the single source of truth for the four-state rule, so the
+	// spec list and the code cannot drift apart silently.
+	editable := []app.State{.remote_server, .attach, .delete_session, .theme}
+	for s in editable {
+		check(fmt.tprintf("  {} OWNS the filter-typing binding", app.state_label(s)),
+			app.state_filter_is_editable(s), "")
+	}
+	non_editable := []app.State{.mode_selection, .name_local, .name_remote_named, .error}
+	for s in non_editable {
+		check(fmt.tprintf("  {} does NOT own it", app.state_label(s)),
+			!app.state_filter_is_editable(s), "")
+	}
+
+	// THE INVERTED BEHAVIOUR CHECK. In {Mode selection} an unclaimed printable
+	// key must leave the filter empty and the visible list untouched. "x" is
+	// deliberately not a mode key.
+	m := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	app.rebuild_shown(&m)
+	before := app.shown_count(&m)
+	stray := "xq/_.1234567890 "
+	changed := 0
+	issued := 0
+	for r in stray {
+		if app.update(&m, kc(r)).kind != .none { issued += 1 }
+		if m.filter.len != 0 { changed += 1 }
+	}
+	check("  typing 16 unclaimed keys in [Mode selection] leaves the filter EMPTY",
+		changed == 0 && m.filter.len == 0,
+		fmt.tprintf("{} of {} keys touched the filter; filter=%q",
+			changed, len(stray), app.text_of(&m.filter)))
+	check("  …and none of them issued a Command or moved the visible list",
+		issued == 0 && app.shown_count(&m) == before && before == len(sm_sessions()),
+		fmt.tprintf("commands issued={} shown={} sessions={}",
+			issued, app.shown_count(&m), len(sm_sessions())))
+
+	// …while the SIX mode keys still work from the same machine, immediately
+	// after the stray typing, with no residue.
+	modes := []struct { key: rune, want: app.State }{
+		{'n', .name_local}, {'r', .remote_server}, {'s', .name_remote_named},
+		{'a', .attach}, {'d', .delete_session}, {'t', .theme},
+	}
+	for m2 in modes {
+		x := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+		drive(&x, stray_keys(stray))
+		cmd := app.update(&x, kc(m2.key))
+		check(fmt.tprintf("  [{}] still reaches {} after stray typing",
+			m2.key, app.state_label(m2.want)),
+			x.state == m2.want && cmd.kind == .none && x.filter.len == 0,
+			fmt.tprintf("state={} cmd={} filter=%q", app.state_label(x.state),
+				app.cmd_kind_label(cmd.kind), app.text_of(&x.filter)))
+	}
+
+	// And in each of the FOUR filter states the SAME typed character DOES filter.
+	for s in editable {
+		f := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+		drive(&f, prefix_for(s))
+		total := app.shown_count(&f)
+		probe := sm_filter_probe_for(s)
+		for r in probe { app.update(&f, kc(r)) }
+		after := app.shown_count(&f)
+		check(fmt.tprintf("  typing %q in {} narrows {} rows -> {} rows",
+			probe, app.state_label(s), total, after),
+			after < total && len(app.text_of(&f.filter)) == len(probe),
+			fmt.tprintf("filter=%q shown {} -> {}", app.text_of(&f.filter), total, after))
+	}
+}
+
+// stray_keys spells a string of unclaimed characters as keys.
+stray_keys :: proc(s: string) -> []input.Key {
+	out: [dynamic]input.Key
+	for r in s { append(&out, kc(r)) }
+	return out[:]
+}
+
+// sm_filter_probe_for picks a substring that narrows the ACTIVE list of `s`
+// without emptying it, so "it filters" and "it filters to nothing" stay
+// distinguishable. "lab" narrows the remote list to one host and the session
+// list to the one lab row; "a" is wide enough for the theme names.
+sm_filter_probe_for :: proc(s: app.State) -> string {
+	#partial switch s {
+	case .remote_server:    return "lab"
+	case .attach:          return "lab"
+	case .delete_session:   return "local"
+	case .theme:           return "cat"
+	}
+	return ""
+}
+
+// ── 9c. R4: the highlighted row IS the selection ─────────────────────
+//
+// The old code opened every list with `sel = -1` (nothing highlighted) because
+// sliding a cursor onto a shifted row can make Enter act on a row the user never
+// pointed at. R4 keeps the highlight but kills the hazard from the other side:
+// after every clamp, `sync_cursors` re-derives `held`/`cursor_id` from the
+// HIGHLIGHTED row, so there is no state in which Enter acts on something the
+// screen is not pointing at.
+sm_r4_highlight_is_the_selection :: proc() {
+	say("  [9c] R4: a non-empty list is ALWAYS highlighted, and the highlight IS the selection")
+
+	// (1) Entering a list state highlights the FIRST row (sessions views).
+	session_views := []app.State{.attach, .delete_session}
+	for s in session_views {
+		m := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+		drive(&m, prefix_for(s))
+		first := m.sessions[m.shown[0]]
+		check(fmt.tprintf("  entering {} highlights row 0 and held == it",
+			app.state_label(s)),
+			m.sel == 0 && m.held.valid && m.held.device == first.device &&
+				m.held.name == first.name,
+			fmt.tprintf("sel={} held={}/{} first={}/{}",
+				m.sel, m.held.device, m.held.name, first.device, first.name))
+	}
+
+	// (2) The remote picker highlights the first host on entry.
+	r := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&r, []input.Key{kc('r')})
+	check("  entering {remote_server} highlights the first host and cursor_id == it",
+		r.sel == 0 && r.cursor_id == r.remotes[r.shown[0]].device,
+		fmt.tprintf("sel={} cursor_id=%q first=%q",
+			r.sel, r.cursor_id, r.remotes[r.shown[0]].device))
+
+	// (3) The THEME picker opens on the APPLIED theme, not on row 0. The fixture
+	//     default theme is "gruvbox-dark" (index 0), so the theme list is walked
+	//     from a NON-zero-theme default to prove it is identity, not position.
+	t := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), "solarized-dark")
+	app.update(&t, kc('t'))
+	check("  the theme picker opens on the APPLIED theme (not row 0)",
+		t.sel == 2 && t.themes[t.shown[t.sel]] == "solarized-dark",
+		fmt.tprintf("sel={} shown@sel={}", t.sel, t.themes[t.shown[t.sel]]))
+
+	// (4) A filter that EXCLUDES the applied theme falls back to the first
+	//     visible row, and the selection moves with it.
+	app.update(&t, kc('c'))
+	check("  a filter excluding the applied theme keeps a highlight (sel >= 0)",
+		t.sel >= 0 && app.shown_count(&t) > 0 &&
+			t.themes[t.shown[t.sel]] != "solarized-dark",
+		fmt.tprintf("sel={} shown={} @sel={}", t.sel, app.shown_count(&t),
+			t.themes[t.shown[t.sel]]))
+	check("  …and cursor_id re-synced to the HIGHLIGHTED theme, not the gone one",
+		t.cursor_id == t.themes[t.shown[t.sel]] && t.cursor_id != "solarized-dark",
+		fmt.tprintf("cursor_id=%q @sel=%q", t.cursor_id, t.themes[t.shown[t.sel]]))
+
+	// (5) THE PHANTOM-ROW GUARD. Filter away the held row in {Attach} while a
+	//     second row survives, then press Enter: the command MUST name the row
+	//     that is highlighted, never the row that was filtered away.
+	g := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&g, []input.Key{kc('a')})
+	held_before := g.held.name
+	high_before := g.sessions[g.shown[g.sel]].name
+	check("  starting state: the highlight and held agree",
+		held_before == high_before && g.sel == 0,
+		fmt.tprintf("held=%q highlighted=%q sel={}", held_before, high_before, g.sel))
+
+	// Narrow so the held row (api-…) is GONE and a different row survives.
+	drive(&g, keys_of("worker"))
+	survivor := g.sessions[g.shown[g.sel]]
+	check("  the filter removes the held row and leaves another visible",
+		app.shown_count(&g) == 1 && survivor.name != held_before && g.sel == 0,
+		fmt.tprintf("shown={} survivor=%q was-held=%q sel={}",
+			app.shown_count(&g), survivor.name, held_before, g.sel))
+	check("  …the highlight moved to the survivor AND held moved with it",
+		g.held.valid && g.held.name == survivor.name && g.held.device == survivor.device,
+		fmt.tprintf("held={}/{} highlighted={}/{}",
+			g.held.device, g.held.name, survivor.device, survivor.name))
+
+	cmd := app.update(&g, k_enter)
+	check("  Enter acts on EXACTLY the highlighted row — never the filtered-away one",
+		cmd.kind == .attach && cmd.name == survivor.name && cmd.device == survivor.device,
+		fmt.tprintf("cmd={} name=%q device=%q (highlighted %q/%q, filtered-away %q)",
+			app.cmd_kind_label(cmd.kind), cmd.name, cmd.device,
+			survivor.name, survivor.device, held_before))
+
+	// (6) EMPTY list -> no highlight, held invalid, Enter is a no-op
+	//     (spec: "If nothing was selected, pressing the key does nothing").
+	e := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&e, []input.Key{kc('a')})
+	drive(&e, keys_of("zzzznothingmatches"))
+	ecmd := app.update(&e, k_enter)
+	check("  an empty list has no highlight and Enter is a no-op",
+		e.sel == -1 && app.shown_count(&e) == 0 && !e.held.valid &&
+			ecmd.kind == .none && e.state == .attach,
+		fmt.tprintf("sel={} shown={} held.valid={} cmd={}",
+			e.sel, app.shown_count(&e), e.held.valid, app.cmd_kind_label(ecmd.kind)))
+	// …and the highlight COMES BACK when the filter is erased, still row 0.
+	for _ in 0 ..< 18 { app.update(&e, k_bsp) }
+	check("  erasing the filter restores the first-row highlight, held in step",
+		e.sel == 0 && app.shown_count(&e) == len(sm_sessions()) &&
+			e.held.name == e.sessions[e.shown[0]].name,
+		fmt.tprintf("sel={} shown={} held=%q", e.sel, app.shown_count(&e), e.held.name))
+}
+
+// ── 9d. R3: the Del key edits text, it is not a dropped key ─────────────
+//
+// The mapping side is in `sm_keymap`; this is the BEHAVIOUR side — the key
+// actually shortens the filter and the edit field, and whole runes go, so a
+// multi-byte character cannot be chopped into a dangling continuation byte.
+// The real-pty proof lives in dev/tui_drive.py (`del-key`).
+sm_r3_delete_key_is_backspace :: proc() {
+	say("  [9d] R3: Del removes the last rune in every filter AND edit state")
+	kd := input.key_of(.backspace)   // what KEY_DELETE decodes to (see sm_keymap)
+
+	// The filter, in a state that owns it.
+	f := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&f, []input.Key{kc('a')})
+	drive(&f, keys_of("api"))
+	check("  the filter holds 3 chars before Del", f.filter.len == 3,
+		fmt.tprintf("filter=%q", app.text_of(&f.filter)))
+	app.update(&f, kd)
+	check("  Del shortens it to 2", f.filter.len == 2 && app.text_of(&f.filter) == "ap",
+		fmt.tprintf("filter=%q", app.text_of(&f.filter)))
+	app.update(&f, kd)
+	app.update(&f, kd)
+	check("  …to 1 …then to empty", f.filter.len == 0,
+		fmt.tprintf("filter=%q", app.text_of(&f.filter)))
+	app.update(&f, kd)   // Del on an empty filter must not go negative
+	check("  Del on an empty filter is harmless (len stays 0)", f.filter.len == 0,
+		fmt.tprintf("filter.len={}", f.filter.len))
+
+	// The whole-rune rule on the filter: 世 is THREE bytes. A one-byte delete
+	// would leave continuation bytes that render as garbage.
+	g := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&g, []input.Key{kc('a')})
+	drive(&g, keys_of("a世😀"))
+	check("  the filter holds an ASCII + 3-byte CJK + 4-byte emoji rune",
+		g.filter.len == 1 + 3 + 4, fmt.tprintf("bytes={}", g.filter.len))
+	app.update(&g, kd)
+	check("  Del removed the WHOLE 4-byte emoji, not one byte of it",
+		g.filter.len == 4 && app.text_of(&g.filter) == "a世",
+		fmt.tprintf("filter=%q bytes={}", app.text_of(&g.filter), g.filter.len))
+	app.update(&g, kd)
+	check("  …and the WHOLE 3-byte CJK rune next",
+		g.filter.len == 1 && app.text_of(&g.filter) == "a",
+		fmt.tprintf("filter=%q bytes={}", app.text_of(&g.filter), g.filter.len))
+
+	// The single-edit states use the same key for the same verb.
+	n := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&n, []input.Key{kc('n')})
+	drive(&n, keys_of("api"))
+	app.update(&n, kd)
+	check("  Del removes a character from the name field too",
+		app.text_of(&n.field) == "ap", fmt.tprintf("field=%q", app.text_of(&n.field)))
+	app.update(&n, kd)
+	app.update(&n, kd)
+	check("  …and erases it completely, leaving Enter a no-op",
+		app.text_of(&n.field) == "" && app.update(&n, k_enter).kind == .none,
+		fmt.tprintf("field=%q", app.text_of(&n.field)))
+
+	// And Del in a filter state still RE-NARROWS the list, not just shortens the
+	// string — that is the visible effect the user asked for.
+	rn := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&rn, []input.Key{kc('a')})
+	drive(&rn, keys_of("bu"))          // matches only `build-…`
+	narrowed := app.shown_count(&rn)
+	app.update(&rn, kd)               // "b" — matches `db-…` AND `build-…`
+	widened := app.shown_count(&rn)
+	check("  Del re-widens the list (filter shortened => more rows visible)",
+		narrowed == 1 && widened > narrowed,
+		fmt.tprintf("{} row at \"bu\" -> {} rows at \"b\"", narrowed, widened))
+}
+
+// ── 9e. the machine's filter == the view's filter ──────────────────────────
 //
 // The row Enter ACTS on and the row the UI PAINTS as selected must come from
 // the same predicate. `app.machine_session_matches` and `ui.sessions_match`

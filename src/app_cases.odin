@@ -755,10 +755,16 @@ contains_device :: proc(rs: []app.Remote, device: string) -> bool {
 	return false
 }
 
-// unit_cleanup — D2 is PARKED: nothing gets destroyed by default.
+// unit_cleanup — the shipped default is `only_created` (RCH-3/R1, which resolves
+// the parked D2): sessions THIS app created are destroyed after the handoff
+// returns; sessions it merely attached to are left alone. `never` is still the
+// safe value a user can choose, and still what an unrecognised config value falls
+// back to. These three assertions used to pin the parked default — they are
+// INVERTED on purpose, because R1 moved the default, and they must move with it.
 unit_cleanup :: proc() {
-	eq("default policy is 'never'", policy_text(app.DEFAULT_CLEANUP_POLICY), "never")
-	eq("current policy is the default", policy_text(app.cleanup_policy()), "never")
+	eq("default policy is 'only_created' (R1)",
+		policy_text(app.DEFAULT_CLEANUP_POLICY), "only_created")
+	eq("current policy is the default", policy_text(app.cleanup_policy()), "only_created")
 
 	check("never → nothing destroyed, even for a session we created",
 		!app.cleanup_should_run(.never, "hs-t-x", true), "")
@@ -778,8 +784,8 @@ unit_cleanup :: proc() {
 	eq("policy is settable at runtime (the seam works)",
 		policy_text(app.cleanup_policy()), "only_created")
 	app.set_cleanup_policy(app.DEFAULT_CLEANUP_POLICY)
-	eq("policy restored to the parked default",
-		policy_text(app.cleanup_policy()), "never")
+	eq("policy restored to the shipped default",
+		policy_text(app.cleanup_policy()), "only_created")
 }
 
 policy_text :: proc(p: app.Cleanup_Policy) -> string {

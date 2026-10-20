@@ -131,10 +131,33 @@ state_is_session_view :: proc(s: State) -> bool {
 	return s == .mode_selection || s == .attach || s == .delete_session
 }
 
-// state_is_filter_view: the states where typed characters narrow a list.
+// state_is_filter_view: the states whose layout DISPLAYS a filter line. The
+// Sessions view is one of them even in {Mode selection}, because the spec's
+// Sessions content is "a line for the filter, and below it the table".
+//
+// Do NOT read this as "typing here edits the filter" — it is not. See
+// `state_filter_is_editable`, which is the narrower set the spec actually names.
 state_is_filter_view :: proc(s: State) -> bool {
 	return s == .mode_selection || s == .remote_server ||
 		s == .attach || s == .delete_session || s == .theme
+}
+
+// state_filter_is_editable: THE FOUR STATES that own the "[Other keys] type in the
+// filter" binding (RCH-3/R2). The spec grants filter typing to exactly these:
+//
+//   {Select remote server for new remote session}
+//   {Select session to attach}
+//   {Select session to delete}
+//   {Select theme}
+//
+// {Mode selection} shows the filter line but does NOT accept typing into it. Its
+// bindings are `Enter n r s a d t Escape Ctrl+C` and nothing else, so an
+// unclaimed printable key there is a NO-OP. Letting it leak into the filter made
+// a mistyped mode key silently change the list instead of doing nothing, which is
+// the opposite of what "does nothing" means to the user reading the footer.
+state_filter_is_editable :: proc(s: State) -> bool {
+	return s == .remote_server || s == .attach ||
+		s == .delete_session || s == .theme
 }
 
 // state_is_edit_view: the states whose main content is a single editable line.
@@ -383,13 +406,17 @@ theme_matches :: proc(name: string, filter: string) -> bool {
 	return contains_ci(name, filter)
 }
 
-// rebuild_shown recomputes `shown` for the ACTIVE state and re-places the
-// cursor on the SAME IDENTITY / SAME ITEM if it survived the filter.
+// rebuild_shown recomputes `shown` for the ACTIVE state, re-places the cursor
+// on the SAME IDENTITY / SAME ITEM if it survived the filter, and then CLAMPS
+// so a non-empty list always has a highlighted row (RCH-3/R4).
 //
-// The "same identity" step is load-bearing: if the selected row is filtered
-// out, the cursor must drop to -1, NOT slide onto whatever row shifted into
-// its slot. Sliding is how Enter ends up acting on a row the user never
-// pointed at.
+// The "same identity" step is load-bearing and stays: if the selected row is
+// filtered out the cursor must not SLIDE onto whatever row happened to shift
+// into its old slot. What superseded the old "drop to -1" answer is the stronger
+// invariant below — the row that gets highlighted IS the selection, because
+// every clamp is followed by `sync_cursors`. There is therefore no such thing as
+// a cursor pointing at a row the user cannot see: the highlight moves to the
+// first VISIBLE row and `held` moves with it.
 rebuild_shown :: proc(a: ^App) {
 	filter := text_of(&a.filter)
 	keep := a.held
@@ -411,9 +438,11 @@ rebuild_shown :: proc(a: ^App) {
 					break
 				}
 			}
-			// A selection the filter removed is GONE. Leaving `held` valid would
-			// let Enter act on a row that is no longer on screen — and `held` is
-			// what the Command is built from, so it must mean "visible selection".
+			// A selection the filter removed is no longer a selection. Dropping
+			// `held` here is what keeps Enter from acting on a row that is off
+			// screen; the clamp at the end of this proc then re-derives BOTH the
+			// cursor and `held` from the first visible row, so the two can never
+			// disagree.
 			if !found { a.held = NO_SELECTION }
 		}
 
@@ -451,6 +480,31 @@ rebuild_shown :: proc(a: ^App) {
 	case:
 		// Edit states and {Error} show no list; nothing to rebuild.
 	}
+
+	clamp_selection(a)
+}
+
+// clamp_selection is the R4 rule in one place:
+//
+//   EMPTY list   -> sel = -1, held invalid, Enter is a no-op
+//                  (spec: "If nothing was selected, pressing the key does nothing")
+//   NON-empty    -> sel is placed inside `shown`, and `sync_cursors` runs so
+//                  `held`/`cursor_id` denote EXACTLY the highlighted row.
+//
+// That second half is the whole safety argument for "always highlighted". Without
+// it, "always highlighted" is just a cursor that can point at nothing while
+// `held` still means a row the filter removed — the phantom-row hazard the old
+// `-1` was papering over. With it, Enter acts on the highlighted row by
+// construction: the highlight and the selection are the same fact, recomputed
+// together.
+clamp_selection :: proc(a: ^App) {
+	if len(a.shown) == 0 {
+		a.sel = -1
+		a.held = NO_SELECTION
+		return
+	}
+	if a.sel < 0 || a.sel >= len(a.shown) { a.sel = 0 }
+	sync_cursors(a)
 }
 
 // ── cursor movement ───────────────────────────────────────────────────────
@@ -592,13 +646,14 @@ at_mode_selection :: proc(a: ^App, k: input.Key) -> Command {
 		case 'd': enter_state(a, .delete_session); return no_cmd()
 		case 't': enter_state(a, .theme); return no_cmd()
 		}
-		// Every other printable key filters the Sessions table. The six mode keys
-		// above returned already, so this only ever sees unclaimed characters —
-		// which is what keeps the spec's filter line usable in the Sessions view
-		// without colliding with a mode binding.
-		if a.filter.len >= FILTER_MAX { return no_cmd() }
-		text_append(&a.filter, k.r)
-		rebuild_shown(a)
+		// An unclaimed printable key is a NO-OP, on purpose and by spec
+		// (RCH-3/R2). {Mode selection} binds `Enter n r s a d t Escape Ctrl+C`
+		// and does not bind "type in the filter" — that binding belongs to the
+		// four states `state_filter_is_editable` names. The filter LINE stays on
+		// screen because the Sessions layout requires it; it simply isn't edited
+		// from here. A stray key that used to leak into it now changes nothing,
+		// which is what the footer promised.
+		return no_cmd()
 	}
 	return no_cmd()
 }
