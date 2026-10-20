@@ -497,7 +497,28 @@ rebuild_shown :: proc(a: ^App) {
 // `-1` was papering over. With it, Enter acts on the highlighted row by
 // construction: the highlight and the selection are the same fact, recomputed
 // together.
+// clamp_selection enforces RCH-3's invariant AS CORRECTED BY RCH-4: the
+// highlighted row is EXACTLY the row `Enter` acts on.
+//
+//   * empty list            -> sel = -1, held invalid, Enter does nothing.
+//   * a picker, selection
+//     filtered away         -> fall to the first VISIBLE row, and re-derive
+//                             held/cursor_id from THAT row.
+//   * {Mode selection}      -> NO highlight, ever. `Enter` there means "New
+//                             session"; it does not target a listed row, so a
+//                             highlight would point at one thing and act on
+//                             another — the precise misleading-UI failure R4
+//                             existed to prevent. The spec also gives this state
+//                             no Up/Down bindings at all: there is no cursor.
+//
+// The list itself is still BUILT for {Mode selection} (the Sessions layout
+// paints every row); only the cursor is withheld.
 clamp_selection :: proc(a: ^App) {
+	if a.state == .mode_selection {
+		a.sel = -1
+		a.held = NO_SELECTION
+		return
+	}
 	if len(a.shown) == 0 {
 		a.sel = -1
 		a.held = NO_SELECTION

@@ -253,6 +253,7 @@ case_state_machine :: proc() -> bool {
 	sm_identity_not_sliding()
 	sm_r2_filter_owns_exactly_four_states()
 	sm_r4_highlight_is_the_selection()
+	sm_rch4_mode_selection_has_no_highlight()
 	sm_r3_delete_key_is_backspace()
 	sm_filter_agrees_with_the_view()
 	sm_never_default()
@@ -902,7 +903,11 @@ sm_filter_probe_for :: proc(s: app.State) -> string {
 sm_r4_highlight_is_the_selection :: proc() {
 	say("  [9c] R4: a non-empty list is ALWAYS highlighted, and the highlight IS the selection")
 
-	// (1) Entering a list state highlights the FIRST row (sessions views).
+	// (1) Entering a PICKER highlights the FIRST row. Scoped to the picker
+	//     states by RCH-4: {Mode selection} is deliberately NOT in this list and
+	//     is asserted to be the OPPOSITE further down. It was in an earlier
+	//     version of this test under the original "always highlight" rule; RCH-4
+	//     corrected the rule, so the rule under test moved with it.
 	session_views := []app.State{.attach, .delete_session}
 	for s in session_views {
 		m := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
@@ -1063,7 +1068,119 @@ sm_r3_delete_key_is_backspace :: proc() {
 		fmt.tprintf("{} row at \"bu\" -> {} rows at \"b\"", narrowed, widened))
 }
 
-// ── 9e. the machine's filter == the view's filter ──────────────────────────
+// ── 9e. RCH-4: {Mode selection} has NO highlight ──────────────────
+//
+// THE CORRECTED HALF OF R4. RCH-3 said "always highlight something"; RCH-4
+// corrected it, because the highlight is a PROMISE ABOUT WHAT ENTER ACTS ON.
+// In {Mode selection} `Enter` means "New session" — it does not target a listed
+// row — so a highlight there points at one thing and then acts on another,
+// which is the exact failure R4 was written to prevent. The spec also gives this
+// state no Up/Down bindings: there is no cursor to draw.
+//
+// This test is additive to [9c] (which keeps the picker half) and asserts the
+// opposite for the landing state, so both halves of the corrected rule are
+// pinned and cannot silently drift back together.
+sm_rch4_mode_selection_has_no_highlight :: proc() {
+	say("  [9e] RCH-4: {Mode selection} points at NOTHING — Enter creates, it does not target")
+
+	// (1) Landing on a NON-EMPTY list and still highlighting nothing. This is
+	//     the whole correction: emptiness is not why there is no highlight here.
+	m := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	app.rebuild_shown(&m)
+	check("  {Mode selection} has rows to show but no highlight",
+		app.shown_count(&m) == len(sm_sessions()) && m.sel == -1,
+		fmt.tprintf("shown={} sel={}", app.shown_count(&m), m.sel))
+	check("  …and held is invalid, not a stale row",
+		!m.held.valid && m.held == app.NO_SELECTION,
+		fmt.tprintf("held.valid={} held={}/{}", m.held.valid, m.held.device, m.held.name))
+
+	// (2) RETURNING from a picker clears both the selection and the filter.
+	//     This is the case that would otherwise leave a highlight pointing at a
+	//     row the user picked two screens ago.
+	rt := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&rt, []input.Key{kc('a')})
+	drive(&rt, keys_of("worker"))
+	check("  setup: filtering to one row leaves exactly that row visible",
+		app.shown_count(&rt) == 1 && rt.sel == 0 && rt.held.valid,
+		fmt.tprintf("shown={} sel={} held.valid={}",
+			app.shown_count(&rt), rt.sel, rt.held.valid))
+	back := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	drive(&back, []input.Key{kc('a')})
+	held_in_picker := back.held.name
+	drive(&back, keys_of("worker"))
+	check("  in {Attach}: a selection exists and the filter is set",
+		back.sel >= 0 && back.held.valid && back.filter.len > 0,
+		fmt.tprintf("sel={} held=%q filter=%q", back.sel, held_in_picker,
+			app.text_of(&back.filter)))
+	app.update(&back, k_esc)
+	check("  back in {Mode selection}: selection CLEARED (no carried-over row)",
+		back.state == .mode_selection && back.sel == -1 && !back.held.valid,
+		fmt.tprintf("state={} sel={} held.valid={} (picker had %q)",
+			app.state_label(back.state), back.sel, back.held.valid, held_in_picker))
+	check("  …and the filter was cleared too",
+		back.filter.len == 0, fmt.tprintf("filter=%q", app.text_of(&back.filter)))
+	check("  …but the list is still fully populated (only the cursor was withheld)",
+		app.shown_count(&back) == len(sm_sessions()),
+		fmt.tprintf("shown={}", app.shown_count(&back)))
+
+	// (3) Enter in {Mode selection} CREATES, with no selection to act on. It
+	//     must not degrade into a no-op just because nothing is highlighted, and
+	//     must not target a row. This is the R1 path staying independent of R4.
+	c := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+	app.rebuild_shown(&c)
+	cmd := app.update(&c, k_enter)
+	check("  Enter with NO highlight still CREATES a new local session",
+		cmd.kind == .launch_local && cmd.name != "" && cmd.device == app.DEVICE_LOCAL,
+		fmt.tprintf("cmd={} name=%q device=%q sel={}",
+			app.cmd_kind_label(cmd.kind), cmd.name, cmd.device, c.sel))
+	check("  …and it names a NEW session, not any row that was on screen",
+		!contains_session_name(sm_sessions(), cmd.name),
+		fmt.tprintf("new name=%q is not an existing row", cmd.name))
+
+	// (4) The sharpened invariant across the whole machine: where there IS a
+	//     highlight, `held` names exactly the highlighted row; where there is
+	//     none, Enter never carries a row identity with it.
+	machine_states := [5]app.State{.mode_selection, .attach, .delete_session,
+		.remote_server, .theme}
+	for s in machine_states {
+		x := app.new_app(sm_sessions(), sm_remotes(), sm_themes(), SM_DEFAULT_THEME)
+		drive(&x, prefix_for(s))
+		has_hl := x.sel >= 0 && x.sel < app.shown_count(&x)
+		if has_hl {
+			ok_hl := true
+			#partial switch s {
+			case .attach, .delete_session:
+				ok_hl = x.held.valid &&
+					x.held.name == x.sessions[x.shown[x.sel]].name
+			case .remote_server:
+				ok_hl = x.cursor_id == x.remotes[x.shown[x.sel]].device
+			case .theme:
+				ok_hl = x.cursor_id == x.themes[x.shown[x.sel]]
+			case .mode_selection:
+				ok_hl = false   // must never reach here with a highlight
+			}
+			check(fmt.tprintf("  {}: highlight present and == what Enter acts on",
+				app.state_label(s)), ok_hl,
+				fmt.tprintf("sel={} cursor_id=%q held.valid={}", x.sel, x.cursor_id, x.held.valid))
+		} else {
+			check(fmt.tprintf("  {}: no highlight => no row identity carried",
+				app.state_label(s)),
+				s == .mode_selection || app.shown_count(&x) == 0 || x.sel == -1,
+				fmt.tprintf("sel={} shown={}", x.sel, app.shown_count(&x)))
+		}
+	}
+}
+
+// contains_session_name is a membership probe over the fixture, used to prove a
+// generated name is genuinely new rather than a row the user was looking at.
+contains_session_name :: proc(rows: []app.Session, name: string) -> bool {
+	for r in rows {
+		if r.name == name { return true }
+	}
+	return false
+}
+
+// ── 9g. the machine's filter == the view's filter ──────────────────────
 //
 // The row Enter ACTS on and the row the UI PAINTS as selected must come from
 // the same predicate. `app.machine_session_matches` and `ui.sessions_match`
