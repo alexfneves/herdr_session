@@ -545,6 +545,20 @@ KILL_REAP_BUDGET :: 250 * time.Millisecond
 // caller must not wait on a child we have already killed) but is left marked
 // un-reaped so `registry_reap_debts` keeps trying, and `registry_free` asserts
 // it got there in the end.
+//
+// ACCEPTED COST (P3-9): the retry loop sleeps 1 ms per turn up to
+// `KILL_REAP_BUDGET`, so this can hold the UI thread for that whole window on
+// the deadline path. It is accepted rather than fixed because the alternative is
+// worse in every direction considered: returning without collecting reintroduces
+// the zombie factory described above; deferring the reap to the next poll turn
+// means the same blocking arrives one frame later without the 250 ms bound being
+// any smaller in aggregate; and doing it on another thread is ruled out by the
+// no-threads rule (ISC-A-6), which is what makes a single-threaded close-out the
+// only shape available. It is also the ONLY non-trivial block left on the UI path
+// besides the bounded capture deadlines, it fires only when a child has already
+// blown its deadline, and the bound is a constant rather than a function of the
+// host — so the worst case is knowable from here rather than something a user
+// discovers.
 kill_and_reap :: proc(f: ^Fetch) {
 	if f.settled && f.reaped { return }
 	t0 := time.now()

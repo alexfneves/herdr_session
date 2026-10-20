@@ -138,6 +138,17 @@ remote_is_valid :: proc(r: Remote) -> bool {
 // the build installed here, so the field set is deliberately generous: an
 // unrecognised key is simply not read, and the precedence chain below picks the
 // first non-empty candidate for the device string.
+// Raw_Machine is deliberately permissive about which key carries the device, and
+// that tolerance is load-bearing rather than speculative in exactly one
+// direction: herdr's registry shape has changed once already between the 0.8.x
+// and 0.9.x generations this app has to run against, and it was observed as an
+// EMPTY registry on this box — so the non-empty spelling is genuinely not known
+// from direct experience. Keeping the accept-set wide is what stops "we have not
+// seen a non-empty registry" from turning into "a real one gets dropped in
+// silence". What got DROPPED here is the speculative machinery that bought
+// nothing: `Raw_Machine_List` (see `parse_machine_list`, which reads both the
+// bare-array and the `machines`-object shape without a wrapper struct) and the
+// per-entry re-parse of the payload just to count provenance.
 Raw_Machine :: struct {
 	name       : string,
 	label      : string,
@@ -146,14 +157,6 @@ Raw_Machine :: struct {
 	id         : string  `json:"id"`,
 	ssh_target : string `json:"ssh_target"`,
 	target     : string `json:"target"`,
-}
-
-// Raw_Machine_List is deliberately NOT used any more: `parse_machine_list` reads
-// the array shape directly so that a bare array (0.9.5) and a `machines` object
-// both work, which a single struct cannot be made to do. Kept as documentation of
-// the shape that was assumed before 0.9.5 could be observed.
-Raw_Machine_List :: struct {
-	machines : []Raw_Machine,
 }
 
 // Machine_Source says where the remote list came from, which the UI shows and the
@@ -371,6 +374,7 @@ discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery 
 	seen := make(map[string]bool)
 	note := ""
 	regs_skipped := 0
+	n_from_registry := 0
 
 	if available {
 		all := machine_array_of(probe)
@@ -380,6 +384,12 @@ discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery 
 			if seen[key] { continue }
 			seen[key] = true
 			append(&merged, r)
+			// Counted HERE, during the pass that already has the parsed registry.
+			// The previous version re-derived this by calling `registry_has_device`
+			// once per merged entry, and that helper re-parsed the whole payload
+			// every time — O(n²) JSON on a number we could have had for free from
+			// the loop we were already running.
+			n_from_registry += 1
 		}
 		regs_skipped = len(all) - len(regs)
 		note = fmt.tprintf("machine registry: {} of {} entr(y/ies) usable", len(regs), len(all))
@@ -396,12 +406,6 @@ discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery 
 		append(&merged, r)
 	}
 
-	n_from_registry := 0
-	if available {
-		for r in merged {
-			if registry_has_device(probe, r.device) { n_from_registry += 1 }
-		}
-	}
 	n_from_config := len(merged) - n_from_registry
 
 	src := Machine_Source.config_fallback
@@ -420,8 +424,9 @@ discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery 
 }
 
 // registry_has_device answers whether a merged entry came from the registry, by
-// the VERBATIM device string. Linear on purpose: the lists are hand-sized and a
-// map keyed on a derived string is how identity gets lost.
+// the VERBATIM device string. Kept for callers outside discover_resolved; note
+// that it re-parses per call, which is why discover_resolved no longer uses it
+// in a loop (see the counting comment there).
 registry_has_device :: proc(probe: []byte, device: string) -> bool {
 	regs, _ := parse_machine_list(probe)
 	for r in regs {
