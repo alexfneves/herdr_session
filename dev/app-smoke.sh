@@ -26,6 +26,11 @@
 set -uo pipefail
 
 BIN="${BIN:-/tmp/hs}"
+
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# A previous build under this path would otherwise print as current evidence.
+require_fresh_bin "$BIN" src
 OUT="${1:-/tmp/hs-app}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
@@ -268,6 +273,15 @@ fi
 echo
 echo "════════════════════════════════════════════════════════════════════════"
 printf ' PHASE 3 TOTAL: %s PASS / %s FAIL\n' "$PASS_TOTAL" "$FAIL_TOTAL"
+# STALE_BIN is checked explicitly because this suite assigns FAIL_TOTAL=0 in its
+# own setup, after sourcing lib.sh — which erases any counter bump the freshness
+# gate made. Read the flag, not the counter.
+if [ "${STALE_BIN:-0}" != "0" ]; then
+	echo " RESULT: FAIL — the binary under test is STALE, so none of the lines"
+	echo "          above are current evidence. Rebuild and re-run."
+	trap - EXIT
+	exit 1
+fi
 if [ "$FAIL_TOTAL" = "0" ]; then
 	echo " RESULT: PASS"
 else

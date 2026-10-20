@@ -23,7 +23,14 @@
 # package and the whole file can be deleted in one action.
 set -uo pipefail
 
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 BIN="${BIN:-/tmp/hs-local}"
+
+# Refuse to certify a stale binary: a previous build under this path would
+# otherwise print as current evidence (see dev/lib.sh).
+require_fresh_bin "$BIN" src
 OUT="${1:-/tmp/hs-tui}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 
@@ -66,6 +73,14 @@ FAIL_TOTAL=0
 
 # run_scenario NAME [needs_fixture] — one spawn per scenario, so a hang in one
 # cannot hide the others' results.
+#
+# The gate (P2-3): the driver's rc is no longer decoration. Each scenario is
+# classified from its OWN verdict lines:
+#   * no [PASS] and no [FAIL] is a FAILURE — a driver that died with a
+#     traceback used to contribute nothing and "pass";
+#   * a scenario skipped for lack of fixture is recorded as SKIPPED, and a skip
+#     is never folded into the PASS total (see ALLOW_SKIP in dev/lib.sh: it must
+#     be a deliberate, typed decision).
 run_scenario() {
 	local name="$1" need_fixture="${2:-no}" log="$OUT/$1.log"
 	echo
@@ -73,28 +88,20 @@ run_scenario() {
 	echo " scenario: $name"
 	echo "────────────────────────────────────────────────────────────────────────"
 	if [ "$need_fixture" = "fixture" ] && [ -z "${HERDR_SESSION_TEST_REMOTE:-}" ]; then
-		echo "    SKIPPED — HERDR_SESSION_TEST_REMOTE is unset, and this scenario is"
-		echo "    the only proof it covers. Arm the fixture (dev/test-remote.md) to run it."
+		skip "$name" "HERDR_SESSION_TEST_REMOTE is unset, and this scenario is the only proof it covers (dev/test-remote.md)"
 		return
 	fi
 	$PY "$name" > "$log" 2>&1
 	local rc=$?
 	grep -aE '\[(PASS|FAIL)\]|timeline|teardown|footer|    ' "$log" | sed 's/^/    /'
-	local badfmt; badfmt=$(grep -ac '%!' "$log" 2>/dev/null || true)
-	if [ "${badfmt:-0}" != "0" ]; then
-		echo "    [FAIL] printf fallout in the scenario output (%! …) — a wrong format"
-		echo "           string still prints a plausible LINE with wrong NUMBERS, which is"
-		echo "           the worst thing a timing claim can do."
+	assert_formatted "$name" "$log" || true
+	tally "$name (driver rc=$rc)" "$log" || true
+	# A driver that exited non-zero while logging no [FAIL] is still a failure:
+	# that is the traceback-and-empty-log shape the tally alone cannot see.
+	if [ "$rc" != "0" ] && [ "$(classify_log "$log")" = "PASS" ]; then
+		printf '    [FAIL] %s: driver exited %s but logged no [FAIL] — a crash is a failure\n' "$name" "$rc"
 		FAIL_TOTAL=$((FAIL_TOTAL + 1))
-		grep -a '%!' "$log" | head -3 | sed 's/^/      /'
-		return
 	fi
-	local p f
-	p=$(grep -ac '\[PASS\]' "$log" || true)
-	f=$(grep -ac '\[FAIL\]' "$log" || true)
-	PASS_TOTAL=$((PASS_TOTAL + p))
-	FAIL_TOTAL=$((FAIL_TOTAL + f))
-	printf '\n== %s: %s PASS / %s FAIL (driver rc=%s)\n' "$name" "$p" "$f" "$rc"
 }
 
 # The seven states, each with its own Ctrl+C proof.
@@ -103,7 +110,7 @@ run_scenario() {
 # ECHILD in the same process is that proof, which is why these run as in-process
 # cases rather than as screen observations.
 run_guards() {
-	local name
+	local name glog
 	for name in "guard-attach local hs-t-does-not-exist-99" \
 		"guard-attach local default" \
 		"guard-delete local hs-t-never-created-77"; do
@@ -111,15 +118,11 @@ run_guards() {
 		echo "────────────────────────────────────────────────────────────────────────"
 		echo " guard: $name"
 		echo "────────────────────────────────────────────────────────────────────────"
-		$BIN $name > "$OUT/guard-$(echo "$name" | tr ' ' '_').log" 2>&1
+		glog="$OUT/guard-$(echo "$name" | tr ' ' '_').log"
+		$BIN $name > "$glog" 2>&1
 		grep -aE 'ok=|refused|no child|would create|D12|nothing was deleted|ECHILD|spawned' \
-			"$OUT/guard-$(echo "$name" | tr ' ' '_').log" | sed 's/^/    /'
-		local p f
-		p=$(grep -acE '\[PASS\]' "$OUT/guard-$(echo "$name" | tr ' ' '_').log" || true)
-		f=$(grep -acE '\[FAIL\]' "$OUT/guard-$(echo "$name" | tr ' ' '_').log" || true)
-		PASS_TOTAL=$((PASS_TOTAL + p))
-		FAIL_TOTAL=$((FAIL_TOTAL + f))
-		printf '\n== guard %s: %s PASS / %s FAIL\n' "$name" "$p" "$f"
+			"$glog" | sed 's/^/    /'
+		tally "guard $name" "$glog" || true
 	done
 }
 
@@ -142,11 +145,17 @@ run_guards
 
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
-printf ' T5.5 TUI smoke: %s PASS / %s FAIL\n' "$PASS_TOTAL" "$FAIL_TOTAL"
+printf ' T5.5 TUI smoke: %s PASS / %s FAIL / %s SKIP\n' "$PASS_TOTAL" "$FAIL_TOTAL" "$SKIP_TOTAL"
 if [ -n "${HERDR_SESSION_TEST_REMOTE:-}" ]; then
 	echo " fixture: armed (remote=${HERDR_SESSION_TEST_REMOTE} unreachable=${HERDR_SESSION_TEST_UNREACHABLE:-192.0.2.201})"
 else
 	echo " fixture: UNARMED — the remote/dead-host/round-trip proofs above were skipped"
 fi
 echo "════════════════════════════════════════════════════════════════════════════"
-[ "$FAIL_TOTAL" = "0" ]
+# A skipped scenario is NOT a pass, and this suite does not quietly allow it:
+# running it without the fixture exits non-zero with the reason on screen, so
+# "we did not run the remote proofs" can never read as "the remote proofs
+# passed". (dev/test-remote.md's "unset the env and the rest stays green" is a
+# statement about app-smoke's unit layer, not a promise about this suite.)
+# Set ALLOW_SKIP=1 only when you truly mean "I know those did not run".
+smoke_verdict "TUI"

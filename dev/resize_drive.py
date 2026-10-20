@@ -44,6 +44,20 @@ def check(label, ok, detail=""):
     return bool(ok)
 
 
+def skipped(label, why):
+    """A scenario that did not run is recorded as SKIPPED, never as a pass.
+
+    Before this, a skipped scenario `return`ed with an empty ledger, and the
+    wrapper's `if rc == 0 and fail == 0` arithmetic reported it as
+    "PASS selection-shrink (0 checks)". A crash and a skip looked identical.
+    A [SKIP] line is its own verdict: visible in the transcript, counted as
+    neither a pass nor a failure, and gating the suite unless the caller said
+    skips were acceptable."""
+    results.append(("skip", label, why))
+    print("  [SKIP] {}   {}".format(label, why))
+    return True
+
+
 TRACE = "/tmp/hs-resize-trace.txt"
 
 
@@ -308,8 +322,9 @@ def sc_selection_shrink():
     # pick the LAST row with `a` + End-equivalent (many Downs) and shrink hard.
     remote = os.environ.get("HERDR_SESSION_TEST_REMOTE", "")
     if not remote:
-        print("    SKIPPED — needs the fixture (a session list long enough to "
-              "scroll). Arm HERDR_SESSION_TEST_REMOTE (dev/test-remote.md).")
+        skipped("selection-shrink: not run",
+                "needs the fixture (a session list long enough to scroll). "
+                "Arm HERDR_SESSION_TEST_REMOTE (dev/test-remote.md).")
         return
     p, t = boot(rows=16, cols=120, extra_env={
         "HERDR_SESSION_TEST_REMOTE": remote,
@@ -357,6 +372,16 @@ def sc_selection_shrink():
 # ── scenario: EINTR must never be fatal ───────────────────────────────────
 
 def sc_eintr_safe():
+    """The resize storm must not turn into a fatal poll error, AND the loop must
+    still be READING after it.
+
+    The name and the old comment promised more than the old code delivered: the
+    'still answers keys' assertion was `not p.alive() is False`, which is
+    aliveness again — the same fact the check one line above already asserted.
+    A loop that survived the storm but stopped reading input would have passed
+    both. So this now asserts a CAUSAL response: drain the stream to silence,
+    press a key, and require the app to EMIT a repaint because of it. A loop
+    that had stopped reading input would emit nothing at all."""
     p, t = boot()
     try:
         check("app reached the alt screen", t is not None, "")
@@ -369,13 +394,28 @@ def sc_eintr_safe():
         alive = p.alive()
         check("after 40 unthrottled resizes the process is still running",
               alive, p.exit_info())
-        # And it still answers the keyboard afterwards — a loop that survived
-        # but stopped reading input would pass the check above and still be dead.
-        p.send("\x1b[B")
-        time.sleep(0.4)
-        p.read(0.4)
-        check("…and it still answers keys after the storm", not p.alive() is False,
-              "process alive after a Down press: {}".format(p.alive()))
+
+        # ── the input-liveness half ────────────────────────────────────────
+        # Settle first so nothing else can write, take the silence as the
+        # baseline, then press Down. Bytes that arrive after that are the
+        # response to the key; a deaf-but-alive loop would produce zero.
+        time.sleep(0.6)
+        p.read(0.5)
+        quiet_bytes = len(p.raw)
+        p.send("\x1b[B")            # Down: move the selection = 3 bytes
+        time.sleep(0.6)
+        p.read(0.5)
+        responded = len(p.raw) - quiet_bytes
+        check("…and it is still READING keys: Down caused the app to repaint",
+              responded > 0 and alive,
+              "{} byte(s) emitted after the keypress (stream was silent before)".format(
+                  responded))
+        # A pty echo alone could only ever return the 3 bytes of the key. Real
+        # output above that is the app having redrawn the selection bar — which is
+        # the response a deaf-but-alive loop cannot produce.
+        check("…and that output is a repaint, not the tty echoing our own bytes back",
+              responded > 3,
+              "keypress = 3 bytes; the app emitted {}".format(responded))
     finally:
         trace = quit_and_trace(p)
         p.kill()
@@ -408,10 +448,18 @@ def main():
         return 2
     print("-- resize scenario: {}   (BIN={})".format(sys.argv[1], D.BIN))
     SCENARIOS[sys.argv[1]]()
-    bad = [r for r in results if not r[0]]
-    print("-- resize {} -> {} PASS / {} FAIL".format(
-        sys.argv[1], len(results) - len(bad), len(bad)))
-    return 1 if bad else 0
+    bad = [r for r in results if r[0] is False]
+    skips = [r for r in results if r[0] == "skip"]
+    good = [r for r in results if r[0] is True]
+    print("-- resize {} -> {} PASS / {} FAIL / {} SKIP".format(
+        sys.argv[1], len(good), len(bad), len(skips)))
+    if bad:
+        return 1
+    # A scenario whose ONLY result is a skip returns 77 so the wrapper can tell
+    # "skipped, on purpose" from "ran and passed" without grepping.
+    if skips and not good:
+        return 77
+    return 0
 
 
 if __name__ == "__main__":
