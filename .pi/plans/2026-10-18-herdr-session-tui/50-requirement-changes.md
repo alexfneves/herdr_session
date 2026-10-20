@@ -281,3 +281,66 @@ assertions executed = failure* (`core:testing` reports 0 tests as a pass otherwi
 This restructures the very files (`src/*_cases.odin`, `src/*_live.odin`, `dev/*`) that the in-flight
 RCH-3/RCH-4 work is editing. **It must run AFTER that lands** — two agents in those files is a
 guaranteed conflict.
+
+---
+
+# RCH-6 — **ALL** test-related `sh` and `py` replaced by Odin tests  (tightens RCH-5)
+
+**User instruction (2026-10-20):** do the RCH-5 migration **after** the in-flight agent finishes, and
+every `sh`/`py` script related to tests must be **replaced** by Odin tests — not wrapped, not kept as
+"thin bash runners". RCH-5's suggestion of keeping thin bash runners in `dev/` is **withdrawn**.
+
+## Complete replacement inventory
+
+**Must become Odin tests (or be deleted):**
+```
+dev/app-smoke.sh              herdr integration + parallel fetch + discriminator
+dev/state-smoke.sh            state machine
+dev/render-smoke.sh           renderer
+dev/handoff-smoke.sh          terminal handoff
+dev/ui-smoke.sh               UI components
+dev/theme-smoke.sh            config + themes
+dev/tui-smoke.sh              full TUI end-to-end
+dev/resize-smoke.sh           resize coalescing / too-small / EINTR
+dev/lib.sh                    the tally rules  → replaced by core:testing semantics
+dev/tui_drive.py              pty driver       → Odin (posix.openpty + fork/exec)
+dev/resize_drive.py           pty driver       → Odin
+dev/theme_drive.py            pty driver       → Odin
+dev/device_discriminator.py   pty driver       → Odin
+dev/stream_order.py           stream-order     → Odin
+```
+
+**NOT test-related — out of scope, may remain:**
+- `dev/local-build.sh` — build helper, not a test
+- `dev/*.md` (`test-remote.md`, `device-discriminator.md`) — documentation/transcripts, not scripts
+- `nix/*`, `flake.*` — build system
+- `vendor/**` — third-party
+
+## Acceptance gates (grep-verifiable)
+1. `find . -name '*.py' -not -path './vendor/*'` → **nothing**.
+2. `git ls-files 'dev/*.py'` → **nothing**.
+3. No `dev/*-smoke.sh`, no `dev/lib.sh`.
+4. Repo contains **no test-related `sh` or `py` of ours**. Product is **Odin only**.
+5. Tests run through a single Odin entrypoint: `odin test ./tests` (or an equivalent Odin runner).
+6. `nix flake check` runs them — CI finally exists.
+
+## Preserve while migrating
+- **Assertion-count parity per suite** (RCH-5's rule): moving a suite must not reduce its assertion
+  count. Report before/after per suite; a drop is a **regression**, said out loud.
+- **The zero-assertions-is-failure rule.** `core:testing` treats 0 tests run as a pass — add an explicit
+  guard (assert the registered test count is non-zero).
+- **Every current check must still be covered**: the ~1,354 checks that today pass, re-expressed in Odin.
+  Deleting a check because porting it is annoying is the failure mode to avoid.
+- The fixture discipline stays: `HERDR_SESSION_TEST_REMOTE`/`_ALIAS`, TEMP `XDG_CONFIG_HOME`,
+  `hs-t-*` scratch only, live user sessions untouched, teardown traps (as Odin `defer`/cleanup).
+- Product invariants untouched: O11/O12/O13, `--` before the ssh device, `resizefd` in the poll set,
+  0.000% idle CPU, RCH-1 no outer border, all anti-criteria greps clean.
+
+## Execution order (strict)
+1. **Wait for the in-flight RCH-3/RCH-4 agent to land** — it owns the same files. Do not overlap.
+2. Remove the argv test dispatch from `main` so the product binary contains **no test code**.
+3. Create `tests/`, migrate **one suite at a time** to `core:testing`, parity-checked, one commit each.
+4. Port the Python pty drivers to Odin; retire the `.py` files only once their replacement passes.
+5. Delete `dev/lib.sh` and every `*-smoke.sh` last, once nothing references them.
+6. Wire `nix flake check`.
+7. Re-run the whole thing and report the honest new total vs the current ~1,354 baseline.
