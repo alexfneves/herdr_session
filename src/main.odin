@@ -353,6 +353,7 @@ Tui :: struct {
 	fds         : [dynamic]posix.pollfd,
 
 	notice   : string, // last executor line; cleared by the next keypress
+	coalescer : terminal.Coalescer, // T6.5 resize/coalescing accounting
 	dirty    : bool,
 	quitting : bool
 }
@@ -586,28 +587,56 @@ tui_on_resize :: proc() {
 	// Nothing to compute: the next paint re-reads tb_width/tb_height, re-runs
 	// frame_layout, re-clamps the selection and repaints. Doing it here instead
 	// of on the next keypress is what makes a resize visible WITHOUT a key.
+	//
+	// T6.5: the resize is also COUNTED. `terminal.note_resize` increments the
+	// run of resize events that have not yet been laid out, and `tui_paint`
+	// closes that run when it paints. The HS_TUI_TRACE line is then the
+	// coalescing evidence: max_run = N means N border-drag resize events were
+	// absorbed by ONE layout pass.
+	terminal.note_resize(&tui.coalescer)
 	tui.dirty = true
 }
 
 // tui_take_event pulls one termbox event without blocking. Returns false when
 // the queue is empty (the caller then goes to poll), and sets `lost` on a real
 // termbox failure so a dead terminal cannot turn the loop into a spin.
+// tui_take_event pulls one termbox event.
+//
+// The status-vs-type distinction is the trap here, and it is what made a border
+// drag kill the app: `tb_peek_event` returns a TB_* STATUS CODE, not the event
+// kind. TB_OK means "ev is populated"; `ev.typ` says whether it was a key or a
+// resize. Anything else is "no event", and the codes for "no event" are several:
+//
+//   TB_ERR_NO_EVENT  the timeout expired           (expected, benign)
+//   TB_ERR_POLL      select() was interrupted     (EINTR — expected during a
+//                    SIGWINCH storm, benign)
+//   TB_ERR           the input buffer holds nothing extractable. Reached on
+//                    EVERY drain of a resize flood, because wait_event falls
+//                    through to `return rv` with rv left at TB_ERR by the
+//                    empty-buffer extract_event at its top.
+//
+// Treating TB_ERR as terminal loss (what this file used to do) means an
+// ordinary window drag ends the session with "lost the terminal". The codes
+// that DO mean the tty is gone are the read/write ones, and those are kept.
+// TB_ERR_READ in particular is termbox's own "read() failed", not a stall.
 tui_take_event :: proc() -> (got: bool, lost: bool) {
 	ev := termbox2.Event{}
 	rv := termbox2.tb_peek_event(&ev, 0)
-	if rv == termbox2.TB_ERR_NO_EVENT || rv == termbox2.TB_ERR_POLL {
+	if rv == termbox2.TB_OK {
+		if ev.typ == termbox2.EVENT_RESIZE {
+			tui_on_resize()
+		} else if ev.typ == termbox2.EVENT_KEY {
+			tui_on_key(input.from_event(&ev))
+		}
+		return true, false
+	}
+	TUI_LAST_PEEK_RC = rv
+	if rv == termbox2.TB_ERR_NO_EVENT || rv == termbox2.TB_ERR_POLL ||
+		rv == termbox2.TB_ERR || rv == termbox2.TB_ERR_NEED_MORE {
 		return false, false
 	}
-	if rv != termbox2.TB_OK {
-		fmt.eprintf("herdr-session: tb_peek_event -> {}\n", termbox2.tb_strerror(rv))
-		return false, true
-	}
-	if ev.typ == termbox2.EVENT_RESIZE {
-		tui_on_resize()
-	} else if ev.typ == termbox2.EVENT_KEY {
-		tui_on_key(input.from_event(&ev))
-	}
-	return true, false
+	fmt.eprintf("herdr-session: tb_peek_event -> {}\n", termbox2.tb_strerror(rv))
+	return false, true
 }
 
 // tui_service_fetches drains every live child, settles what finished, merges it
@@ -639,10 +668,14 @@ tui_merge :: proc(f: ^app.Fetch) {
 // bytes, or the earliest deadline arrives. `timeout == -1` when nothing is in
 // flight: the process then sleeps until the user does something, which is the
 // difference between an event loop and a spin lock.
-tui_wait :: proc() {
+//
+// Returns false ONLY for a poll failure that is not EINTR. The caller turns that
+// into `tui_lost_terminal()`; returning true there would re-enter a poll set we
+// already know is broken, which is an infinite spin wearing the loop's clothes.
+tui_wait :: proc() -> bool {
 	clear(&tui.fds)
 	ttyfd, rsfd : i32 = -1, -1
-	if termbox2.tb_get_fds(&ttyfd, &rsfd) != termbox2.TB_OK { return }
+	if termbox2.tb_get_fds(&ttyfd, &rsfd) != termbox2.TB_OK { return false }
 	append(&tui.fds, posix.pollfd{fd = posix.FD(ttyfd), events = {.IN}})
 	append(&tui.fds, posix.pollfd{fd = posix.FD(rsfd),  events = {.IN}})
 	app.registry_fds(&tui.reg, &tui.fds)
@@ -674,16 +707,35 @@ tui_wait :: proc() {
 		timeout = ms
 	}
 
-	if len(tui.fds) == 0 { return }
+	if len(tui.fds) == 0 { return true }
 	TUI_POLLS += 1
 	rv := posix.poll(&tui.fds[0], posix.nfds_t(len(tui.fds)), timeout)
 	if rv > 0 {
 		TUI_POLL_HITS += 1
 	} else if rv == 0 {
 		TUI_POLL_IDLES += 1
+	} else if posix.errno() == posix.Errno.EINTR {
+		// A signal arrived. That is a WAKE-UP, not a failure — termbox's SIGWINCH
+		// handler has written the self-pipe and the NEXT turn of the loop reads
+		// it. Erroring here would kill the app on an ordinary window drag; a bare
+		// `continue` with no record would leave "EINTR is handled" as a comment
+		// nobody can check.
+		//
+		// It is deliberately NOT counted in TUI_POLL_ERRS: `errs` in the trace
+		// means "something actually broke", and a resize storm would otherwise
+		// look like a broken app. It lands in the coalescer's own eintr counter
+		// instead, where a test can require that it happened.
+		terminal.note_eintr(&tui.coalescer)
 	} else {
+		// A real poll failure (EBADF, EFAULT, EINVAL…). Do NOT loop on it: the
+		// caller ends the run as a lost terminal rather than re-entering a wait
+		// set already known to be broken.
 		TUI_POLL_ERRS += 1
+		TUI_WAIT_RV = rv
+		TUI_WAIT_BLOCKED = i32(posix.errno())
+		return false
 	}
+	return true
 }
 
 // ── projection helpers ───────────────────────────────────────────────────
@@ -790,6 +842,30 @@ tui_paint :: proc() {
 	if cols != tui.painter.cols || rows != tui.painter.rows {
 		ui.painter_resize(&tui.painter, cols, rows)
 	}
+	terminal.record_size(&tui.coalescer, cols, rows)
+
+	// ── T6.5: the terminal may not be able to hold a session list ─────────
+	//
+	// The gate is evaluated from the CURRENT size on EVERY frame, which is why
+	// recovery needs no extra machinery: enlarge the window and this branch
+	// stops being taken. There is deliberately no "too small mode" stored in
+	// the machine, because a stored mode is a second answer to "how big is the
+	// screen" and the two drift.
+	//
+	// Nothing else runs on this frame. The user's keys still drive the state
+	// machine as usual (the loop is unchanged) — they just cannot see the
+	// result until the terminal is big enough to show it, which is strictly
+	// better than the alternative of painting a truncated table where a name
+	// column of one cell would read as a bug.
+	if terminal.too_small(cols, rows) {
+		terminal.too_small_paint(&tui.coalescer)
+		ui.paint_notice(&tui.painter, cols, rows, &tui.pal,
+			terminal.too_small_message(cols, rows))
+		termbox2.tb_present()
+		tui.dirty = false
+		TUI_FRAMES += 1
+		return
+	}
 	l := ui.frame_layout(cols, rows)
 
 	f := &tui.frame
@@ -817,6 +893,7 @@ tui_paint :: proc() {
 	}
 	ui.frame_close(&tui.painter, f)
 	termbox2.tb_present()
+	terminal.note_paint(&tui.coalescer)
 	tui.dirty = false
 	TUI_FRAMES += 1
 }
@@ -974,7 +1051,7 @@ tui_loop :: proc() {
 		draining := true
 		for draining && !tui.quitting {
 			got, lost := tui_take_event()
-			if lost { tui_lost_terminal() }
+			if lost { tui_lost_terminal("event drain: termbox reported the tty gone") }
 			draining = got
 		}
 		if tui.quitting { break }
@@ -986,8 +1063,9 @@ tui_loop :: proc() {
 	    //    screen is never a frame behind the state.
 		if tui.dirty { tui_paint() }
 
-		// 4. Sleep until something real happens.
-		tui_wait()
+		// 4. Sleep until something real happens. A non-EINTR poll failure means
+		//    the wait set itself is dead, which is the lost-terminal case.
+		if !tui_wait() { tui_lost_terminal("poll/get_fds failed") }
 	}
 }
 
@@ -1008,6 +1086,13 @@ tui_dump_trace :: proc() {
 	os.write_string(f, fmt.tprintf("total={}ms frames={} polls={} hits={} idles={} errs={} remote_fans={} local_ms={} first_paint_ms={}\n",
 		total, TUI_FRAMES, TUI_POLLS, TUI_POLL_HITS, TUI_POLL_IDLES, TUI_POLL_ERRS,
 		TUI_REMOTE_FANS, TUI_LOCAL_MS, TUI_FIRST_PAINT_MS))
+	// T6.5: the resize ledger, on the same line format so the driver can grep
+	// both. `max_run` is the coalescing proof and `too_small_paints` is the
+	// too-small/recovery proof; both are produced by the app's own counters
+	// rather than inferred by the harness from byte counts.
+	os.write_string(f, fmt.tprintf("resize {}\n", terminal.summary(&tui.coalescer)))
+	os.write_string(f, fmt.tprintf("diag last_peek_rc={} wait_rv={} wait_errno={} lost_reason={}\n",
+		TUI_LAST_PEEK_RC, TUI_WAIT_RV, TUI_WAIT_BLOCKED, TUI_LOST_REASON[0:]))
 	for fetch in app.registry_all(&tui.reg) {
 		settled_at := total - i64(time.duration_milliseconds(time.since(fetch.settled_at)))
 		os.write_string(f, fmt.tprintf("fetch {} kind={} pid={} eof_out={} eof_err={} settled={} reaped={} status={} killed={} first_bytes=+{}ms settled_at=+{}ms exit={} out={}B err={}B\n",
@@ -1031,18 +1116,30 @@ first_bytes_at_ms :: proc(f: ^app.Fetch) -> i64 {
 		time.duration_milliseconds(time.since(f.first_bytes_at)))
 }
 
-tui_lost_terminal :: proc() {
+tui_lost_terminal :: proc(reason: string) {
 	// Do not repaint into a screen we may not own, and do not exit 0 as if the
 	// user asked to quit.
 	tui.quitting = true
 	TUI_LOST_TERMINAL = true
+	n := min(len(reason), len(TUI_LOST_REASON))
+	copy(TUI_LOST_REASON[0:n], reason[0:n])
 }
 
 TUI_LOST_TERMINAL : bool = false
+TUI_LAST_PEEK_RC  : i32 = 0
+// Set by tui_wait with the raw tb_get_fds/poll result when the wait was not
+// possible, so `lost the terminal` is never an unexplained verdict.
+TUI_WAIT_BLOCKED  : i32 = 0
+TUI_WAIT_RV       : i32 = 0
+TUI_LOST_REASON   : [64]u8 = 'u'
 TUI_POLLS      : int = 0
 TUI_POLL_HITS  : int = 0
 TUI_POLL_IDLES : int = 0
 TUI_POLL_ERRS  : int = 0
+// TUI_POLL_ERRS counts poll failures that were NOT EINTR. EINTR has its own
+// counter on the coalescer, because a SIGWINCH storm raises EINTR on purpose
+// and must never look like a broken app: `errs > 0` in a trace means a real
+// poll failure happened, which is never expected.
 
 // tui_boot builds the world, paints the local rows, THEN starts the remotes.
 // The order is the requirement: ISC-6 says the first frame already shows the

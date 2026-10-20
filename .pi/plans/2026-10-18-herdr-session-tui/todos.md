@@ -1679,7 +1679,91 @@ Deleting that one file / unset that one env var leaves remote support **intact a
 
 ---
 
-### T6.5 — Resize: coalescing + "too small" state
+### T6.5 — Resize: coalescing + "too small" state  ✅ DONE
+
+> **Implemented.** `src/terminal/resize.odin` (policy + coalescing ledger),
+> `src/ui/frame.odin` (`paint_notice`), `src/main.odin` (gate, ledger, EINTR
+> split), and the evidence driver `dev/resize_drive.py` + `dev/resize-smoke.sh`.
+>
+> | Requirement | Where | Proof |
+> |---|---|---|
+> | resize reaches the screen with **no key input** (ISC-13) | `tui_wait` polls ttyfd **and** `resizefd` from `tb_get_fds()` | `resize-no-key`: 0 bytes written by us, first repaint byte **~50 ms** after the ioctl, dividers repainted at the NEW width |
+> | visible rows recomputed | `frame_layout` re-run each paint from live `tb_width/tb_height` | every scenario; width/height assertions on dividers |
+> | selection preserved across shrink | `sessions_clamp` re-clamps by **identity** | `selection-shrink` |
+> | selection scrolled into view | `keep_visible` inside the same clamp | `selection-shrink` |
+> | column truncation recomputed | `sessions_columns(avail)` per paint | `ui-shrink` + flood final-width checks |
+> | **"too small" under ~40×10** | `terminal.too_small()` gate in `tui_paint` → `ui.paint_notice` (replaces the spine, never joins it) | `too-small` at 9×120, 40×39, 5×20, 2×5: notice drawn, **zero leftover rule rows**, nothing past the last column |
+> | **recovers when enlarged** | the gate is re-evaluated from the CURRENT size every frame — there is no stored "too small mode" to get stuck in | `too-small` RECOVERED: normal UI back, both dividers back |
+> | **coalesce a border-drag flood** | drain-everything-pending, then ONE paint; `terminal.Coalescer` records the run | `flood`: **30 resize events → 1 layout pass** (`max_run=30`, ratio 30.0), and the surviving frame is the FINAL size (no stale frame) |
+> | `TB_ERR_POLL` / `EINTR` → loop, not error | `tui_wait` counts EINTR on the coalescer and keeps going; only a **non-EINTR** poll failure ends the run as lost-terminal | `eintr-safe`: `eintr=1…7 observed`, `errs=0`, process alive and still answering keys afterwards |
+>
+> **Pre-existing bug found while proving this (was live at `da1568e`).**
+> `tb_peek_event` returns plain `TB_ERR` (-1) when its input buffer holds nothing
+> extractable — which happens on **every drain of a resize flood** — and the old
+> code treated any non-`TB_OK` status as "the tty is gone". A window drag
+> therefore killed the app: reproduced at HEAD with `lost the terminal` + exit 1.
+> Fixed by separating "no event" (`TB_ERR`, `TB_ERR_NO_EVENT`, `TB_ERR_POLL`,
+> `TB_ERR_NEED_MORE`) from the codes that genuinely mean the terminal is gone.
+> This is exactly the trap the vendored binding's own comment warns about: **the
+> return value is a status code, not the event type** — `ev.typ` is the type.
+>
+> **Trace ledger** (`HS_TUI_TRACE`, one line per run):
+> `resize resizes=N passes=P max_run=M ratio=R too_small_paints=K eintr=E`
+
+---
+
+### T6.6 — Final anti-criteria sweep + README  ✅ DONE
+
+> **`README.md` created; sweep run end-to-end.** Actual results against this tree:
+>
+> | Anti-criterion | Command | Result |
+> |---|---|---|
+> | ISC-A-1 no `2>&1` before a JSON parse | `grep -rn '2>&1' src/` | **no matches** |
+> | ISC-A-2 no idle-spin sleep in the loop | `grep -rn 'time.sleep' src/` | 4 hits, **0 in `src/main.odin`** (see below) |
+> | ISC-A-3 no hard-coded loopback | `grep -rn 'localhost\|127\.0\.0\.1' src/` | **no matches** |
+> | ISC-A-4 no Kitty keyboard protocol | `grep -rnE '\[>1u\|kitty' src/ nix/` | **no matches** |
+> | ISC-A-5 no TOML parser dependency | `grep -rnE 'toml' src/ nix/` | **no matches** |
+> | ISC-A-7 no copied experiment code | `grep -rn 'tui_experiment' src/` | **no matches** |
+> | ISC-A-8 no alpha-as-identity hack | `grep -rnE 'backgroundColor.*alpha' src/` | **no matches** |
+> | ISC-A-9 no committed prebuilt blobs | `git ls-files \| grep -E '\.(a\|lib\|o)$'` | **no matches** |
+>
+> **The four `time.sleep` hits are shown, not hidden — and are not ISC-A-2
+> violations.** ISC-A-2 forbids an idle-spin sleep in the event loop.
+> `grep -n 'time.sleep' src/main.odin` returns **nothing**: the interactive loop
+> blocks in `poll()` with `timeout = -1` when nothing is in flight. The four hits
+> are bounded, budgeted waits in one-shot helpers:
+>
+> | Site | Waits for | Bound |
+> |---|---|---|
+> | `src/app/model.odin:243` | session-name collision retry | finite candidate loop |
+> | `src/app/herdr.odin:438` | `reap_child` on a child we killed | `if time.since(started) > budget { return -1 }` |
+> | `src/app/fetch.odin:527` | kill + reap of a fetch child | `KILL_REAP_BUDGET` |
+> | `src/app/fetch.odin:666` | drain fallback when no fds registered | capped `wait` duration |
+>
+> Empirical back-up for the same claim: idling the real TUI for 6 s with nothing in
+> flight burns **0 clock ticks = 0.000 % of one core** and emits **0 bytes**.
+>
+> **README contains:** what it is · key-binding tables for **all 7 states** ·
+> the `~/.config/herdr_session.json` schema (`theme` / `remotes` /
+> `cleanup_policy`) with a worked example and the bad-config-is-shown table ·
+> how to add a remote under **verbatim ssh-target semantics** plus the **additive
+> union merge** with herdr 0.9's `machine` registry (registry-empty never
+> swallows the config) · how to change theme (default **`gruvbox-dark`**,
+> **`catppuccin-latte`** selectable, lenient name resolution) · **how to replace
+> `herdr-cycle`** in `~/.config/home-manager/modules/editors/alacritty.nix`,
+> replacing the current
+> `program = "${config.home.homeDirectory}/.local/bin/herdr-cycle";` with
+> `program = "${config.home.homeDirectory}/.local/bin/herdr-session";` · a
+> prominent **`cleanup_policy = "never"` caveat** (sessions are NOT destroyed on
+> detach, unlike `herdr-cycle`'s destroy-on-detach; `default` is never destroyed
+> by any policy) · build/run (`nix build .`, `nix run .`, real TTY required,
+> exit 3 with a clear message otherwise) · how to run every `dev/*-smoke.sh` with
+> the fixture env vars · and that **`dev/test-remote.md` is dev-only and
+> deletable** while the product stays generic.
+
+---
+
+### T6.5 — Resize: coalescing + "too small" state (original spec)
 
 **Create:** `src/terminal/resize.odin` (or fold into T1.2)
 
@@ -1704,7 +1788,7 @@ frame. Then drag the border continuously → no repaint storm, no flicker, selec
 
 ---
 
-### T6.6 — Final anti-criteria sweep + README
+### T6.6 — Final anti-criteria sweep + README (original spec)
 
 **Create:** `README.md`; run the sweep.
 

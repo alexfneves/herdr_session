@@ -383,11 +383,59 @@ painter_resize :: proc(p: ^Painter, cols, rows: i32) {
 	clay.SetLayoutDimensions(clay.Dimensions{width = f32(cols), height = f32(rows)})
 }
 
+// painter_stop releases the Clay arena.
 painter_stop :: proc(p: ^Painter) {
 	if len(p.buf) > 0 {
 		delete(p.buf)
 		p.buf = nil
 	}
+}
+
+// ── THE "TOO SMALL" SCREEN ─────────────────────────────────────────────────
+//
+// paint_notice is the frame drawn when the terminal cannot hold the real UI
+// (T6.5, `terminal.too_small`). Two constraints shape it:
+//
+//  1. It must REPLACE the spine, not join it. `frame_layout` clamps
+//     `main_rows` at 0 for a tiny terminal, and a zero-row MAIN still sits
+//     between the header rule and the footer rule — the rules then land on top
+//     of each other and on top of the message. That is the garbling this path
+//     exists to prevent, so no header/footer/rules are drawn here at all.
+//
+//  2. It must still be drawn BY Clay. "Every cell travels Clay -> render.paint"
+//     is the rule the whole renderer rests on; hand-placing cells to dodge the
+//     layout engine is the anti-pattern this project refused at Phase 2. So the
+//     notice is a real one-child Clay tree, centred, that degrades gracefully
+//     down to a 1x1 terminal.
+//
+// Recovery is automatic for the same reason the notice is cheap: the notice is
+// chosen per frame from the CURRENT terminal size, so when the user enlarges the
+// window the next frame takes the normal path again. There is no "too small
+// mode" to exit, and therefore no way to get stuck in one.
+paint_notice :: proc(p: ^Painter, cols, rows: i32, pal: ^Palette, msg: string) -> render.Stats {
+	colors: ^Palette = pal
+	if colors == nil { colors = &DEFAULT_PALETTE }
+	// Keep the whole message on one line and inside the terminal: at these sizes
+	// wrapping would push the tail off-screen and read as corruption.
+	text := ellipsize(msg, cols)
+
+	clay.BeginLayout()
+	clay._OpenElementWithId(clay.ID("hs.notice.root"))
+	clay.ConfigureOpenElement(clay.ElementDeclaration{
+		layout = clay.LayoutConfig{
+			sizing = clay.Sizing{
+				width  = clay.SizingFixed(f32(cols)),
+				height = clay.SizingFixed(f32(rows)),
+			},
+			layoutDirection = clay.LayoutDirection.TopToBottom,
+			childAlignment = clay.ChildAlignment{x = .Center, y = .Center},
+		},
+		backgroundColor = colors.bg,
+	})
+	clay.Text(text, clay.TextElementConfig{textColor = colors.err_fg})
+	clay._CloseElement()
+	cmds := clay.EndLayout(0)
+	return render.render_frame(&p.rend, cmds)
 }
 
 // ── THE SPINE IS OPEN/CLOSE, NOT A CLOSURE ──────────────────────────────────
