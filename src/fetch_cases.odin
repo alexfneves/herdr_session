@@ -375,7 +375,7 @@ unit_status_mapping :: proc() {
 		"unreachable")
 	eq("255 + 'Permission denied' -> auth",
 		app.device_status_label(app.ssh_failure_status(
-			"nosuchuser@127.0.0.1: Permission denied (publickey,password,keyboard-interactive).")),
+			"nosuchuser@203.0.113.9: Permission denied (publickey,password,keyboard-interactive).")),
 		"auth")
 	eq("255 + 'Too many authentication failures' -> auth",
 		app.device_status_label(app.ssh_failure_status(

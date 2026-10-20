@@ -1584,7 +1584,34 @@ its label-mapping dependent, and the orphan-rule check counting a
 pre-existing session). They are herdr **0.9.5** behaviour drift against
 checks written for 0.8.2, and they fail the same way with and without T6.
 
-### T6.3 — ⭐ The acceptance test the loopback fixture CANNOT satisfy
+### T6.3 — ⭐ The acceptance test the loopback fixture CANNOT satisfy — ✅ DONE
+
+> **STATUS: ✅ DONE (2026-10-20).** `dev/device-discriminator.md` (the labelled
+> manual transcript) + `dev/device_discriminator.py` (the real-TUI driver) +
+> `src/app/exec.odin:attach_target_argv` (the branch the UI actually takes,
+> pulled out as a pure proc so the `--remote` value is assertable without handing
+> a terminal to herdr). **Wired into `app-smoke.sh` as step 5/6: 9 PASS / 0 FAIL.**
+>
+> **One product fix was required to make this test mean anything.** The TUI was
+> reading `HERDR_SESSION_TEST_REMOTE_ALIAS` as a *display label* on the primary
+> remote (`src/main.odin:tui_fixture_remotes`), so the table showed **one** row
+> and the discriminator discriminated nothing — a device-blind model passed the
+> whole fixture. It is now registered as **its own `Remote` with its own verbatim
+> device string**, which is what "two distinct ssh target strings for the same
+> machine" has to mean. The screen now renders three rows for one session:
+>
+> ```
+>   |local        2026-10-20 08:42:00.459 running  2026-10-20-08-42-00-459
+>   |127.0.0.1    2026-10-20 08:42:00.459 running  2026-10-20-08-42-00-459
+>   |localhost    2026-10-20 08:42:00.459 running  2026-10-20-08-42-00-459
+> ```
+>
+> All four checks are green — separate rows by `(device,name)`, per-device
+> filtering in both directions, `--remote → 127.0.0.1` / `--remote → localhost`
+> verbatim, and delete scoping that refuses to borrow the other target's row.
+> **Full transcripts in `dev/device-discriminator.md`.** The stronger variant
+> (two unix users, one device string) is **NOT run and NOT claimed** — it needs a
+> second account and credential this box does not have.
 
 **Create:** `dev/device-discriminator.md` (+ any scripted helpers under `dev/`)
 
@@ -1610,7 +1637,29 @@ the *same* device string (discriminates user scoping).
 
 ---
 
-### T6.4 — Test-fixture isolation: grep-removable in one action
+### T6.4 — Test-fixture isolation: grep-removable in one action — ✅ DONE
+
+> **STATUS: ✅ DONE (2026-10-20).** `dev/test-remote.md`. Verified:
+>
+> ```console
+> $ grep -rn 'localhost\|127\.0\.0\.1' src/
+> $
+> ```
+>
+> **Zero hits** — and the ISC-A-3 anti-criteria grep in `app-smoke.sh` now
+> covers `localhost` as well as the literal loopback address, so this cannot
+> silently regress. Fixture enters through exactly three env vars
+> (`HERDR_SESSION_TEST_REMOTE` / `_ALIAS` / `_TEST_UNREACHABLE`) and nothing
+> else. Removing the fixture is one action, verified both ways: unsetting the
+> env leaves **315 PASS / 0 FAIL** with the fixture-dependent checks skipping
+> themselves, and `nix/package.nix` ships `src/` + `vendor/` only, so deleting
+> `dev/` removes every fixture reference without touching product code.
+>
+> Two scrubs made to get to zero: the TUI comment prose in `src/app/exec.odin`
+> and `src/app_live.odin`, and a captured ssh auth-failure sample in
+> `src/fetch_cases.odin` that named `127.0.0.1` as its host — replaced with
+> RFC 5737 TEST-NET (`203.0.113.9`), because a sample that *classifies* a
+> string has no business naming a reachable host.
 
 **Create:** `dev/test-remote.md` (the ONLY place the fixture may appear)
 

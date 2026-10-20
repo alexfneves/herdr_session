@@ -187,6 +187,28 @@ do_launch :: proc(cmd: Command, home: string) -> Effect {
 // attach — guarded, because attach CREATES
 // -----------------------------------------------------------------------------
 
+// attach_target_argv picks the argv an attach on `device` actually runs, with no
+// process spawned and no config read. It is `do_attach`'s branch pulled out into
+// a pure function for exactly one reason: T6.3 has to prove that the string a
+// given row carries is the string that lands after `--remote` — that we never
+// substitute the label, the hostname, or some other target for the same box.
+// Proving that through `do_attach` would mean actually attaching, which is not a
+// test anyone wants to run unattended.
+//
+//	local            -> herdr session attach <name>
+	//anything else     -> herdr --remote <device> --session <name>
+	//
+	// The asymmetry is herdr's: `--remote` pairs only with the default launch
+	// command, so a remote "attach" is necessarily a create-or-attach — which is
+	// why attach_guard has to have run first and why this proc returns nothing at
+	// all for a name that will not validate.
+attach_target_argv :: proc(device: string, name: string) -> (out: []string, ok: bool) {
+	if is_local_device(device) { return attach_argv(name) }
+	return launch_argv(device, name)
+}
+
+// -----------------------------------------------------------------------------
+
 do_attach :: proc(cmd: Command, rows: []Session, home: string) -> Effect {
 	g := attach_guard(rows, cmd.device, cmd.name)
 	if !g.ok {
@@ -198,22 +220,12 @@ do_attach :: proc(cmd: Command, rows: []Session, home: string) -> Effect {
 	// Local attaches through `herdr session attach` (the named subcommand);
 	// remote goes through `herdr --remote <device> --session <name>`, because
 	// herdr forwards nothing else over --remote (verbatim rule 11). Either way
-	// the device travels verbatim.
-	argv : []string
-	if is_local_device(cmd.device) {
-		a, ok := attach_argv(cmd.name)
-		if !ok {
-			return Effect{kind = .refused,
-				message = fmt.tprintf("refused to attach {}: invalid session name", cmd.name)}
-		}
-		argv = a
-	} else {
-		a, ok := launch_argv(cmd.device, cmd.name)
-		if !ok {
-			return Effect{kind = .refused,
-				message = fmt.tprintf("refused to attach {}: invalid session name", cmd.name)}
-		}
-		argv = a
+	// the device travels verbatim — see `attach_target_argv`, which is where
+	// that choice lives and which T6.3 pins.
+	argv, ok := attach_target_argv(cmd.device, cmd.name)
+	if !ok {
+		return Effect{kind = .refused,
+			message = fmt.tprintf("refused to attach {}: invalid session name", cmd.name)}
 	}
 
 	eff := run_child(argv, home)

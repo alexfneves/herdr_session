@@ -32,9 +32,31 @@ package app
 // command"). The registry can tell us *which* hosts exist; it cannot list them
 // for us.
 //
+// # THE MERGE RULE (RCH-2 / O13) — registry and config are SUMMED, never chosen
+//
+// `machine list --json` on herdr 0.9.5 answers `[]`. That is a *valid* answer,
+// and it is the dangerous one: a gate that reads "registry available, zero
+// machines" and returns the empty set would silently drop every host the user
+// wrote into `herdr_session.json`. Nothing on screen would say so — the device
+// list would just be shorter than the config.
+//
+// So `discover_resolved` never picks a winner. It reads the registry, reads the
+// config, and returns the UNION of the two, de-duplicated on the VERBATIM device
+// string. There is no code path in this file that can produce "registry said X,
+// therefore not-X": the only way a configured remote disappears is if it is
+// literally `local` (which is implicit in the table) or not a valid target at
+// all, and both are reported.
+//
+// The registry answer is also SHAPE-flexible, because we do not own its schema and
+// 0.9.5 proved that: it returns a **bare JSON array** (`[]`), while the shape
+// documented earlier in this project was an object with a `machines` array. Both
+// parse. What still does NOT parse is 0.8.2's plain-text `unknown command: machine`
+// on stdout with exit 0 — a help banner is not a registry, and exit code alone
+// cannot tell them apart. That is why the gate is a shape check.
+//
 // # Config injection is temporary by design
 //
-// `config_remotes` is passed in rather than loaded here. T6.1 replaces the
+// `config_remotes` is passed in rather than loaded here. T6.1 replaced the
 // argument with a real config loader; until then no fixture value is baked into
 // product code, so `HERDR_SESSION_TEST_REMOTE` cannot leak into a shipped binary.
 
@@ -88,18 +110,29 @@ Raw_Machine :: struct {
 	host       : string,
 	alias      : string,
 	id         : string  `json:"id"`,
-	ssh_target : string  `json:"ssh_target"`,
+	ssh_target : string `json:"ssh_target"`,
+	target     : string `json:"target"`,
 }
 
+// Raw_Machine_List is deliberately NOT used any more: `parse_machine_list` reads
+// the array shape directly so that a bare array (0.9.5) and a `machines` object
+// both work, which a single struct cannot be made to do. Kept as documentation of
+// the shape that was assumed before 0.9.5 could be observed.
 Raw_Machine_List :: struct {
 	machines : []Raw_Machine,
 }
 
 // Machine_Source says where the remote list came from, which the UI shows and the
 // evidence logs need in order to prove the gate behaved as designed.
+//
+// It describes the REGISTRY's answer, not the merge: the merged `remotes` always
+// carry the configured hosts too, and `Discovery.from_config` / `from_registry`
+// are the counts that prove it. `.registry` therefore does NOT mean "the config
+// was consulted and discarded" — it never is.
 Machine_Source :: enum {
-	not_probed,        // we have not asked yet
-	registry,        // `machine list` answered with a real registry shape
+	not_probed,      // we have not asked yet
+	registry,        // `machine list` answered with a registry shape
+	merged,          // registry shape AND configured remotes both contributed
 	config_fallback, // no registry (0.8.2), or it answered with the wrong shape
 }
 
@@ -107,6 +140,7 @@ machine_source_label :: proc(s: Machine_Source) -> string {
 	#partial switch s {
 	case .not_probed:      return "not probed"
 	case .registry:        return "herdr machine registry"
+	case .merged:          return "registry + configured remotes"
 	case .config_fallback: return "configured remotes"
 	}
 	return "configured remotes"
@@ -114,12 +148,39 @@ machine_source_label :: proc(s: Machine_Source) -> string {
 
 // machine_registry_available is THE GATE.
 //
-// True only when `payload` parses as a JSON object with a `machines` array. This
+// True when `payload` has a *registry shape*, which is either:
+//
+//   * a bare JSON array            — what herdr 0.9.5 actually returns (`[]`)
+//   * an object with a `machines` array — the shape documented in this project
+//     before 0.9.5 could be observed non-empty
+//
 // deliberately ignores the exit code that produced the payload: the shape is the
 // evidence, so "unknown command: machine" (0.8.2) and a malformed registry
 // response (0.9.x) both read as unavailable, while a well-formed registry reads
-// as available even if some individual entries are unusable.
+// as available even if some individual entries are unusable — or if it is EMPTY.
+//
+// An EMPTY registry reads as available. That is not sloppiness: "no machines
+// registered" is a true answer about the registry, and `discover_resolved` sums
+// it with the config rather than stopping at it. The failure O13 guards against
+// is exactly the version where an empty array is treated as "nothing to do".
 machine_registry_available :: proc(payload: []byte) -> bool {
+	if _, ok := registry_entries(payload); ok { return true }
+	return registry_object_has_machines(payload)
+}
+
+// registry_entries returns the machine array when the payload IS a bare array
+// (0.9.5's shape). Returns ok=false for anything that is not an array, so the
+// caller can fall through to the object shape.
+registry_entries :: proc(payload: []byte) -> (json.Array, bool) {
+	if len(payload) == 0 { return json.Array{}, false }
+	v, err := json.parse_bytes(payload)
+	if err != nil { return json.Array{}, false }
+	arr, is_arr := v.(json.Array)
+	return arr, is_arr
+}
+
+// registry_object_has_machines is the pre-observed shape: {"machines": [...]}
+registry_object_has_machines :: proc(payload: []byte) -> bool {
 	if len(payload) == 0 { return false }
 	v, err := json.parse_bytes(payload)
 	if err != nil { return false }
@@ -131,27 +192,79 @@ machine_registry_available :: proc(payload: []byte) -> bool {
 	return is_arr
 }
 
+// machine_array_of returns whichever array the registry used, in the shape the
+// rest of this file parses. Centralised so a third shape has exactly one place
+// to be added.
+machine_array_of :: proc(payload: []byte) -> json.Array {
+	if arr, ok := registry_entries(payload); ok { return arr }
+	empty := json.Array{}
+	if len(payload) == 0 { return empty }
+	v, err := json.parse_bytes(payload)
+	if err != nil { return empty }
+	obj, is_obj := v.(json.Object)
+	if !is_obj { return empty }
+	mv, has := obj["machines"]
+	if !has { return empty }
+	arr, is_arr := mv.(json.Array)
+	if !is_arr { return empty }
+	return arr
+}
+
 // parse_machine_list turns a registry payload into remotes. Entries with no usable
 // device string are skipped rather than failing the whole list: one bad registry
 // entry must not cost us the other hosts.
+//
+// Reads through `machine_array_of` so both registry shapes (bare array, and the
+// `{machines:[...]}` object) go down the same code path — one place to add a
+// third, and no chance of the two shapes disagreeing about what a machine is.
 parse_machine_list :: proc(payload: []byte) -> (remotes: []Remote, ok: bool) {
-	raw : Raw_Machine_List = {}
-	if err := json.unmarshal(payload, &raw); err != nil {
-		return nil, false
-	}
-	out := make([dynamic]Remote, 0, len(raw.machines))
-	for m in raw.machines {
+	arr := machine_array_of(payload)
+	out := make([dynamic]Remote, 0, len(arr))
+	for item in arr {
+		m, is_obj := item.(json.Object)
+		if !is_obj { continue }
 		// Precedence: the explicit ssh target wins (it is what `--remote` needs),
 		// then host/name/alias. Never synthesised, never rewritten.
-		r := Remote{device = m.ssh_target, label = m.label}
-		if r.device == "" { r.device = m.host }
-		if r.device == "" { r.device = m.name }
-		if r.device == "" { r.device = m.alias }
+		r := Remote{device = json_str(m, "ssh_target"), label = json_str(m, "label")}
+		if r.device == "" { r.device = json_str(m, "target") }
+		if r.device == "" { r.device = json_str(m, "host") }
+		if r.device == "" { r.device = json_str(m, "name") }
+		if r.device == "" { r.device = json_str(m, "alias") }
 		if r.label == "" { r.label = r.device }
+		// A DISABLED machine is not a remote we should reach for. Only an explicit
+		// `"enabled": false` skips it: absent means enabled, so a registry that
+		// does not carry the key at all (the shape this project was written
+		// against) still works.
+		if !json_enabled(m) { continue }
 		if !remote_is_valid(r) { continue }
 		append(&out, r)
 	}
 	return out[:], true
+}
+
+// json_str reads one string field, or "" if it is missing or not a string.
+// Written out because the assert-and-default idiom otherwise repeats eight times.
+json_str :: proc(o: json.Object, key: string) -> string {
+	v, has := o[key]
+	if !has { return "" }
+	s, is_str := v.(json.String)
+	if !is_str { return "" }
+	return string(s)
+}
+
+// json_enabled: absent -> true. Only `false` (or the strings "false"/"0",
+// because a registry that serialises booleans as strings would otherwise have
+// every machine silently dropped and nothing on screen would say why) is off.
+json_enabled :: proc(o: json.Object) -> bool {
+	v, has := o["enabled"]
+	if !has { return true }
+	if b, is_b := v.(json.Boolean); is_b { return bool(b) }
+	if s, is_s := v.(json.String); is_s {
+		low := strings.to_lower(string(s))
+		if low == "false" || low == "0" || low == "off" { return false }
+	}
+	if i, is_i := v.(json.Integer); is_i { return int(i) != 0 }
+	return true
 }
 
 //-----------------------------------------------------------------------------
@@ -159,11 +272,20 @@ parse_machine_list :: proc(payload: []byte) -> (remotes: []Remote, ok: bool) {
 //-----------------------------------------------------------------------------
 
 // Discovery holds the resolved remote set plus how it was obtained.
+//
+// `from_registry` and `from_config` are not decoration. They are the numbers that
+// distinguish "the registry was empty and the config carried the hosts" from
+// "nothing was configured" from "the registry answered and the config added
+// more" — and O13's failure mode (an empty registry swallowing the config) is
+// exactly the thing a caller must be able to see without re-deriving it.
 Discovery :: struct {
 	remotes  : []Remote,      // never includes DEVICE_LOCAL
 	source   : Machine_Source,
-	registry : bool,          // convenience mirror of `source == .registry`
+	registry : bool,          // the registry answered with a real shape
 	note     : string,        // what we saw, for the status line / evidence
+	from_registry : int,      // merged entries that came from the registry
+	from_config   : int,      // merged entries that came from `config_remotes`
+	skipped     : int,        // registry entries dropped (invalid / disabled)
 }
 
 // machine_probe_argv is the feature probe. Run once at startup and cached — not on
@@ -175,15 +297,33 @@ machine_probe_argv :: proc() -> []string {
 	return argv[:]
 }
 
-// discover_resolved is the seam T4.1 calls.
+// discover_resolved is the seam T4.1 calls, and the one place the O13 merge rule
+// lives.
 //
-// `probe` is the raw payload of `machine list --json` (stdout, exit 0 path only —
-// a non-zero exit is passed as an empty payload so it reads as "no registry"),
-// and `config_remotes` is what the user configured.
+// `probe` is the raw payload of `machine list --json` (stdout only — a non-zero
+// exit is passed as an empty payload so it reads as "no registry"), and
+// `config_remotes` is what the user configured.
 //
-// Precedence: registry wins when the shape gate passes; otherwise the configured
-// list is used verbatim. DEVICE_LOCAL is never part of this list — the local group
-// is implicit in the table and adding it here would double it.
+// THE RULE: the result is the UNION, never the choice.
+//
+//   remotes = registry_entries ∪ config_remotes   (deduped on VERBATIM device)
+//
+// Registry entries first, so a registry `label` wins a collision with a bare
+// config target — the registry knows the machine, the config only knows how to
+// dial it. Nothing else about the merge can lose information:
+//
+//   * registry empty (`[]`, today's herdr)   -> the configured remotes stand
+//   * config empty, registry full           -> the registry's hosts stand
+//   * both empty                             -> an empty set, said out loud
+//   * registry unavailable (0.8.2)         -> the configured remotes stand
+//
+// The reason this is a union rather than "registry wins when present": the
+// registry's emptiness is a statement about HERDR's saved-machine list, not about
+// the user's intent. Treating it as authority would drop configured hosts with no
+// message anywhere — the specific silent failure O13 exists to prevent.
+//
+// DEVICE_LOCAL is never part of this list — the local group is implicit in the
+// table and adding it here would double it.
 discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery {
 	valid := make([dynamic]Remote, 0, len(config_remotes) + 1)
 	for r in config_remotes {
@@ -192,33 +332,29 @@ discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery 
 		append(&valid, r)
 	}
 
-	if !machine_registry_available(probe) {
-		return Discovery{
-			remotes = valid[:],
-			source  = .config_fallback,
-			note    = "no machine registry in this herdr — using configured remotes",
-		}
-	}
-
-	regs, ok := parse_machine_list(probe)
-	if !ok || len(regs) == 0 {
-		return Discovery{
-			remotes = valid[:],
-			source  = .config_fallback,
-			note    = "machine registry present but empty — using configured remotes",
-		}
-	}
-
-	// Registry first, then any configured remote it does not already know about,
-	// de-duplicated on the VERBATIM device string (identity rule).
-	merged := make([dynamic]Remote, 0, len(regs) + len(valid))
+	available := machine_registry_available(probe)
+	merged := make([dynamic]Remote, 0, len(valid) + 4)
 	seen := make(map[string]bool)
-	for r in regs {
-		key := strings.to_lower(r.device)
-		if seen[key] { continue }
-		seen[key] = true
-		append(&merged, r)
+	note := ""
+	regs_skipped := 0
+
+	if available {
+		all := machine_array_of(probe)
+		regs, _ := parse_machine_list(probe)
+		for r in regs {
+			key := strings.to_lower(r.device)
+			if seen[key] { continue }
+			seen[key] = true
+			append(&merged, r)
+		}
+		regs_skipped = len(all) - len(regs)
+		note = fmt.tprintf("machine registry: {} of {} entr(y/ies) usable", len(regs), len(all))
+	} else {
+		note = "no machine registry in this herdr — configured remotes only"
 	}
+
+	// The config pass. This runs whether or not the registry answered, and that
+	// single line is the whole of O13.
 	for r in valid {
 		key := strings.to_lower(r.device)
 		if seen[key] { continue }
@@ -226,12 +362,38 @@ discover_resolved :: proc(probe: []byte, config_remotes: []Remote) -> Discovery 
 		append(&merged, r)
 	}
 
-	return Discovery{
-		remotes  = merged[:],
-		source   = .registry,
-		registry = true,
-		note     = fmt.tprintf("machine registry: {} machine(s)", len(regs)),
+	n_from_registry := 0
+	if available {
+		for r in merged {
+			if registry_has_device(probe, r.device) { n_from_registry += 1 }
+		}
 	}
+	n_from_config := len(merged) - n_from_registry
+
+	src := Machine_Source.config_fallback
+	if available && n_from_registry > 0 && n_from_config > 0 { src = .merged }
+	if available && n_from_registry > 0 && n_from_config == 0 { src = .registry }
+
+	return Discovery{
+		remotes       = merged[:],
+		source        = src,
+		registry      = available,
+		note          = note,
+		from_registry = n_from_registry,
+		from_config   = n_from_config,
+		skipped       = regs_skipped,
+	}
+}
+
+// registry_has_device answers whether a merged entry came from the registry, by
+// the VERBATIM device string. Linear on purpose: the lists are hand-sized and a
+// map keyed on a derived string is how identity gets lost.
+registry_has_device :: proc(probe: []byte, device: string) -> bool {
+	regs, _ := parse_machine_list(probe)
+	for r in regs {
+		if r.device == device { return true }
+	}
+	return false
 }
 
 // devices_for_table projects a Discovery into the table's device groups, with the

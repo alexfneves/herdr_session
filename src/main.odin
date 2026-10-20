@@ -408,12 +408,23 @@ tui_config_remotes :: proc() -> []app.Remote {
 // than an assertion). Reading them HERE and nowhere else is what keeps the
 // fixture-host-name grep over src/ empty while the loopback fixture still
 // exercises the real ssh path.
+//
+// HERDR_SESSION_TEST_REMOTE_ALIAS is a SECOND SSH TARGET STRING for the same
+// machine, registered as its own Remote — NOT a display label for the first one.
+// This is T6.3 and it is the reason the variable exists: on this box, local and
+// remote are the same herdr install, so the only way to catch a model that
+// ignores `device` is to reach the identical set of sessions twice, under two
+// different names. Made a label instead, the table would show one row and every
+// device-blind bug would pass the fixture with flying colours.
 tui_fixture_remotes :: proc() -> []app.Remote {
-	out := make([dynamic]app.Remote, 0, 2)
+	out := make([dynamic]app.Remote, 0, 3)
 	target := os.get_env_alloc("HERDR_SESSION_TEST_REMOTE", context.allocator)
 	if target != "" {
-		label := os.get_env_alloc("HERDR_SESSION_TEST_REMOTE_ALIAS", context.allocator)
-		append(&out, app.Remote{device = target, label = label})
+		append(&out, app.Remote{device = target, label = target})
+	}
+	alias := os.get_env_alloc("HERDR_SESSION_TEST_REMOTE_ALIAS", context.allocator)
+	if alias != "" && alias != target {
+		append(&out, app.Remote{device = alias, label = alias})
 	}
 	dead := os.get_env_alloc("HERDR_SESSION_TEST_UNREACHABLE", context.allocator)
 	if dead != "" {

@@ -74,6 +74,7 @@ case_app_unit :: proc() -> bool {
 	unit_identity()
 	unit_parse_list()
 	unit_exit_contract()
+	unit_tty_version_tolerance()
 	unit_machine_gate()
 	unit_cleanup()
 	unit_argv()
@@ -472,6 +473,122 @@ unit_exit_contract :: proc() {
 	eq_i("all 8 exit codes map to distinct meanings", i64(len(seen)), 8)
 }
 
+// unit_tty_version_tolerance — RCH-2 / O12: the no-terminal failure has TWO
+// shapes in the wild and the product must answer BOTH the same way.
+//
+// Both payloads below are captured, byte for byte, from real herdr binaries on
+// this box:
+//
+//   0.8.2  -> exit 101 + a Rust panic that never was JSON
+//   0.9.5  -> exit  1  + one clean human sentence, also not JSON
+//
+// The failure this exists to prevent is a map keyed on the code alone: code 1
+// is BOTH "herdr refused, read the envelope" and (0.9.3+) "there was no
+// terminal". The discriminator is the envelope, so both directions are pinned
+// here — the refusal that must NOT be swallowed, and the refusal that must be.
+unit_tty_version_tolerance :: proc() {
+	say("  — the no-terminal failure across herdr versions (RCH-2 / O12)")
+
+	// ---- 0.8.2: the panic path ------------------------------------------------
+	p82 := app.Capture{
+		code    = 101,
+		spawned = true,
+		err = to_bytes("thread 'main' panicked at src/ui/init.rs:299:11:\nfailed to initialize terminal: IoError(Os { code: 25, kind: Uncategorized, message: \"Inappropriate ioctl for device\" })\nnote: run with `RUST_BACKTRACE=1` for a backtrace\n"),
+	}
+	k82, p_ok82, h82 := app.outcome(&p82)
+	say(fmt.tprintf("    0.8.2 exit 101  -> {}", app.outcome_label(k82)))
+	check("0.8.2: exit 101 is a terminal failure",
+		app.outcome_needs_terminal(k82), app.outcome_label(k82))
+	check("0.8.2: the panic is never parsed as a herdr error envelope",
+		!h82.present && p_ok82 == nil,
+		fmt.tprintf("present={} payload_nil={}", h82.present, p_ok82 == nil))
+
+	// ---- 0.9.5: the clean-message path ---------------------------------------
+	// VERBATIM from `env -u HERDR_ENV herdr --session x < /dev/null` on herdr
+	// 0.9.5 (RCH-2's capture; the whole line is 116 bytes).
+	p95 := app.Capture{
+		code = 1,
+		spawned = true,
+		err = to_bytes("herdr: cannot attach without a usable terminal: Inappropriate ioctl for device (os error 25); run inside a terminal\n"),
+	}
+	k95, p95_payload, h95 := app.outcome(&p95)
+	say(fmt.tprintf("    0.9.5 exit 1    -> {}", app.outcome_label(k95)))
+	check("0.9.5: exit 1 with no envelope and a terminal message is a terminal failure",
+		app.outcome_needs_terminal(k95), app.outcome_label(k95))
+	check("0.9.5: it is NOT mislabelled as the generic herdr error",
+		k95 != .herdr_error, fmt.tprintf("kind={}", app.outcome_label(k95)))
+	check("0.9.5: nothing was parsed as an envelope (there is none)",
+		!h95.present, fmt.tprintf("present={}", h95.present))
+	check("0.9.5: the human sentence IS the payload — safe to show the user",
+		len(p95_payload) > 0 && strings.contains(string(p95_payload), "terminal"),
+		fmt.tprintf("{} bytes, mentions the terminal", len(p95_payload)))
+
+	// ---- THE PAIR: one answer, two codes -------------------------------------
+	check("both herdr generations reach the SAME verdict",
+		app.outcome_needs_terminal(k82) == app.outcome_needs_terminal(k95) &&
+		app.outcome_needs_terminal(k82),
+		fmt.tprintf("101 -> {} · 1 -> {}", app.outcome_label(k82), app.outcome_label(k95)))
+
+	// ---- the negative half: exit 1 must NOT become a terminal refusal ---------
+	// This is the rule that keeps `nested herdr is disabled`, a failed `stop`,
+	// and a rejected session name readable. Each arrives at exit 1 WITH an
+	// envelope; if the marker check ran first, or ran without the envelope check,
+	// every one of those would tell the user to go find a terminal.
+	enveloped := []string{
+		`{"error":{"code":"session_stop_failed","message":"session x is not running"}}`,
+		`{"error":{"code":"invalid_session_name","message":"name may contain only [A-Za-z0-9._-]"}}`,
+	}
+	for body in enveloped {
+		c := app.Capture{code = 1, spawned = true, err = to_bytes(body)}
+		k, _, h := app.outcome(&c)
+		check("exit 1 WITH an envelope stays a herdr error (never 'no terminal')",
+			k == .herdr_error && h.present,
+			fmt.tprintf("kind={} code={}", app.outcome_label(k), h.code))
+	}
+
+	// A nested-herdr refusal is plain text on some builds and mentions nothing
+	// terminal-shaped; still not a tty failure.
+	nested := app.Capture{code = 1, spawned = true,
+		err = to_bytes("error: nested herdr is disabled by default.\nsee configuration if you want to enable it.\n")}
+	kn, _, _ := app.outcome(&nested)
+	check("the nesting refusal is not read as a terminal problem",
+		!app.outcome_needs_terminal(kn), app.outcome_label(kn))
+
+	// Exit 1 with an EMPTY stderr is a herdr error with no detail — not a tty
+	// failure. (The marker check must not fire on nothing.)
+	empty := app.Capture{code = 1, spawned = true}
+	ke, _, _ := app.outcome(&empty)
+	check("exit 1 with no stderr at all is NOT a terminal refusal",
+		ke == .herdr_error, app.outcome_label(ke))
+
+	// A NEW version that invents a third code still has to be answerable. It is:
+	// unknown is not terminal, which means a future code cannot silently inherit
+	// "go find a terminal" — and if herdr changes the WORDS rather than the code,
+	// TTY_REFUSAL_MARKERS is the one list to extend.
+	future := app.Capture{code = 137, spawned = true,
+		err = to_bytes("herdr: something entirely new happened\n")}
+	kf, _, _ := app.outcome(&future)
+	check("an unknown code is never misread as a terminal refusal",
+		kf == .unknown && !app.outcome_needs_terminal(kf), app.outcome_label(kf))
+
+	// The two terminal kinds stay DISTINCT (the panic and the refusal are
+	// different facts and the UI may want different words) while sharing the ONE
+	// predicate every caller actually asks.
+	check("tty_panic and tty_unavailable are distinct kinds but one answer",
+		app.outcome_label(.tty_panic) != app.outcome_label(.tty_unavailable) &&
+		app.outcome_needs_terminal(.tty_panic) && app.outcome_needs_terminal(.tty_unavailable),
+		fmt.tprintf("{} / {}", app.outcome_label(.tty_panic),
+			app.outcome_label(.tty_unavailable)))
+
+	// And neither is a device outage: a host whose herdr cannot find a terminal
+	// is a config fact about the whole app, not "that host is down".
+	check("a terminal failure is still a per-host 'failed', never 'unreachable'",
+		app.device_status_label(app.device_status_of(.tty_unavailable, "")) == "failed" &&
+		app.device_status_label(app.device_status_of(.tty_unavailable, "")) !=
+		app.device_status_label(.unreachable),
+		app.device_status_label(app.device_status_of(.tty_unavailable, "")))
+}
+
 // unit_machine_gate — D1: gate on JSON SHAPE, never on the exit code.
 unit_machine_gate :: proc() {
 	// herdr 0.8.2: no `machine` subcommand at all.
@@ -525,8 +642,8 @@ unit_machine_gate :: proc() {
 		{device = "local", label = "should be dropped from the remote list"},
 	}
 	d := app.discover_resolved(with_machines, cfg)
-	check("registry wins as the source", d.source == .registry,
-		app.machine_source_label(d.source))
+	check("registry + config both contributed -> .merged",
+		d.source == .merged, app.machine_source_label(d.source))
 	check("local is never in the remote list",
 		!contains_device(d.remotes, app.DEVICE_LOCAL), "the local group is implicit")
 	// The dedup key is the VERBATIM device string, so the registry entry and a
@@ -536,19 +653,78 @@ unit_machine_gate :: proc() {
 	   "alice@workbox.example")
 	eq("registry label wins over the config label", d.remotes[0].label, "Work")
 	eq("config-only entries follow the registry", d.remotes[1].device, "cfgbox")
+	eq_int("the merge reports 1 from the registry", d.from_registry, 1)
+	eq_int("the merge reports 2 from the config", d.from_config, 2)
 
 	// Fallback when the gate fails.
 	d2 := app.discover_resolved(eight_o_two, cfg)
-	check("gate fails → config fallback", d2.source == .config_fallback,
+	check("gate fails -> config fallback", d2.source == .config_fallback,
 		app.machine_source_label(d2.source))
 	eq_i("fallback carries the config remotes", i64(len(d2.remotes)), 2)
 	eq("fallback drops local too", d2.remotes[0].device, "cfgbox")
+	eq_int("nothing came from a registry that never answered", d2.from_registry, 0)
 
-	// Registry present but empty → still fall back rather than show no remotes.
+	// Registry present but empty -> the configured remotes still stand. This was
+	// always true; O13 makes it the RULE rather than a fallback, and the counts
+	// below are what distinguish it from "the user configured nothing".
 	empty := to_bytes(`{"machines":[]}`)
 	d3 := app.discover_resolved(empty, cfg)
-	check("empty registry → config fallback", d3.source == .config_fallback,
-		fmt.tprintf("{} / {} remotes", app.machine_source_label(d3.source), len(d3.remotes)))
+	check("empty {machines:[]} registry does NOT suppress the configured remotes",
+		len(d3.remotes) == 2, fmt.tprintf("{} remotes, {} from the registry",
+			len(d3.remotes), d3.from_registry))
+	eq_int("…and the accounting says the registry contributed zero",
+		d3.from_registry, 0)
+	eq_int("…while the config contributed both", d3.from_config, 2)
+	check("…and the gate still KNOWS the registry exists (it is not " +
+		"confused with 0.8.2)", d3.registry, fmt.tprintf("registry={}", d3.registry))
+
+	// ---- O13: the shape herdr 0.9.5 ACTUALLY returns ------------------------
+	// VERBATIM: `herdr machine list --json` on 0.9.5 prints `[]` — a bare array,
+	// not an object. A gate written against the documented `{machines:[…]}` shape
+	// reads that as "no registry", which is survivable; a gate that reads it as
+	// "registry available, zero machines" and RETURNS that empty set silently
+	// drops every host in the user's config. Both halves are pinned here.
+	zero_nine_five := to_bytes("[]\n")
+	check("0.9.5's bare `[]` IS recognised as a registry answer",
+		app.machine_registry_available(zero_nine_five),
+		"bare array, not {machines:[…]} — the gate has to accept both shapes")
+	z := app.discover_resolved(zero_nine_five, cfg)
+	check("O13: machine list == [] + non-empty config -> the config is still there",
+		len(z.remotes) == 2,
+		fmt.tprintf("{} remote(s): {}", len(z.remotes), devices_of_remotes(z.remotes)))
+	eq_int("O13: zero came from the empty registry", z.from_registry, 0)
+	eq_int("O13: two came from the config", z.from_config, 2)
+	check("O13: and they are the CONFIGURED devices, verbatim",
+		z.remotes[0].device == "cfgbox" && z.remotes[1].device == "workbox",
+		devices_of_remotes(z.remotes))
+	check("O13: the gate reports the registry as PRESENT (not the 0.8.2 path)",
+		z.registry, fmt.tprintf("registry={} source={}", z.registry,
+			app.machine_source_label(z.source)))
+
+	// A bare array WITH entries must merge too, not just its empty case — otherwise
+	// "empty works" would be masking "non-empty ignored".
+	bare_full := to_bytes(`[{"label":"Box A","ssh_target":"a@example"},{"label":"Box B","ssh_target":"b@example"}]`)
+	check("bare array WITH entries is a registry", app.machine_registry_available(bare_full),
+		"same shape rule, non-empty")
+	bf := app.discover_resolved(bare_full, cfg)
+	eq_i("both bare-array machines merged", i64(len(bf.remotes)), 4)
+	eq_int("…2 from the registry", bf.from_registry, 2)
+	eq_int("…2 from the config", bf.from_config, 2)
+	eq("…registry first, verbatim", bf.remotes[0].device, "a@example")
+
+	// `enabled: false` is respected; absent means enabled.
+	off := to_bytes(`[{"ssh_target":"off@example","enabled":false},{"ssh_target":"on@example"}]`)
+	offs, _ := app.parse_machine_list(off)
+	eq_i("disabled entries are skipped", i64(len(offs)), 1)
+	eq("…and the enabled one survives verbatim", offs[0].device, "on@example")
+
+	// Nothing configured AND an empty registry: an empty set, said out loud rather
+	// than implied. There must be no state that looks like "we have remotes".
+	none := app.discover_resolved(zero_nine_five, []app.Remote{})
+	eq_i("empty registry + empty config -> empty set", i64(len(none.remotes)), 0)
+	check("…and that is distinguishable from a registry that answered with hosts",
+		none.from_registry == 0 && none.source != .merged,
+		fmt.tprintf("source={}", app.machine_source_label(none.source)))
 
 	// The table's device groups: local implicit + one group per remote.
 	groups := app.devices_for_table(d2)
@@ -557,6 +733,14 @@ unit_machine_gate :: proc() {
 	for g in groups { append(&gparts, g.target) }
 	gstr, _ = strings.join(gparts[:], ",")
 	eq("table groups: local first, then the fallback remotes", gstr, "local,cfgbox,workbox")
+}
+
+// devices_of_remotes renders a remote list for check details, in order.
+devices_of_remotes :: proc(rs: []app.Remote) -> string {
+	parts := make([dynamic]string, 0, len(rs))
+	for r in rs { append(&parts, r.device) }
+	body, _ := strings.join(parts[:], " ")
+	return body
 }
 
 contains_device :: proc(rs: []app.Remote, device: string) -> bool {

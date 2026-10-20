@@ -186,12 +186,34 @@ else
 	tally "fetch-live" "$OUT/fetch-live.log"
 fi
 
+echo
+echo "────────────────────────────────────────────────────────────────────────"
+echo " 5/6  device-discriminator (T6.3) — the same machine, two ssh target strings"
+echo "────────────────────────────────────────────────────────────────────────"
+# The check that a device-blind model cannot pass on a single box. Needs the
+# fixture PAIR; without two distinct target strings there is nothing to
+# discriminate, so this skips rather than silently going green.
+if [ -z "${HERDR_SESSION_TEST_REMOTE:-}" ] || [ -z "${HERDR_SESSION_TEST_REMOTE_ALIAS:-}" ] \
+	|| [ "${HERDR_SESSION_TEST_REMOTE:-}" = "${HERDR_SESSION_TEST_REMOTE_ALIAS:-}" ]; then
+	echo "    SKIPPED — need REMOTE + a DISTINCT _ALIAS (T6.3 discriminates on two"
+	echo "    target strings for one machine; one string proves nothing)."
+else
+	env BIN="$BIN" \
+		HERDR_SESSION_TEST_REMOTE="${HERDR_SESSION_TEST_REMOTE}" \
+		HERDR_SESSION_TEST_REMOTE_ALIAS="${HERDR_SESSION_TEST_REMOTE_ALIAS}" \
+		python3 "$(dirname "$0")/device_discriminator.py" > "$OUT/device-discriminator.log" 2>&1
+	echo "    driver exit code: $?"
+	grep -aE '\[(PASS|FAIL)\]|^      \||^== ' "$OUT/device-discriminator.log" | sed 's/^/    /'
+	assert_formatted "device-discriminator" "$OUT/device-discriminator.log"
+	tally "device-discriminator (T6.3)" "$OUT/device-discriminator.log"
+fi
+
 # ---------------------------------------------------------------------------
-# 5. Anti-criteria greps — the rules that must hold textually, not just at runtime
+# 6. Anti-criteria greps — the rules that must hold textually, not just at runtime
 # ---------------------------------------------------------------------------
 echo
 echo "────────────────────────────────────────────────────────────────────────"
-echo " 5/5  anti-criteria greps over product sources"
+echo " 6/6  anti-criteria greps over product sources"
 echo "────────────────────────────────────────────────────────────────────────"
 SRC_ROOT="$(cd "$(dirname "$0")/../src" && pwd)"
 # Product sources = everything EXCEPT the *_cases / *_live drivers. The drivers
@@ -225,7 +247,7 @@ fi
 
 for d in "${PRODUCT_DIRS[@]}"; do
 	grep_check "no merged streams before a JSON parse (ISC-A-1) — $d" '2>&1' "$d"
-	grep_check "no fixture host names in product code (ISC-A-3) — $d" '127\.0\.0\.1' "$d"
+	grep_check "no fixture host names in product code (ISC-A-3) — $d" '127\.0\.0\.1\|localhost' "$d"
 	grep_check "no threads (ISC-A-6) — $d" 'core:thread' "$d"
 	grep_check "no TOML dependency anywhere (ISC-A-5) — $d" 'toml' "$d"
 	grep_check "no Kitty protocol (ISC-A-4) — $d" 'kitty\|\[>1u' "$d"

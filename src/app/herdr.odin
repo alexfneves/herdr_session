@@ -43,19 +43,48 @@ package app
 //  5. **`default` is never offered** (D12). Filtered in `model.odin`, re-checked
 //     here, and refused by `delete_session` even if a caller builds the request.
 //
-// # Exit-code contract (verified against 0.8.2)
+// # Exit-code contract — VERSION-TOLERANT (RCH-2 / O12)
 //
 //   code  meaning                                     where the message is
 //   ----  ------------------------------------------  -------------------------
 //     0   success                                     stdout (JSON with --json)
 //     1   herdr error (nesting off, stop failed, …)    stderr {"error":{…}}
+//     1*  no usable terminal (herdr >= 0.9.3)          stderr, plain text, NOT JSON
 //     2   CLI syntax / name validation                 stderr + "herdr --help"
-//   101   terminal-init panic (Rust panic)             stderr, NOT JSON
+//   101   no usable terminal (herdr <= 0.8.2)          stderr, NOT JSON (Rust panic)
 //   124   our own timeout fired                      —
 //   127   `herdr: command not found` on a remote       stderr (ssh's)
 //   255   ssh transport / auth failure                stderr (ssh's)
 //
 // 101 is deliberately *not* parsed as JSON, and 124 is one we synthesise.
+//
+// # The `1*` row, and why the map has two doors to the same answer
+//
+// herdr changed how it fails when there is no terminal. Both halves were
+// captured on this box, against the same command (`herdr --session <name>`,
+// stdin from a non-tty):
+//
+//   0.8.2  exit 101  thread 'main' panicked ... failed to initialize terminal
+//   0.9.5  exit 1    herdr: cannot attach without a usable terminal: ...
+//                    ; run inside a terminal
+//
+// A map keyed on the code alone therefore CANNOT be version-independent: code 1
+// is simultaneously "a herdr error with an envelope" (both versions) and "the
+// terminal refusal" (0.9.5 only). What separates them is not the code, it is
+// the shape of stderr:
+//
+//   * envelope present ({"error":{code,message}}) -> a real herdr error. The
+//     nesting refusal, a failed stop, a bad session name: these ALL arrive with
+//     an envelope, and all arrive at exit 1.
+//   * no envelope, but the text says the terminal is the problem -> the app has
+//     no terminal to work with. That is `.tty_unavailable`, not a herdr error,
+//     and it is actionable in a way "herdr error" is not.
+//
+// So `outcome` asks the envelope first and the marker second, and
+// `outcome_needs_terminal` is the single predicate callers use when they want
+// "did this fail because there was no terminal?" — true for 101 and for 1*.
+// Both herdr versions answer it, which is the whole point: the user's herdr is
+// not ours to pin (D: the user owns herdr via home-manager).
 
 import json "core:encoding/json"
 import "core:c"
@@ -418,12 +447,54 @@ Outcome_Kind :: enum {
 	ok,            // exit 0 — parse stdout
 	herdr_error,   // exit 1 — parse stderr for {"error":{code,message}}
 	cli_error,     // exit 2 — argv was wrong: our bug, or a hostile config
-	tty_panic,     // exit 101 — Rust panic, NOT JSON; generic message only
+	tty_panic,     // exit 101 — the pre-0.9 terminal failure (Rust panic, NOT JSON)
+	tty_unavailable, // exit 1 with NO envelope and a terminal-shaped message (0.9.3+)
 	timed_out,     // ours (124)
 	no_herdr,      // 127 — herdr is not installed on that host
 	ssh_failure,   // 255 — transport/auth
 	not_found,     // we could not even spawn it
 	unknown,
+}
+
+// TTY_REFUSAL_MARKERS are the words herdr uses when the terminal, not herdr, is
+// the problem. Matched case-insensitively against stderr, and only after the
+// {"error":…} envelope has been RULED OUT — the envelope is what makes "exit 1,
+// herdr error" mean something else, and a marker-only match would collapse the
+// two. Kept as a list rather than one substring because herdr's wording is not a
+// contract we own and two of these phrases are version-specific:
+//
+//   0.8.2 (exit 101, panic path) "failed to initialize terminal"
+//   0.9.5 (exit 1, clean)        "cannot attach without a usable terminal"
+//                                "; run inside a terminal"
+//
+// Deliberately NOT matched: the word "terminal" alone. `herdr --help` and
+// several real error envelopes contain it, and a false `.tty_unavailable` would
+// tell a user to go find a terminal when their config is what is broken.
+TTY_REFUSAL_MARKERS := []string{
+	"usable terminal",
+	"run inside a terminal",
+	"failed to initialize terminal",
+	"failed to initialize the terminal",
+	"no controlling terminal",
+	"terminal is required",
+}
+
+// stderr_says_no_terminal is the second door of the `1*` rule: shape, not code.
+stderr_says_no_terminal :: proc(err: []byte) -> bool {
+	if len(err) == 0 { return false }
+	lower := strings.to_lower(string(err))
+	for m in TTY_REFUSAL_MARKERS {
+		if strings.contains(lower, strings.to_lower(m)) { return true }
+	}
+	return false
+}
+
+// outcome_needs_terminal is THE version-tolerant answer to "was this a no-tty
+// failure?". Both herdr generations get here — 0.8.2 by panicking at 101,
+// 0.9.5 by exiting 1 with a clean sentence — and callers must not have to know
+// which one the user has installed.
+outcome_needs_terminal :: proc(k: Outcome_Kind) -> bool {
+	return k == .tty_panic || k == .tty_unavailable
 }
 
 // Herdr_Error is the parsed `{"error":{"code","message"}}` envelope. `present`
@@ -472,10 +543,22 @@ outcome :: proc(c: ^Capture) -> (kind: Outcome_Kind, payload: []byte, herr: Herd
 	// Everything below answers from STDERR only.
 	herr = parse_error_envelope(c.err)
 
+	// The `1*` split, in the only order that is not a guess: the envelope first.
+	// Exit 1 WITH an envelope is a herdr error on every version (nesting refused,
+	// stop failed, name rejected). Exit 1 with NO envelope and a terminal-shaped
+	// message is 0.9.3+ saying "I have no terminal" — same meaning as the old
+	// 101 panic, different code.
+	if c.code == 1 && !herr.present && stderr_says_no_terminal(c.err) {
+		return .tty_unavailable, c.err, Herdr_Error{}
+	}
 	if c.code == 1 { return .herdr_error, c.err, herr }
 	if c.code == 2 { return .cli_error, c.err, herr }
-	// A Rust panic is not JSON and its text is internal detail: the caller shows a
-	// generic line instead of echoing a backtrace into the status bar.
+	// The pre-0.9 terminal failure. A Rust panic is not JSON and its text is
+	// internal detail, so the payload is deliberately nil: the caller shows a
+	// generic line instead of echoing a backtrace into the status bar. Note this
+	// branch comes AFTER the envelope check, which is where 0.9.3+'s exit-1
+	// refusal is caught; between them, `outcome_needs_terminal` covers every
+	// herdr generation without the caller choosing a version.
 	if c.code == 101 { return .tty_panic, nil, Herdr_Error{} }
 	if c.code == 127 { return .no_herdr, c.err, herr }
 	if c.code == 255 { return .ssh_failure, c.err, herr }
@@ -488,6 +571,7 @@ outcome_label :: proc(k: Outcome_Kind) -> string {
 	case .herdr_error:  return "herdr error"
 	case .cli_error:    return "bad command line"
 	case .tty_panic:    return "terminal-init panic"
+	case .tty_unavailable: return "no usable terminal"
 	case .timed_out:    return "timed out"
 	case .no_herdr:     return "herdr not installed there"
 	case .ssh_failure:  return "ssh failed"

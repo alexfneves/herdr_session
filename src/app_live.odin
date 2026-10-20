@@ -18,9 +18,11 @@ package main
 
 import app "./app"
 
+import "core:c"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 
 // The one scratch name this driver creates. One is enough: creating more buys no
@@ -30,6 +32,10 @@ SCRATCH :: "hs-t-phase3-probe"
 // SCRATCH_NEVER is a name that must never exist. Used to catch herdr's
 // `delete`-lies and to prove our pre-check refuses it.
 SCRATCH_NEVER :: "hs-t-never-created-zz"
+
+// SCRATCH_PREFIX lives in app_cases.odin ("hs-t-") and is shared by every driver
+// in this package. It is what the dynamic baseline below counts, and what the
+// teardown in dev/app-smoke.sh promises to remove.
 
 // live_remote reads the fixture ssh target from the environment. NEVER hard-coded:
 // the loop-back fixture (T6.4) is a dev/CI affordance, not a product feature.
@@ -304,54 +310,151 @@ list_now :: proc() -> []app.Session {
 	return rows
 }
 
+// scratch_names_now is the DYNAMIC baseline (O12.3): every `hs-t-*` session
+// currently alive, read from herdr rather than recalled from a plan written
+// against a session set that no longer exists.
+//
+// This exists because a hard-coded baseline is worse than no baseline. The old
+// check compared against names from the plan; when the user's sessions changed,
+// a leftover could be absorbed into "before" and never flagged — a drift check
+// that cannot fail is not a check. Counting by prefix, live, has no such hole:
+// nothing named `hs-t-*` is legitimately there, whoever put it there.
+scratch_names_now :: proc() -> [dynamic]string {
+	out := make([dynamic]string, 0, 4)
+	for r in list_now() {
+		if strings.has_prefix(r.name, SCRATCH_PREFIX) { append(&out, r.name) }
+	}
+	return out
+}
+
+// joined is the printable form of a name list, brackets included, so an EMPTY
+// baseline reads as `[]` in the log rather than as nothing at all.
+joined :: proc(names: []string) -> string {
+	parts := make([dynamic]string, 0, len(names))
+	for n in names { append(&parts, fmt.tprintf("'{}'", n)) }
+	body, _ := strings.join(parts[:], ", ")
+	return fmt.tprintf("[{}]", body)
+}
+
+no_children_alive :: proc() -> (int, int) {
+	st: c.int = 0
+	kid := posix.waitpid(-1, &st, {.NOHANG})
+	return int(kid), int(posix.errno())
+}
+
+// prove_no_fork is the evidence half of a guard assertion. A guard that returns
+// false only proves what the function said about itself; `waitpid(-1, WNOHANG)`
+// answering ECHILD in this process proves there is NO child to reap, i.e. the
+// guard did not spawn one on its way out. O11 keeps the guards precisely because
+// they are the thing we own; this is what makes "kept" observable.
+prove_no_fork :: proc(label: string) {
+	kid, errno := no_children_alive()
+	check(fmt.tprintf("{} forked nothing", label),
+		kid == -1 && errno == 10,
+		fmt.tprintf("waitpid(-1,WNOHANG) = {} errno={} (10 = ECHILD)", kid, errno))
+}
+
 // ---------------------------------------------------------------------------
 // The orphan rule (rule 3) — why validation happens BEFORE the spawn
 // ---------------------------------------------------------------------------
 
+// The three things this proc used to assert were properties of herdr 0.8.2. RCH-2
+// moved the ground: 0.9.5 got a clean terminal check and stopped orphaning on an
+// aborted launch. So the assertions moved off the hazard and onto the guard, which
+// is the only one of the two we control.
+//
+//   BEFORE (pinned to 0.8.2)                 AFTER (version-tolerant, O11-O12)
+//   ------------------------                 --------------------------------
+//   exit must be 101                         exit must be 101 OR 1-with-a-clean-
+//                                          message — `outcome_needs_terminal`
+//   the aborted launch must still leave a    the GUARD must refuse an unknown
+//   live session (proving the hazard)        name, and must fork nothing at all
+//   a baseline of known session names        a baseline read live, by prefix
+//
+// "Whether upstream orphans" is not our contract and is not what a red test
+// should be about. "We never hand an unvalidated name to herdr" is, and it is
+// true on 0.8.2, 0.9.5, and whatever comes between them.
 live_orphan_rule :: proc() {
-	// Proof of the hazard: `herdr --session <name>` is CREATE-OR-ATTACH, and the
-	// server spawns BEFORE terminal init. With no tty the UI dies with a Rust
-	// panic (101) — but the session it created stays running. A "validated after
-	// the fact" design would leak live sessions on every typo.
-	// Built by hand ON PURPOSE (not via launch_argv): this probe reproduces the
-	// hazard of an unvalidated launch, so it must bypass the gate it demonstrates.
+	say("  — the orphan rule, asserted on the GUARD not the hazard (O11/O12)")
+
+	// Dynamic baseline: what `hs-t-*` sessions already exist. Nothing named this
+	// way is legitimately here, so a non-empty baseline is itself a finding.
+	baseline := scratch_names_now()
+	say(fmt.tprintf("    dynamic scratch baseline at start: {} (0 is the only sane value)",
+		joined(baseline[:])))
+	check("baseline is read live, not recalled from a plan (O12.3)",
+		len(baseline) == 0,
+		fmt.tprintf("{} pre-existing `hs-t-*` session(s): {}", len(baseline),
+			joined(baseline[:])))
+
+	// ---- the hazard itself, REPORTED and never asserted-on -------------------
+	// Built by hand ON PURPOSE (not via launch_argv): this reproduces the raw
+	// create-or-attach failure so we can see what the installed herdr does, and
+	// nothing else. It is telemetry, not a contract.
 	orphan_argv := make([dynamic]string, 0, 3)
 	append(&orphan_argv, app.HERDR_BIN, "--session")
 	append(&orphan_argv, SCRATCH)
-	created_itself := false
 	c := app.run_capture(orphan_argv[:], 20 * time.Second)
-	say(fmt.tprintf("  `herdr --session {}` with no tty → exit {} (stdout {} B, stderr {} B)",
-		SCRATCH, c.code, len(c.out), len(c.err)))
-	say_raw("    stderr (the Rust panic — note it is NOT JSON)", c.err)
 	kind, _, _ := app.outcome(&c)
-	eq_code("no-tty launch panics with 101", c.code, 101)
-	eq("101 maps to tty_panic (never parsed as JSON)", app.outcome_label(kind), "terminal-init panic")
+	say(fmt.tprintf("    raw `{} --session {}` with no tty -> exit {} · {} · {} B of stderr",
+		app.HERDR_BIN, SCRATCH, c.code, app.outcome_label(kind), len(c.err)))
+	say_raw("      stderr", first_bytes(c.err, 160))
 
-	// The part that matters: despite the failure, the session EXISTS and is running.
-	after := list_now()
-	for r in after {
-		if r.name == SCRATCH {
-			created_itself = true
-			say(fmt.tprintf("    → session {} is present (running={}) even though the UI died",
-				r.name, r.running))
-		}
-	}
-	check("an aborted launch still leaves a live session (the orphan hazard is real)",
-		created_itself, fmt.tprintf("names={}", names_of(after)))
+	// THE version-tolerant half. `outcome_needs_terminal` is true for 101 (the
+	// panic 0.8.2 and 0.9.2-and-earlier produce) and for 1-with-a-clean-message
+	// (0.9.3+). Which one the user has is not our business; that BOTH answer it
+	// is what the test pins.
+	check("a launch with no terminal is recognised as such on EITHER herdr (O12.1)",
+		app.outcome_needs_terminal(kind),
+		fmt.tprintf("exit={} -> {}", c.code, app.outcome_label(kind)))
+	check("…and neither shape leaks a parsed error envelope",
+		kind != .herdr_error || !app.outcome_needs_terminal(kind),
+		fmt.tprintf("kind={}", app.outcome_label(kind)))
 
-	// Which is why our own path validates first and produces no argv at all for a
-	// bad name — already asserted in the unit case, restated here as the rule the
-	// live path must follow.
+	// Whether the aborted launch orphaned a session is now REPORTED, not asserted.
+	// 0.8.2 said yes; 0.9.5 says no. The test does not care, and it must not
+	// start failing the day someone upgrades or downgrades herdr.
+	left_it := contains_name(list_now(), SCRATCH)
+	say(fmt.tprintf("    this herdr's hazard answer: aborted launch left a live session = {}",
+		left_it))
+	say("      (reported only — 0.8.2 true, 0.9.5 false; the GUARD is the contract)")
+	teardown_scratch()
+
+	// ---- the guard: O11 says these stay, so here is what "stays" looks like --
+	// Attaching an unvalidated name is refused before an argv exists. The boolean
+	// is half the proof; ECHILD is the other half.
+	rows := list_now()
+	unknown := "hs-t-not-in-the-model"
+	g := app.attach_guard(rows, app.DEVICE_LOCAL, unknown)
+	prove_no_fork("attach_guard(unknown)")
+	check("attach_guard still refuses an unvalidated name (O11: never attached)",
+		!g.ok, fmt.tprintf("{}", g.reason))
+	check("…and the reason names the consequence, not just the rule",
+		strings.contains(g.reason, "CREATE"), fmt.tprintf("\"{}\"", g.reason))
+
+	dg := app.delete_guard(rows, app.DEVICE_LOCAL, SCRATCH_NEVER)
+	prove_no_fork("delete_guard(never-created)")
+	check("delete_guard still refuses a name it never saw (O11: pre-check kept)",
+		!dg.ok, fmt.tprintf("{}", dg.reason))
+	check("…and says nothing was destroyed where herdr would have said 'deleted'",
+		strings.contains(dg.reason, "nothing was deleted"), fmt.tprintf("\"{}\"", dg.reason))
+
+	// The argv builders refuse too, so even a caller that skipped the guard has
+	// nothing to spawn. Two independent doors, both shut.
 	_, bad_launch := app.launch_argv(app.DEVICE_LOCAL, "bad name")
 	_, bad_attach := app.attach_argv("default")
 	check("our launch/attach produce NO argv for an invalid or default name",
 		!bad_launch && !bad_attach, fmt.tprintf("launch_ok={} attach_ok={}", bad_launch, bad_attach))
-
-	// And a name that is NOT in the model is refused in-app (ISC-17), creating
-	// nothing: we check the model before we would ever hand off.
 	check("attaching an unknown name is refused in-app (ISC-17)",
-		!app.is_known_session(after, app.DEVICE_LOCAL, "hs-t-not-in-the-model"),
+		!app.is_known_session(rows, app.DEVICE_LOCAL, unknown),
 		"the model is the gate, not herdr's answer")
+
+	// And the run leaves nothing behind, whoever created it: the same prefix sweep
+	// that started at zero must end at zero.
+	leftover := scratch_names_now()
+	check(fmt.tprintf("this run leaves no `{}*` session behind, by prefix", SCRATCH_PREFIX),
+		len(leftover) == 0,
+		fmt.tprintf("{} left: {}", len(leftover), joined(leftover[:])))
 }
 
 // ---------------------------------------------------------------------------
@@ -367,26 +470,41 @@ live_machine_gate :: proc() {
 	available := app.machine_registry_available(c.out)
 	say(fmt.tprintf("    installed herdr reports a machine registry: {}", available))
 	check("the gate reads the installed herdr without bricking on it",
-		true, fmt.tprintf("shape={} (0.8.2 → false, 0.9.x → true)", available))
+		true, fmt.tprintf("shape={} (0.8.2 -> false, 0.9.x -> true)", available))
 
-	// Either way, discovery must land somewhere sane.
+	// O13, against the REAL payload rather than a fixture. `[]` is exactly what
+	// 0.9.5 prints on this box, so this is not a hypothetical: the merge below is
+	// the difference between "the configured host is on screen" and "the device
+	// list is quietly one shorter".
 	cfg := []app.Remote{{device = "configured.example", label = "Configured"}}
 	d := app.discover_resolved(c.out, cfg)
-	say(fmt.tprintf("    discovery source: {} ({} remote(s): {})",
-		app.machine_source_label(d.source), len(d.remotes), devices_of(d.remotes)))
-	check("discovery always yields a usable remote set",
-		d.source == .registry || d.source == .config_fallback,
-		app.machine_source_label(d.source))
-	if d.source == .config_fallback {
-		check("fallback carries the configured remote",
-			len(d.remotes) >= 1 && d.remotes[0].device == "configured.example",
-			fmt.tprintf("first={}", d.remotes[0].device))
+	say(fmt.tprintf("    discovery source: {} · from_registry={} from_config={} · {} remote(s): {}",
+		app.machine_source_label(d.source), d.from_registry, d.from_config, len(d.remotes),
+		devices_of(d.remotes)))
+	check("O13: whatever the registry said, the configured remote is present",
+		contains_device(d.remotes, "configured.example"),
+		fmt.tprintf("remotes={} (registry said {} bytes)", devices_of(d.remotes), len(c.out)))
+	check("O13: and nothing in the merge was silently dropped",
+		len(d.remotes) == d.from_registry + d.from_config,
+		fmt.tprintf("{} != {} + {}", len(d.remotes), d.from_registry, d.from_config))
+	if !available {
+		check("0.8.2-shaped: fallback carries the configured remote",
+			d.source == .config_fallback && d.remotes[0].device == "configured.example",
+			app.machine_source_label(d.source))
 	}
 	// The probe's exit code is NOT the gate — assert that explicitly by feeding the
 	// real payload through the shape check regardless of what the code was.
 	check("gate decision is made on shape, independent of the exit code",
 		app.machine_registry_available(c.out) == available,
 		fmt.tprintf("exit={} shape={}", c.code, available))
+	// And the version-specific reading, spelled out for the log: an empty registry
+	// is not "no remotes".
+	if len(app.machine_array_of(c.out)) == 0 {
+		check("O13: an EMPTY registry (this box) still leaves the configured remote",
+			len(d.remotes) >= 1,
+			fmt.tprintf("registry empty, {} remote(s) survive: {}", len(d.remotes),
+				devices_of(d.remotes)))
+	}
 }
 
 devices_of :: proc(rs: []app.Remote) -> string {
@@ -446,6 +564,15 @@ devices_of_remote :: proc(rows: []app.Session) -> string {
 // host suite can never pass
 // ---------------------------------------------------------------------------
 
+// live_device_discriminator is T6.3: the SAME machine reachable by TWO ssh target
+// strings (the fixture's target and its alias, e.g. the two loopback
+// spellings), which must never be collapsed.
+//
+// This is the case a naive identity model dies of. Both targets reach the same
+// socket and therefore the same session names, so any model keyed on `name` — or
+// on "which host does this resolve to" — merges them, and then attach and delete
+// act on whichever target the merge happened to keep. The device string is part
+// of the identity precisely so that a row says what it will dial.
 live_device_discriminator :: proc() {
 	remote := live_remote()
 	alias := fixture_alias()
@@ -479,33 +606,116 @@ live_device_discriminator :: proc() {
 	check_int("identical names stay DISTINCT rows (device is part of the key)",
 		len(combined[:]), len(ra) + len(rb))
 
-	// Deleting one identity leaves the other's identity present.
-	if len(ra) > 0 {
-		name := ra[0].name
-		left := []app.Session{app.Session{device = alias, label = alias, name = name, running = false}}
-		check("an alias-scoped identity survives independently of the primary target",
-			app.is_known_session(left[:], alias, name) &&
-			!app.is_known_session(left[:], remote, name),
-			fmt.tprintf("name={} known-under-alias={} known-under-primary={}",
-				name,
-				app.is_known_session(left[:], alias, name),
-				app.is_known_session(left[:], remote, name)))
+	if len(ra) == 0 {
+		say("  SKIP: no sessions under the fixture target to discriminate")
+		return
 	}
+	name := ra[0].name
 
-	// And the round trip into argv keeps BOTH strings verbatim, in each direction.
-	la, lok := app.launch_argv(remote, "hs-t-verbatim-check")
-	lb, lbok := app.launch_argv(alias, "hs-t-verbatim-check")
-	check("launch argv keeps the primary target verbatim", lok && argv_contains(la, remote),
-		argv_join(la))
-	check("launch argv keeps the alias target verbatim", lbok && argv_contains(lb, alias),
-		argv_join(lb))
-	say(fmt.tprintf("  {} → {}", remote, argv_join(la)))
-	say(fmt.tprintf("  {} → {}", alias, argv_join(lb)))
+	// (a) Device filtering shows BOTH, separately. The names are IDENTICAL (same
+	// machine, same sessions) — so "both lists contain the name" is not the
+	// discriminator. The discriminator is that the two lists are distinct
+	// per-device slices that each hold their OWN copy, and that the combined table
+	// holds two identities rather than one shared row.
+	names_a := app.names_for_device(combined[:], remote)
+	names_b := app.names_for_device(combined[:], alias)
+	each_own_rows := len(names_a) == len(ra) && len(names_b) == len(rb)
+	neither_empty := len(names_a) > 0 && len(names_b) > 0
+	check("the device filter returns each target's own rows, neither empty",
+		each_own_rows && neither_empty,
+		fmt.tprintf("{}={} {}={}", remote, joined(names_a), alias, joined(names_b)))
+	ident_a := count_identity(combined[:], remote, name)
+	ident_b := count_identity(combined[:], alias, name)
+	check("…and filtering by one target NEVER borrows the other's rows",
+		ident_a == 1 && ident_b == 1,
+		fmt.tprintf("two devices, same name -> {} + {} rows for '{}'",
+			ident_a, ident_b, name))
+	check_int("…which is exactly 2 identities, not 1 shared row",
+		ident_a + ident_b, 2)
+
+	// (b) Identity lookup is (device, name) — the SAME name answers differently
+	// depending on which device you ask about. This is the discriminator.
+	both := []app.Session{
+		app.Session{device = remote, label = remote, name = name, running = true},
+		app.Session{device = alias, label = alias, name = name, running = true},
+	}
+	check("the name is known under BOTH devices as two separate identities",
+		app.is_known_session(both[:], remote, name) && app.is_known_session(both[:], alias, name),
+		fmt.tprintf("{}: {} {}: {}", remote, app.is_known_session(both[:], remote, name),
+			alias, app.is_known_session(both[:], alias, name)))
+	check_int("…and looking one up by (device,name) finds exactly one, not two",
+		count_identity(both[:], remote, name), 1)
+
+	// (c) T6.3's headline: an ATTACH aimed at the ALIAS row puts the ALIAS string
+	// after `--remote`, verbatim. Not the primary target, not the label, not the
+	// resolved hostname.
+	argv_b, ok_b := app.attach_target_argv(alias, name)
+	check("attach on the alias row carries the ALIAS verbatim after --remote",
+		ok_b && argv_contains(argv_b, "--remote") && argv_after(argv_b, "--remote") == alias,
+		fmt.tprintf("--remote → {}", argv_after(argv_b, "--remote")))
+	say(fmt.tprintf("      {} row -> {}", alias, argv_join(argv_b)))
+
+	argv_a, ok_a := app.attach_target_argv(remote, name)
+	check("attach on the primary row carries the PRIMARY verbatim",
+		ok_a && argv_after(argv_a, "--remote") == remote,
+		fmt.tprintf("--remote → {}", argv_after(argv_a, "--remote")))
+	say(fmt.tprintf("      {} row -> {}", remote, argv_join(argv_a)))
+	check("…and the two argvs are DIFFERENT strings — the target was not merged away",
+		argv_join(argv_a) != argv_join(argv_b),
+		fmt.tprintf("{} != {}", argv_join(argv_a), argv_join(argv_b)))
+
+	// (d) Deleting one identity leaves the other intact. Model-level: with only
+	// the alias row left, the primary-target identity is gone and vice versa — and
+	// the guards say so independently, so a delete scoped to one can never be
+	// satisfied by the other.
+	only_alias := []app.Session{app.Session{device = alias, label = alias, name = name}}
+	check("delete scoped to the alias is permitted while the primary identity is absent",
+		app.delete_guard(only_alias[:], alias, name).ok &&
+		!app.delete_guard(only_alias[:], remote, name).ok,
+		fmt.tprintf("alias={} primary={}",
+			app.delete_guard(only_alias[:], alias, name).ok,
+			app.delete_guard(only_alias[:], remote, name).ok))
+	// …and the guard that refuses the primary scope never forks (O11: not weakened).
+	prove_no_fork("delete_guard(primary while only alias exists)")
+
+	// (e) And the reverse: with only the primary row left, the alias scope refuses.
+	only_primary := []app.Session{app.Session{device = remote, label = remote, name = name}}
+	check("the mirror case refuses too — neither target can borrow the other's row",
+		app.delete_guard(only_primary[:], remote, name).ok &&
+		!app.delete_guard(only_primary[:], alias, name).ok,
+		fmt.tprintf("primary={} alias={}",
+			app.delete_guard(only_primary[:], remote, name).ok,
+			app.delete_guard(only_primary[:], alias, name).ok))
 }
 
 argv_contains :: proc(argv: []string, needle: string) -> bool {
 	for a in argv { if a == needle { return true } }
 	return false
+}
+
+// argv_after returns the value that follows `flag`, or "" if the flag is absent or
+// last. Used to prove the VALUE of --remote, not merely that the string appears
+// somewhere: a contains-check would also pass on a command
+// that put the target in the wrong slot.
+argv_after :: proc(argv: []string, flag: string) -> string {
+	for v, idx in argv {
+		if v == flag && idx + 1 < len(argv) { return argv[idx+1] }
+	}
+	return ""
+}
+
+contains_string :: proc(vs: []string, want: string) -> bool {
+	for v in vs { if v == want { return true } }
+	return false
+}
+
+// count_identity counts rows matching the FULL identity (device, name). A model
+// that collapsed the two targets would return 2 here for one name; the
+// discriminator must return exactly 1 per device.
+count_identity :: proc(rows: []app.Session, device, name: string) -> int {
+	n := 0
+	for r in rows { if r.device == device && r.name == name { n += 1 } }
+	return n
 }
 
 argv_join :: proc(argv: []string) -> string {

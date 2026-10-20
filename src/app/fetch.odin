@@ -434,6 +434,10 @@ device_status_of :: proc(kind: Outcome_Kind, err_text: string) -> Device_Status 
 	case .herdr_error:  return .failed
 	case .cli_error:    return .failed
 	case .tty_panic:    return .failed
+	// Same verdict as the panic, for the same reason: the fetch itself is fine,
+	// the *child* could not run. It is not a host outage and must not be
+	// reported as one — but it is not a success either.
+	case .tty_unavailable: return .failed
 	case .not_found:    return .failed
 	}
 	return .failed
