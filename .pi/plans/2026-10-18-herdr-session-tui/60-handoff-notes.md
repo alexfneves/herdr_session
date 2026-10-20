@@ -166,3 +166,36 @@ All of these were paid for during T6.1/T6.2 on **odin dev-2026-09**, against the
 - **The picker's `Enter` on `sel == -1` is a no-op by design**, so a filter
   that hides the currently-applied theme leaves nothing to apply. Drive Down
   then Enter when testing "apply the other one".
+
+## Traps hit during RCH-3 / RCH-4 (2026-10-20)
+
+- **Do not conclude "environment is broken" without re-running the BASELINE
+  binary in the same fixture.** An earlier pass of this work decided the four
+  `roundtrip` failures were a pre-existing pty/herdr breakage and moved on.
+  That was wrong: re-running the *same* scenario against the pre-RCH-3 binary
+  in the *same* fixture passed 17/0. The handoff was fine all along — what was
+  failing were stale assertions about the old `cleanup_policy=never` default.
+  A wrong "env blocker" conclusion is worse than a red suite, because it
+  launders a real failure into an accepted one. Re-run the baseline before
+  attributing, and record the comparison.
+- **`XDG_CONFIG_HOME` moves *herdr's own state dir*, not just our config file.**
+  Running the live suites under a temp `XDG_CONFIG_HOME` makes herdr report an
+  empty session list, which surfaces as `added=0` / `names=` / "host session
+  missing" — not a product bug, a relocated filesystem. Isolating *our* config
+  is still mandatory; do it with the per-test config paths the suites already
+  pass to `config_parse_json`/`config_save_*`, and run the **live** suites
+  against the real herdr home so the host session is genuinely visible.
+  Fingerprint the real `~/.config/herdr_session.json` before and after either way.
+- **RCH-3/RCH-4 supersedes the older picker note above** that says a filter
+  hiding the applied theme leaves nothing to apply. With `clamp_selection` the
+  highlight falls back to the first *visible* row and `held` is re-derived from
+  it, so `Enter` now applies that row. Do not re-add the "must press Down
+  first" workaround.
+- **A whole-screen single-character scan is not a leak check.** Asserting "no
+  typed character appears anywhere on screen" is vacuous-to-false in both
+  directions: `p` is in `pending`, `m` is in `mode_selection`. Check the
+  surface the leak would actually land on (the filter line) plus the effect
+  (row count unchanged).
+- **Odin cannot parse an inline composite literal as a `for … in` expression**:
+  `for s in []State{.a, .b} {` is a syntax error. Bind the slice to a name
+  first. Two separate encounters in one file; both were the same cause.
