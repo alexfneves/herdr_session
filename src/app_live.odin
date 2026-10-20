@@ -409,9 +409,17 @@ live_orphan_rule :: proc() {
 	check("a launch with no terminal is recognised as such on EITHER herdr (O12.1)",
 		app.outcome_needs_terminal(kind),
 		fmt.tprintf("exit={} -> {}", c.code, app.outcome_label(kind)))
-	check("…and neither shape leaks a parsed error envelope",
-		kind != .herdr_error || !app.outcome_needs_terminal(kind),
-		fmt.tprintf("kind={}", app.outcome_label(kind)))
+	// Was, before this was fixed: `kind != .herdr_error || !outcome_needs_terminal(kind)`
+	// — a TAUTOLOGY. `outcome_needs_terminal(.herdr_error)` is false by
+	// definition (it only covers .tty_panic / .tty_unavailable), so the second
+	// operand was true whenever the first was false, and the check could never
+	// fail. It is now the assertion the label always claimed: a no-terminal launch
+	// must be a TTY verdict, never a parsed herdr error. If the envelope parser
+	// ever became eager enough to grab panic text, THIS fails.
+	check("…and the no-terminal verdict is a TTY shape, never a parsed herdr error",
+		kind != .herdr_error && (kind == .tty_panic || kind == .tty_unavailable),
+		fmt.tprintf("kind={} (must be .tty_panic or .tty_unavailable)",
+			app.outcome_label(kind)))
 
 	// Whether the aborted launch orphaned a session is now REPORTED, not asserted.
 	// 0.8.2 said yes; 0.9.5 says no. The test does not care, and it must not
@@ -471,8 +479,18 @@ live_machine_gate :: proc() {
 
 	available := app.machine_registry_available(c.out)
 	say(fmt.tprintf("    installed herdr reports a machine registry: {}", available))
-	check("the gate reads the installed herdr without bricking on it",
-		true, fmt.tprintf("shape={} (0.8.2 -> false, 0.9.x -> true)", available))
+	// The old form was `check(..., true, ...)` — a literal `true`, a check that
+	// cannot fail and reads like coverage that does not exist. The falsifiable
+	// version pins two things the gate can actually get wrong on the REAL payload:
+	// the probe really ran, and the gate's answer agrees with the payload's own
+	// first structural character — computed here, independently of the gate.
+	says_registry := registry_says_registry(c.out)
+	check("the machine probe spawned a child that answered (not a silent no-op)",
+		c.spawned && len(c.out) > 0,
+		fmt.tprintf("spawned={} stdout={} bytes", c.spawned, len(c.out)))
+	check("the gate's answer agrees with the payload's shape (gate never invents one)",
+		available == says_registry,
+		fmt.tprintf("gate said {}; the payload starts as {}", available, says_registry))
 
 	// O13, against the REAL payload rather than a fixture. `[]` is exactly what
 	// 0.9.5 prints on this box, so this is not a hypothetical: the merge below is
@@ -514,6 +532,26 @@ devices_of :: proc(rs: []app.Remote) -> string {
 	for r in rs { append(&parts, r.device) }
 	joined, _ := strings.join(parts[:], " ")
 	return joined
+}
+
+// registry_says_registry answers the same question as the product's gate, but
+// from the RAW BYTES alone — first non-whitespace character, and whether the
+// payload mentions `machines` at all. It deliberately does NOT call
+// `machine_registry_available`, because a check that re-calls the function under
+// test can never fail. Two independent paths to the same answer is the only
+// version of "it read the payload correctly" that is worth printing.
+registry_says_registry :: proc(payload: []byte) -> bool {
+	if len(payload) == 0 { return false }
+	first: byte = 0
+	for b in payload {
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' { continue }
+		first = b
+		break
+	}
+	if first == '[' { return true }
+	if first != '{' { return false }
+	text := string(payload)
+	return strings.contains(text, "\"machines\"") || strings.contains(text, "machines")
 }
 
 // ---------------------------------------------------------------------------

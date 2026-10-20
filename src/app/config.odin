@@ -476,11 +476,14 @@ write_doc :: proc(path: string, obj: json.Object) -> (bool, string) {
 	if werr := os.write_entire_file_from_string(tmp, string(bytes)); werr != nil {
 		return false, fmt.tprintf("cannot write %s: %v", tmp, os.error_string(werr))
 	}
-	if os.is_file(path) {
-		if rm := os.remove(path); rm != nil {
-			return false, fmt.tprintf("cannot replace %s: %v", path, os.error_string(rm))
-		}
-	}
+	// NO `remove(path)` here. The previous version deleted the live file and then
+	// renamed the temp into place, which is precisely the window this function was
+	// written to close: a crash (or a full disk on the rename) between the two
+	// leaves NO config at all, and the next boot reports "no config file" rather
+	// than the user's real settings. POSIX `rename` replaces the destination
+	// atomically within a filesystem — unlinking it first buys nothing and costs
+	// the guarantee. If the rename fails, the old file is still there, which is
+	// the whole point.
 	if rerr := os.rename(tmp, path); rerr != nil {
 		return false, fmt.tprintf("cannot move %s into place: %v", tmp, os.error_string(rerr))
 	}

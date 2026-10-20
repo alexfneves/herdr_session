@@ -155,6 +155,8 @@ sorted_rows :: proc(rows: []app.Session) -> []app.Session {
 	return out
 }
 
+NARROW_WIDTHS : []i32 = {120, 100, 80, 60, 40, 30, 20, 10}
+
 UI_KEYS : []ui.Key_Hint = {
 	ui.Key_Hint{"enter", "new"},
 	ui.Key_Hint{"r", "remote"},
@@ -483,6 +485,87 @@ case_ui_frame :: proc() -> bool {
 	}
 	check("footer lists every usable key with its action", seen == len(UI_KEYS),
 		fmt.tprintf("{}/{} hints visible", seen, len(UI_KEYS)))
+
+	// 7b. RETENTION AT NARROW WIDTHS (P3-12). The requirement is that the footer
+	// shows every USABLE key; at 80–120 columns a mode with 8 hints cannot show
+	// all of them. What must never happen is the truncation cutting the "how do I
+	// get out" hints while keeping the "what can I start" hints — a footer that
+	// says `enter new local session` and not `esc quit` is a trap. These run
+	// against keys_line directly (no terminal needed) at the widths a real user
+	// has, and they fail if the escape hatch is the thing that got cut.
+	// 7b. RETENTION AT NARROW WIDTHS (P3-12), using the REAL mode-selection
+	// footer rather than a toy list, because that is the footer the requirement is
+	// about. KEYS_MODE is 8 hints / ~102 columns, so at 80 or 100 columns the
+	// truncation policy is exercised for real. What must never happen is the cut
+	// taking the "how do I get out" hints while keeping the "what can I start"
+	// ones: a footer that says `enter new local session` and not `esc quit` is a
+	// trap. These checks fail if that happens.
+	// Real mode-selection footer: 8 hints, ~102 columns, so 80/100 forces a cut.
+	for w in NARROW_WIDTHS {
+		ks := KEYS_MODE[:]
+		line := ui.keys_line(ks, w)
+		last := ks[len(ks)-1]
+		check(fmt.tprintf("KEYS_MODE at {} cols still shows the exit hint `{} {}`", w, last.key, last.action),
+			str_contains_ignore_case(line, last.key) && str_contains_ignore_case(line, last.action),
+			fmt.tprintf("footer = '{}'", line))
+		// `t theme` must survive whenever the width could physically hold it next
+		// to the exit hint. Below that it is arithmetic, not policy, so it is not
+		// asserted — the point of the check is that theme and quit are the LAST
+		// things to go, not that they fit in ten columns.
+		theme_w := ui.text_cols("t theme")
+		quit_w := ui.text_cols("esc quit")
+		if w >= theme_w + 2 + quit_w {
+			check(fmt.tprintf("KEYS_MODE at {} cols still shows `t theme`", w),
+				str_contains_ignore_case(line, "theme"),
+				fmt.tprintf("need={} got='{}'", theme_w + 2 + quit_w, line))
+		}
+		check(fmt.tprintf("KEYS_MODE at {} cols never overflows", w),
+			ui.text_cols(line) <= w, fmt.tprintf("cols={} line='{}'", ui.text_cols(line), line))
+		parts, _ := strings.split(line, "  ")
+		partial := 0
+		for p in parts {
+			if p == "" || p == "…" { continue }
+			if !strings.contains(p, " ") { partial += 1 }
+		}
+		check(fmt.tprintf("KEYS_MODE at {} cols cuts no hint in half", w),
+			partial == 0, fmt.tprintf("partial={} line='{}'", partial, line))
+		check(fmt.tprintf("KEYS_MODE at {} cols is not blank", w), line != "", "footer = ''")
+	}
+	for w in NARROW_WIDTHS {
+		line := ui.keys_line(UI_KEYS, w)
+		last := UI_KEYS[len(UI_KEYS)-1]
+		check(fmt.tprintf("UI_KEYS at {} cols still shows the exit hint `{} {}`", w, last.key, last.action),
+			str_contains_ignore_case(line, last.key) && str_contains_ignore_case(line, last.action),
+			fmt.tprintf("footer = '{}'", line))
+
+		// The second-to-last hint (`t theme`) must be there whenever the width
+		// could physically hold it next to the exit hint. Below that it is a
+		// layout impossibility, not a policy failure, so it is not asserted.
+		two := UI_KEYS[len(UI_KEYS)-2]
+		need := ui.text_cols(fmt.tprintf("{} {}", two.key, two.action)) + 2 +
+			ui.text_cols(fmt.tprintf("{} {}", last.key, last.action))
+		if w >= need {
+			check(fmt.tprintf("UI_KEYS at {} cols also shows `{} {}`", w, two.key, two.action),
+				str_contains_ignore_case(line, two.key) && str_contains_ignore_case(line, two.action),
+				fmt.tprintf("need={} got='{}'", need, line))
+		}
+
+		check(fmt.tprintf("UI_KEYS at {} cols never overflows the width", w),
+			ui.text_cols(line) <= w, fmt.tprintf("cols={} line='{}'", ui.text_cols(line), line))
+		// Never half a hint: every visible hint must carry BOTH its key and its
+		// action, so a cut can never leave a key that does nothing.
+		parts, _ := strings.split(line, "  ")
+		partial := 0
+		for p in parts {
+			if p == "" || p == "…" { continue }
+			if !strings.contains(p, " ") { partial += 1 }
+		}
+		check(fmt.tprintf("UI_KEYS at {} cols cuts no hint in half", w),
+			partial == 0, fmt.tprintf("partial pieces={} line='{}'", partial, line))
+		// And the line is never empty while hints exist.
+		check(fmt.tprintf("UI_KEYS at {} cols is not blank", w), line != "",
+			fmt.tprintf("footer = ''"))
+	}
 
 	// 8. PREDICTED GEOMETRY == CLAY'S GEOMETRY. The view computes its cell box
 	//    before EndLayout; this proves the prediction matches Clay's own record,

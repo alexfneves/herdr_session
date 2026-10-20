@@ -516,6 +516,44 @@ case_config_save :: proc() -> bool {
 		strings.contains(body_e, "alpha.example"),
 		fmt.tprintf("ok={} err='{}'\n{}", ok4, e4, body_e))
 
+	// ATOMICITY (P3-11). The previous implementation unlinked `path` before
+	// renaming the temp into place, which opened exactly the window this function
+	// exists to prevent: a crash between the unlink and the rename leaves NO config
+	// at all. POSIX `rename` replaces the destination atomically, so the remove is
+	// not just unnecessary, it is the bug.
+	//
+	// HONEST SCOPE OF THIS CHECK. The crash window itself cannot be reproduced in a
+	// single-process test without a fault-injection hook into write_doc, so what is
+	// asserted here is the surrounding rename semantics:
+	//   * a replace produces a NEW inode (so it is a rename, not an in-place
+	//     truncate — a truncate is visible to a concurrent reader as a short file),
+	//   * the temp never survives the call (a leftover .tmp would mean the rename
+	//     did not happen and we returned success anyway),
+	//   * and the file is present the instant the save returns, with no retry.
+	// What is NOT machine-proven here is "a SIGKILL in the middle leaves the old
+	// file"; that rests on the rename syscall's guarantee, which is exactly why the
+	// code now uses the rename alone and nothing else.
+	before := app_config_inode(path)
+	ok_at, err_at := app.config_save_theme(path, "gruvbox-dark")
+	after := app_config_inode(path)
+	check("a save over an existing config succeeds", ok_at, fmt.tprintf("err='{}'", err_at))
+	check("…the replaced file is a NEW inode (rename, not truncate-in-place)",
+		before != 0 && after != 0 && before != after,
+		fmt.tprintf("before={} after={}", before, after))
+	check("…and no .tmp file was left behind", !file_exists(fmt.tprintf("{}.tmp", path)),
+		"a leftover tmp means the rename did not happen")
+	check("…the config is on disk immediately after the save returns",
+		file_exists(path), fmt.tprintf("path={}", path))
+	// And the write path contains no unlink of the live file — the structural half
+	// of the fix, checked structurally because the temporal half is not testable.
+	wd := read_source_file("src/app/config.odin")
+	in_wd := between(wd, "write_doc :: proc", "\n// path_dir")
+	check("…and write_doc never unlinks the live config",
+		!strings.contains(in_wd, "os.remove(path)") && strings.contains(in_wd, "os.rename(tmp, path)"),
+		fmt.tprintf("write_doc body mentions remove={} rename={}",
+			strings.contains(in_wd, "os.remove(path)"),
+			strings.contains(in_wd, "os.rename(tmp, path)")))
+
 	// E: an unparseable file cannot be preserved, and the code says so by
 	//    keeping the app usable rather than refusing to start.
 	if werr2 := os.write_entire_file_from_string(path, "{ broken {{{"); werr2 != nil {
@@ -739,4 +777,44 @@ case_colour_wire :: proc() -> bool {
 	check("selection bar bg and selection text differ in every theme", bar_same == 0,
 		fmt.tprintf("{} theme(s) with an invisible selection label", bar_same))
 	return !any_failed
+}
+
+// app_config_inode / file_exists — the stat probes the atomicity check needs.
+// The inode number is the only way to tell "renamed a new file into place" from
+// "truncated the old one", and the difference is the whole guarantee: a truncate
+// is visible to a concurrent reader as a zero-length file, a rename never is.
+app_config_inode :: proc(path: string) -> u128 {
+	fi, err := os.stat(path, context.allocator)
+	if err != nil { return 0 }
+	return fi.inode
+}
+
+file_exists :: proc(path: string) -> bool {
+	fi, err := os.stat(path, context.allocator)
+	if err != nil { return false }
+	return fi.type != .Undetermined || fi.size >= 0
+}
+
+// read_source_file / between — a structural check over the project's own source.
+// This is not a substitute for a behavioural test; it is used only where the
+// property is temporal (a crash window) and therefore not reproducible in-process,
+// so the guard is "the dangerous call is not in the function at all".
+SRC_SEARCH : []string = {"", "../", "../../"}
+
+read_source_file :: proc(rel: string) -> string {
+	for dir in SRC_SEARCH {
+		p := fmt.tprintf("{}{}", dir, rel)
+		if b, ok := os.read_entire_file(p, context.allocator); ok == nil && b != nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+
+between :: proc(s: string, start, end: string) -> string {
+	i := strings.index(s, start)
+	if i < 0 { return "" }
+	j := strings.index(s[i:], end)
+	if j < 0 { return s[i:] }
+	return s[i : i+j]
 }

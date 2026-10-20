@@ -368,7 +368,17 @@ Tui :: struct {
 	// exactly when it matters, because the frame that shows a big age is the
 	// frame the user is reading after not touching the app for that long.
 	list_at   : time.Time,
-	list_seen : bool
+	list_seen : bool,
+
+	// Where the remote list CAME FROM, carried out of boot-time discovery so the
+	// footer can say it. This is the seam the README's "the footer reports where
+	// the list came from" claim needs to be true: without it, a user looking at an
+	// unexpected set of hosts cannot tell whether herdr's machine registry
+	// answered, whether only their config did, or whether the registry is absent
+	// because they are on herdr 0.8.x. Discovery was computed at boot and then
+	// thrown away; the label now outlives it.
+	disc_source : app.Machine_Source,
+	disc_note   : string,
 }
 
 tui : Tui
@@ -919,6 +929,12 @@ host_status_word :: proc(s: app.Device_Status) -> string {
 // `string(buf[:])` out of a scope that `defer delete(buf)`s the buffer hands the
 // caller a string pointing at freed memory, and the footer then renders exactly
 // that — garbage where "local ok 3" should be.
+//
+// A NON-ok host also carries its `detail` — the WHY. That field used to be
+// written by every settle path and rendered nowhere, so "down" was all the user
+// ever got, and "down" does not distinguish "no route", "herdr is not installed
+// there" and "your key was refused", which are three different fixes. One line,
+// ellipsised: the footer has one row and cannot hold an ssh trace.
 tui_host_line :: proc() -> string {
 	out := ""
 	for d in tui.table.devices {
@@ -929,6 +945,9 @@ tui_host_line :: proc() -> string {
 		name := d.target
 		if d.label != "" { name = d.label }
 		one := fmt.tprintf("{} {} {}", name, host_status_word(d.status), n)
+		if d.status != .ok && d.status != .pending && d.detail != "" {
+			one = fmt.tprintf("{} — {}", one, diag_head(d.detail, 44))
+		}
 		if out == "" {
 			out = one
 		} else {
@@ -936,6 +955,24 @@ tui_host_line :: proc() -> string {
 		}
 	}
 	return out
+}
+
+// diag_head takes the first line of a multi-line diagnostic and caps it at
+// `max` BYTES cut on a rune boundary, so a truncated accented character cannot
+// leak a replacement glyph into the footer.
+diag_head :: proc(s: string, max: int) -> string {
+	end := len(s)
+	for i := 0; i < len(s); i += 1 {
+		if s[i] == '\n' || s[i] == '\r' { end = i; break }
+	}
+	head := s[:end]
+	if len(head) <= max { return head }
+	cut := max
+	// 0x80..0xBF are UTF-8 continuation bytes: never cut just after one, and never
+	// leave one at the end of the string.
+	for cut > 0 && head[cut-1] & 0xc0 == 0x80 { cut -= 1 }
+	for cut > 0 && cut < len(head) && head[cut] & 0xc0 == 0x80 { cut -= 1 }
+	return fmt.tprintf("{}{}", head[:cut], "…")
 }
 
 tui_state_text :: proc() -> string {
@@ -949,8 +986,28 @@ tui_state_text :: proc() -> string {
 		return fmt.tprintf("\u26a0 {}  ·  {}  ·  {}", warn,
 			app.state_label(tui.machine.state), tui_host_line())
 	}
+	// The provenance segment goes LAST on the right, after the per-host verdict and
+	// the age token: when the row is short it is the first thing to be cut, and
+	// when the user needs it (an unexpected host set) it is still there. Putting it
+	// first would let a long host list hide the state word, which is worse.
+	src := tui_source_line()
+	if src != "" {
+		return fmt.tprintf("{}  ·  {}  ·  {}  ·  {}", app.state_label(tui.machine.state),
+			tui_host_line(), tui_list_age(), src)
+	}
 	return fmt.tprintf("{}  ·  {}  ·  {}", app.state_label(tui.machine.state),
 		tui_host_line(), tui_list_age())
+}
+
+// tui_source_line names the provenance of the remote set in the footer, using the
+// app's own label rather than a re-derived string. The rule is to say nothing when
+// there is nothing to say: with no remotes configured the source is not
+// interesting, and a footer line nobody asked for pushes the interesting parts off
+// the screen.
+tui_source_line :: proc() -> string {
+	if len(tui.remotes) == 0 { return "" }
+	if tui.disc_source == .not_probed { return "" }
+	return fmt.tprintf("from {}", app.machine_source_label(tui.disc_source))
 }
 
 tui_paint :: proc() {
@@ -1325,6 +1382,11 @@ tui_boot :: proc() -> bool {
 	disc := tui_discover()
 	TUI_DISCOVER_MS = i64(time.duration_milliseconds(time.since(probe_t0)))
 	tui.remotes = disc.remotes
+	// Keep the provenance for the footer. This is O13's user-facing half: if the
+	// registry silently stopped answering, the host set changes and the footer is
+	// the only place that can say why.
+	tui.disc_source = disc.source
+	tui.disc_note = disc.note
 	app.table_reset_devices(&tui.table, app.devices_for_table(disc))
 
 	// (b) THE local list, inline and blocking: ~3 ms, and it is the only thing

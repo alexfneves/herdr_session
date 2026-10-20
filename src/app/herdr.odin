@@ -611,10 +611,27 @@ SSH_BIN :: "ssh"
 // `ConnectTimeout` a black-holed host costs ~133 s, and without `BatchMode` a
 // passphrase prompt hangs the fan-out forever instead of failing in ~120 ms.
 // `-T` keeps stdout pure JSON (no tty, no chatter) and is ~20 ms faster.
-SSH_BASE_ARGS :: [5]string{
+//
+// The trailing `--` is the OPTION-PARSING TERMINATOR (P2-7), and it is in this
+// list rather than spelled out at each call site on purpose: `SSH_BASE_ARGS` is
+// always emitted immediately before the device, so putting the terminator last
+// here is what guarantees `--` sits between our options and the device in EVERY
+// ssh argv we build, including ones added later. Verified on this box:
+//
+//	ssh -T -o BatchMode=yes -o ConnectTimeout=5 -- '-F/tmp/evil' 'echo x'
+//	  → hostname contains invalid characters      (exit 255, nothing ran)
+//	ssh -T -o BatchMode=yes -o ConnectTimeout=5   '-F/tmp/evil' 'echo x'
+//	  → ssh READS /tmp/evil as its config file    (BatchMode gone)
+//
+// It is a SECOND layer, not a replacement: `remote_is_valid` still refuses such
+// a device at config-parse and registry-parse time, with a warning. Validation
+// stops the user's typo; `--` makes the transport itself unable to be hijacked if
+// that validation is ever bypassed.
+SSH_BASE_ARGS :: [6]string{
 	"-T",
 	"-o", "BatchMode=yes",
 	"-o", "ConnectTimeout=5",
+	"--", // must stay LAST: it terminates option parsing right before the device
 }
 
 // remote_list_argv is our own `ssh -T … 'herdr session list --json'`.

@@ -149,6 +149,13 @@ Fetch :: struct {
 	settled_at     : time.Time,
 }
 
+// NO_FD is the "there is no fd here" sentinel (P3-10). It is -1 and NOT 0, because
+// 0 is stdin — a perfectly real descriptor. With 0 as the sentinel, a fetch whose
+// read end happened to land on 0 (a daemonised/`</dev/null`-detached parent, or
+// any future code path that closes stdin) would be skipped by every `fd != 0`
+// guard and leak a descriptor per fetch, forever.
+NO_FD : posix.FD = -1
+
 fetch_free :: proc(f: ^Fetch) {
 	if f == nil { return }
 	fetch_close(f)
@@ -160,10 +167,10 @@ fetch_free :: proc(f: ^Fetch) {
 fetch_close :: proc(f: ^Fetch) {
 	if f.closed { return }
 	f.closed = true
-	if f.out_fd != 0 { posix.close(f.out_fd) }
-	if f.err_fd != 0 { posix.close(f.err_fd) }
-	f.out_fd = 0
-	f.err_fd = 0
+	if f.out_fd >= 0 { posix.close(f.out_fd) }
+	if f.err_fd >= 0 { posix.close(f.err_fd) }
+	f.out_fd = NO_FD
+	f.err_fd = NO_FD
 }
 
 // fetch_pending is "still a child we are waiting on".
@@ -207,6 +214,10 @@ spawn_fetch :: proc(device, label: string, kind: Fetch_Kind, argv: []string,
 	f.status = .pending
 	f.out = make([dynamic]byte, 0, 16 * 1024)
 	f.err = make([dynamic]byte, 0, 4 * 1024)
+	// Explicitly NO_FD: a zero-valued struct would otherwise carry 0, which is
+	// stdin, and every guard would treat it as "a pipe we must not close".
+	f.out_fd = NO_FD
+	f.err_fd = NO_FD
 
 	if len(argv) == 0 {
 		return settle_failed_spawn(f, "empty argv")
@@ -330,10 +341,12 @@ fetch_drained :: proc(f: ^Fetch) -> bool {
 // of re-waking on a hangup we already handled.
 fetch_fds_watched :: proc(f: ^Fetch, fds: ^[dynamic]posix.pollfd) {
 	if f.settled || f.closed { return }
-	if !f.eof_out {
+	// `>= 0` and not "it exists": a NO_FD (-1) handed to poll(2) is EBADF, which
+	// would turn a closed fetch into a spurious wake-every-loop storm.
+	if !f.eof_out && f.out_fd >= 0 {
 		append(fds, posix.pollfd{fd = f.out_fd, events = {.IN}})
 	}
-	if !f.eof_err {
+	if !f.eof_err && f.err_fd >= 0 {
 		append(fds, posix.pollfd{fd = f.err_fd, events = {.IN}})
 	}
 }
@@ -931,16 +944,41 @@ selection_from_index :: proc(rows: []Session, index: int) -> Selection {
 // Local snapshot — the blocking inline fetch the first paint uses
 //-----------------------------------------------------------------------------
 
+// local_failure_text maps "the local list did not work" onto the message and the
+// STATUS the footer shows. It is a pure function of the three facts the capture
+// carries, so the mapping is testable without breaking the install under test —
+// which matters, because "herdr is missing" and "herdr answered nonsense" used to
+// share one sentence and the user cannot tell them apart from the outside.
+local_failure_text :: proc(spawned: bool, timed_out: bool, code: i32, budget: time.Duration) -> (string, Device_Status) {
+	if !spawned {
+		return "herdr not found on PATH — install herdr, or add it to PATH", .no_herdr
+	}
+	if timed_out {
+		return fmt.tprintf("local herdr did not answer within {}s", int(budget / time.Second)),
+			.timed_out
+	}
+	if code == 127 {
+		return "herdr not found on PATH (exit 127) — install herdr, or add it to PATH", .no_herdr
+	}
+	return fmt.tprintf("local herdr answered, but not with a session list (exit {})", code), .failed
+}
+
 // local_snapshot runs the local list synchronously and merges it. The first
 // frame waits on this and nothing else: measured ~3 ms, against ~150 ms per
 // remote host. Remote fetches are already in flight by the time it returns in
 // the startup sequence — see `fetch_live` for the ordering proof.
+//
+// The failure message is chosen from what actually happened, because the old
+// single string was a lie in the most common broken-install case: with herdr not
+// on PATH the child never spawned at all, and the footer accused it of having
+// "answered, but not with a session list" — sending the user to read logs for a
+// program that was never running. Three truths, three messages.
 local_snapshot :: proc(t: ^Table, budget: time.Duration) -> (Merge_Report, Capture) {
 	c := run_capture(list_argv(), budget)
 	rows, ok := parse_session_list(c.out, DEVICE_LOCAL, DEVICE_LOCAL)
 	if !ok {
-		set_device_status(t, DEVICE_LOCAL, DEVICE_LOCAL, .failed,
-			"local herdr answered, but not with a session list")
+		why, status := local_failure_text(c.spawned, c.timed_out, c.code, budget)
+		set_device_status(t, DEVICE_LOCAL, DEVICE_LOCAL, status, why)
 		return Merge_Report{device = DEVICE_LOCAL, total = len(t.rows)}, c
 	}
 	set_device_status(t, DEVICE_LOCAL, DEVICE_LOCAL, .ok,

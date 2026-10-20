@@ -673,8 +673,10 @@ unit_deadline_policy :: proc() {
 	// it will actually run.
 	argv := app.remote_list_argv("some.host.example")
 	joined := argv_join(argv)
+	// The `--` before the host is part of the mandatory form now (P2-7): it
+	// terminates ssh's option parsing immediately before the device.
 	eq("the fetch argv is exactly the mandatory ssh form", joined,
-	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 some.host.example herdr session list --json")
+	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 -- some.host.example herdr session list --json")
 	check("…contains -T (NOT -t: no pty, no chatter)",
 		strings.contains(joined, " -T ") && !strings.contains(joined, " -t "),
 		joined)

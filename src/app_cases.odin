@@ -24,6 +24,7 @@ import app "./app"
 import "core:fmt"
 import "core:sort"
 import "core:strings"
+import "core:unicode/utf8"
 import "core:time"
 
 // scratch_prefix is the ONLY name prefix this driver may create.
@@ -80,6 +81,8 @@ case_app_unit :: proc() -> bool {
 	unit_argv()
 	unit_detach_carries_device()
 	unit_device_option_injection()
+	unit_diag_head()
+	unit_missing_herdr()
 	unit_control_budget()
 	unit_stopped_attach_is_legal()
 
@@ -799,10 +802,16 @@ unit_argv :: proc() {
 	eq("remote launch carries --remote VERBATIM", app_argv_text(ra),
 	   "herdr --remote alice@workbox.example --session mydb")
 
-	// The same device string must be what our ssh fetch uses — one string, three uses.
+	// The same device string must be what our ssh fetch uses — one string, three
+	// uses. The `--` before the device is deliberate and was added AFTER this
+	// expectation was first pinned (P2-7): it terminates ssh's option parsing so
+	// a device that reached the argv without passing validation is still read as
+	// a HOST, never as an option. Updating this string was a deliberate test
+	// change, not a regression: the byte-exact form IS the thing being pinned, so
+	// it is pinned to the secure argv.
 	fa := app.remote_list_argv("Alice@Work.Box.Example")
-	eq("ssh fetch uses the same verbatim device string", app_argv_text(fa),
-	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 Alice@Work.Box.Example herdr session list --json")
+	eq("ssh fetch uses the same verbatim device string, after the `--` terminator", app_argv_text(fa),
+	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 -- Alice@Work.Box.Example herdr session list --json")
 
 	aa, aok := app.attach_argv("2026-10-18-20-30-45-123")
 	check("attach argv built", aok, "")
@@ -857,9 +866,9 @@ unit_detach_carries_device :: proc() {
 	// The remote row: both commands must be OUR ssh, aimed at the row's device.
 	r_stop, r_del := app.cleanup_argv("alice@build-box.example", "hs-t-p1")
 	eq("remote cleanup stop argv", app_argv_text(r_stop),
-	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 alice@build-box.example 'herdr session stop --json hs-t-p1'")
+	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 -- alice@build-box.example 'herdr session stop --json hs-t-p1'")
 	eq("remote cleanup delete argv", app_argv_text(r_del),
-	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 alice@build-box.example 'herdr session delete --json hs-t-p1'")
+	   "ssh -T -o BatchMode=yes -o ConnectTimeout=5 -- alice@build-box.example 'herdr session delete --json hs-t-p1'")
 
 	// The device in the HOST slot, verbatim — not the label, not a resolved
 	// address, not "local". Index 6 is the operand right after `ssh` + the 5
@@ -971,11 +980,176 @@ unit_device_option_injection :: proc() {
 	}
 	check("…and the warning names it and says OPTION", warned,
 		fmt.tprintf("warnings={}", c.warnings))
+
+	// ── THE SECOND LAYER (P2-7 override) ─────────────────────────────────
+	// Everything above is validation, and validation is one refactor away from
+	// being skipped. So the transport must ALSO be unable to be hijacked: the
+	// argv builder is called here with a hostile device DIRECTLY, with every
+	// check bypassed on purpose, and the assertion is that `--` still sits
+	// immediately before the device — which is the position that makes ssh stop
+	// reading options and treat everything after it as the host operand.
+	//
+	// Measured on this box with OpenSSH 10.5p1:
+	//   ssh -T … -- '-F/tmp/evil' 'echo x'  → hostname contains invalid characters
+	//   ssh -T …    '-F/tmp/evil' 'echo x'  → ssh reads /tmp/evil as its config
+	bypass := []string{"-F/tmp/evil", "-oProxyCommand=nc evil 80", "-p2222", "-"}
+	for t in bypass {
+		la := app.remote_list_argv(t)
+		// The device is the operand right after the base args; the token before it
+		// must be the terminator, and no option may appear after it.
+		host_at := len(app.SSH_BASE_ARGS) + 1
+		check(fmt.tprintf("even with validation bypassed, remote_list_argv puts `--` before %q", t),
+			host_at < len(la) && la[host_at-1] == "--" && la[host_at] == t,
+			fmt.tprintf("token before the device={} device={}", la[host_at-1], la[host_at]))
+
+		ca := app.control_argv(t, app.delete_argv("hs-t-p1"))
+		chost_at := len(app.SSH_BASE_ARGS) + 1
+		check(fmt.tprintf("…and control_argv does too (cleanup path): %q", t),
+			chost_at < len(ca) && ca[chost_at-1] == "--" && ca[chost_at] == t,
+			fmt.tprintf("token before the device={} device={}", ca[chost_at-1], ca[chost_at]))
+
+		// The device must appear AFTER the terminator and never before it: if the
+		// terminator moved to the end of the argv the guard would be decorative.
+		early := false
+		for i := 0; i < host_at-1; i += 1 {
+			if la[i] == t { early = true }
+		}
+		check(fmt.tprintf("…and the hostile device never appears in the option slots: %q", t),
+			!early, fmt.tprintf("argv before the terminator does not contain it"))
+	}
+
+	// The terminator is part of SSH_BASE_ARGS, in the LAST slot, so a future
+	// builder cannot emit "base args + device" without it. That structural claim
+	// is what keeps this from silently decaying.
+	eq("SSH_BASE_ARGS ends with the option terminator",
+		app.SSH_BASE_ARGS[len(app.SSH_BASE_ARGS)-1], "--")
+	check("…and every ssh argv we build therefore has `--` immediately before the host",
+		app.remote_list_argv("box.example")[len(app.SSH_BASE_ARGS)+1] == "box.example" &&
+		app.remote_list_argv("box.example")[len(app.SSH_BASE_ARGS)] == "--",
+		fmt.tprintf("argv={}", app_argv_text(app.remote_list_argv("box.example"))))
 }
 
 // ---------------------------------------------------------------------------
 // P2-5 — the control budget is derived from the transport, not picked
 // ---------------------------------------------------------------------------
+
+// unit_diag_head — the footer's diagnostic truncation (P3-12). The `why` strings
+// carried by a device are often whole ssh traces; the footer has one row. This
+// proves the cut takes the FIRST line, caps the width, and never slices a UTF-8
+// sequence in half (which would paint a replacement glyph where the reason was).
+unit_diag_head :: proc() {
+	say("  — the per-host diagnostic is truncated honestly (P3-12)")
+
+	eq("single short line passes through", diag_head("connection refused", 44),
+		"connection refused")
+	eq("only the first line of a multi-line trace is used",
+		diag_head("banner: ssh refused\nsecond line\nthird", 44), "banner: ssh refused")
+	eq("CRLF is handled the same as LF",
+		diag_head("refused\r\nnoise", 44), "refused")
+
+	long, _ := strings.repeat("x", 90)
+	big := diag_head(long, 44)
+	// The contract: at most `max` bytes of the REASON, then the mark. `…` is
+	// 3 bytes in UTF-8, so a 44-byte cap yields 47 bytes of string — the cap is
+	// on the content, and the mark is what tells you it was applied.
+	check("a 90-char reason is capped to max content bytes", len(big) == 44 + len("…"),
+		fmt.tprintf("len={}", len(big)))
+	check("…and the cap is marked, not silent", strings.has_suffix(big, "…"),
+		fmt.tprintf("tail={}", big[44:]))
+
+	// The rune-boundary rule: cut in the middle of a multi-byte character and the
+	// footer prints a replacement glyph where the reason was. `é` is 2 bytes; with
+	// a 43-byte prefix the 44-byte cap lands INSIDE it (…|c3|a9), so a naive
+	// slice would leave a dangling lead byte.
+	prefix44, _ := strings.repeat("a", 43)
+	tail20, _ := strings.repeat("b", 20)
+	accented := fmt.tprintf("{}{}{}", prefix44, "é", tail20)
+	cut := diag_head(accented, 44)
+	ELL :: "…"
+	body := cut[:len(cut)-len(ELL)]  // everything before the truncation mark
+	check("the 44-byte cap backed off the middle of a 2-byte rune",
+		len(body) == 43, fmt.tprintf("body len={} (44 would split é)", len(body)))
+	check("…and the truncated part is valid UTF-8 on its own",
+		utf8_valid(body), fmt.tprintf("body={}", body))
+	check("…and the cut is still marked as truncated", strings.has_suffix(cut, ELL),
+		fmt.tprintf("cut='{}'", cut))
+
+	// A general sweep: for every cap across a mixed-ASCII/multi-byte reason, the
+	// result must never be broken UTF-8. This is the property the footer needs;
+	// one bad width on a host's error message is enough to corrupt the row.
+	e30, _ := strings.repeat("é", 30)
+	mixed := fmt.tprintf("ssh: could not read {} from the tunnel", e30)
+	broke := 0
+	for cap in 1 ..= 60 {
+		r := diag_head(mixed, cap)
+		rb := r[:len(r)-len(ELL)]
+		if !utf8_valid(rb) { broke += 1 }
+	}
+	check("no width in 1..60 produces broken UTF-8", broke == 0,
+		fmt.tprintf("{} widths broke across 60", broke))
+
+	// An empty detail must not produce a bare ellipsis in the footer — the caller
+	// checks for "" before calling, and this pins that empty stays empty.
+	eq("empty detail stays empty", diag_head("", 44), "")
+}
+
+// utf8_valid decodes a string rune by rune and reports whether every sequence is
+// well formed. core:unicode/utf8 counts runes without complaining about broken
+// ones, which is fine for layout and useless for THIS — the whole point is to
+// notice a dangling lead byte left behind by a truncation.
+utf8_valid :: proc(s: string) -> bool {
+	i := 0
+	for i < len(s) {
+		r, n := utf8.decode_rune_in_string(s[i:])
+		if r == utf8.RUNE_ERROR || n <= 0 { return false }
+		i += n
+	}
+	return true
+}
+
+// Diag_Case is one row of the missing-herdr mapping table. Named because Odin
+// wants a named type for a table like this; see unit_missing_herdr for why the
+// table exists at all.
+Diag_Case :: struct {
+	name      : string,
+	spawned   : bool,
+	timed_out : bool,
+	code      : i32,
+	want      : app.Device_Status,
+}
+
+MISSING_HERDR_CASES : []Diag_Case = {
+	{"never spawned (not on PATH)", false, false, -1, .no_herdr},
+	{"shell says 127",              true,  false, 127, .no_herdr},
+	{"answered garbage",            true,  false,   0, .failed},
+	{"hit our deadline",            true,   true,  -1, .timed_out},
+}
+
+// unit_missing_herdr — P3-5. The old code reported "local herdr answered, but
+// not with a session list" even when nothing ever spawned, which sent users to
+// debug a program that was never running. Each failure shape now has its own
+// message, and the STATUS is the actionable one.
+unit_missing_herdr :: proc() {
+	say("  — a missing local herdr says so instead of blaming herdr (P3-5)")
+
+	// The three shapes the code distinguishes, asserted by their cause rather
+	// than by a captured string: no child, a timeout, and a 127 from the shell.
+	for c in MISSING_HERDR_CASES {
+		why, st := app.local_failure_text(c.spawned, c.timed_out, c.code, 5 * time.Second)
+		check(fmt.tprintf("{} -> status {}", c.name, app.device_status_label(st)),
+			st == c.want, fmt.tprintf("got {} why='{}'", app.device_status_label(st), why))
+		check(fmt.tprintf("{} names a cause the user can act on", c.name),
+			len(why) > 0 && why != "local herdr answered, but not with a session list" ||
+				st == .failed,
+			fmt.tprintf("why='{}'", why))
+	}
+	// The specific lie this is fixing: an unspawned child must NEVER be reported
+	// as having answered badly.
+	why_ns, _ := app.local_failure_text(false, false, -1, 5 * time.Second)
+	check("a child that never spawned is never described as having answered",
+		!strings.contains(why_ns, "answered"), fmt.tprintf("why='{}'", why_ns))
+	check("…and it says PATH", strings.contains(why_ns, "PATH"), fmt.tprintf("why='{}'", why_ns))
+}
 
 unit_control_budget :: proc() {
 	say("  — the delete/control budget sits just above ssh's own bound (P2-5)")
@@ -984,7 +1158,7 @@ unit_control_budget :: proc() {
 	// changes SSH_BASE_ARGS this check moves with it, which is the whole point of
 	// deriving the budget from the transport.
 	ssh_bound := -1.0
-	base: [5]string = app.SSH_BASE_ARGS
+	base: [6]string = app.SSH_BASE_ARGS
 	for idx in 0 ..< len(base) {
 		a := base[idx]
 		if strings.has_prefix(a, "ConnectTimeout=") {

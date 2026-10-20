@@ -14,12 +14,17 @@ CLI you already have.
 ──────────────────────────────────────────────────────────────────────────
 filter: ▏
 device      timestamp               state    name
-local       2026-10-20 08:42:00.459 running  default
-build-box   2026-10-19 21:14:07.221 running  api
-deploy     2026-10-18 09:03:55.104 stopped  worker
+local       2026-10-20 08:42:00.459 running  api
+build-box   2026-10-19 21:14:07.221 running  worker
+deploy     2026-10-18 09:03:55.104 stopped  bench
 ──────────────────────────────────────────────────────────────────────────
 mode_selection  ·  local ok 1  build-box ok 1  deploy timeout 0
 ```
+
+`default` never appears in the list. It is herdr's own persistent workspace, not a
+session you created, and D12 forbids the app from touching it — the filter is applied
+at the parse boundary (`parse_session_list`), so it cannot reappear through any code
+path that reads a session list. The sample above therefore shows only real sessions.
 
 There is deliberately **no outer border** — the header and footer dividers are
 Clay `betweenChildren` rules, so the screen uses every column it was given. The
@@ -234,7 +239,11 @@ The result is the **union**, de-duplicated on the verbatim device string:
 The registry is never allowed to win by *replacing* your list. An empty registry is
 a true answer about herdr's saved machines, not a statement about what you wanted,
 and treating it as authority is exactly how a hand-written host list silently
-vanishes. The footer reports where the list came from.
+vanishes. The footer reports where the list came from: `from registry + configured
+remotes`, `from herdr machine registry`, or `from configured remotes` — which is
+how you can tell "your registry is empty" apart from "your herdr is too old to
+have one" without running anything. The label is `app.machine_source_label`, and
+`main.odin` renders it whenever there is at least one remote.
 
 Two details worth knowing:
 
@@ -430,8 +439,14 @@ Notes:
 
 Every suite runs the real binary; the ones that need a terminal create a real pty.
 None of them touch your real `~/.config` (they point `XDG_CONFIG_HOME` at a temp
-directory) and each one proves the herdr session list is byte-identical after the
-run.
+directory).
+
+The suites that CREATE sessions also prove the list is restored byte-for-byte, by
+capturing `herdr session list` before and after the run and failing on any drift:
+`app-smoke` and `tui-smoke` both print their pre-run and post-run lists on the
+same screen. `state`, `render`, `theme` and `ui` are pure-model / pure-render suites
+that spawn no session, so they have nothing to restore and assert that instead
+rather than claiming a cleanup they did not perform.
 
 ```sh
 dev/local-build.sh                     # -> /tmp/hs-local
@@ -486,5 +501,14 @@ the product depends on that file, its fixture, or a loopback address.
 
 ## License
 
-MIT. Vendored dependencies: [Clay](https://github.com/nicbclay/clay-odin) and
-[termbox2](https://github.com/termbox/termbox2), both built from pinned source.
+**Apache-2.0**, matching `license = lib.licenses.asl20` in `nix/package.nix`
+(this previously said MIT while the package metadata said ASL 2.0, and the two
+disagreed).
+
+Vendored/build-time dependencies, both pinned by revision in `flake.nix`:
+
+- [Clay](https://github.com/nicbarker/clay) (MIT) — layout, used via its C ABI
+- [termbox2](https://github.com/termbox/termbox2) (zlib) — terminal rendering
+
+Check each upstream's licence before relicensing or redistributing a combined
+artifact; this project's licence governs this repository's own source only.

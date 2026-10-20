@@ -126,6 +126,16 @@ decode :: proc(typ: u8, key: u16, ch: u32, mod: u8) -> Key {
 	if mapped != .none { return key_of(mapped) }
 
 	if ch == 0 { return NO_KEY }
+	// ASTRAL GUARD (P3-6). `ch` is a u32 rune and `map_code` takes a u16 termbox
+	// code. Truncating a Plane-1+ scalar silently folds its high bits away, and
+	// termbox reserves 0xffXX for its OWN specials — so U+1FFED (a perfectly
+	// printable supplementary-plane character whose low 16 bits happen to be
+	// KEY_ARROW_UP, 0xffed) would have moved the selection instead of being
+	// typed into the filter. A rune above the BMP is TEXT, never a control code:
+	// skip the code table entirely and let it fall through to `char_key`.
+	// Anything outside Unicode's own range is not a rune at all and is dropped.
+	if ch > 0x10ffff { return NO_KEY }
+	if ch > 0xffff { return char_key(rune(ch)) }
 	from_ch := map_code(u16(ch))
 	if from_ch != .none { return key_of(from_ch) }
 	if !control_byte_is_printable(ch) { return NO_KEY }

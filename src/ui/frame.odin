@@ -546,27 +546,76 @@ frame_footer :: proc(f: ^Frame, pal: ^Palette) {
 
 // keys_line renders "j move  k quit  enter open" truncated to `max` cells, dropping
 // whole hints (never half a hint) so the footer never wraps.
+//
+// RETENTION (P3-12). When the line cannot hold every hint, the cut is made from
+// the FRONT, not the back — and it is marked with `…`. This is deliberate:
+// every KEYS_* table in main.odin lists its "how you get out" hints last
+// (`t theme`, `esc quit`, `ctrl-c quit`), so filling from the front and cutting
+// from the front keeps the exit visible and sheds the optional verbs first. A
+// footer that keeps `enter new local session` while dropping `esc quit` tells
+// the user how to start things and not how to stop, which at 80–120 columns — a
+// perfectly ordinary terminal — is the difference between a UI and a trap.
+//
+// The rule is "keep the hints nearest the exit, drop the ones furthest from it",
+// which is the same ordering the tables are written in and needs no second table
+// of priorities to drift out of sync.
 keys_line :: proc(keys: []Key_Hint, max: i32) -> string {
-	if max <= 0 {
+	if max <= 0 || len(keys) == 0 {
 		return ""
 	}
+
+	// The exit hint alone decides whether anything can be shown at all.
+	last := fmt.tprintf("{} {}", keys[len(keys)-1].key, keys[len(keys)-1].action)
+	if text_cols(last) > max {
+		return ellipsize(last, max)
+	}
+
+	// Walk backwards from the exit hint, prepending whatever still fits.
+	kept: []Key_Hint = keys[len(keys)-1:]
+	used := text_cols(last)
+	for i := len(keys) - 2; i >= 0; i -= 1 {
+		hint := fmt.tprintf("{} {}", keys[i].key, keys[i].action)
+		// Room for the hint, its separator, and — if we will still be dropping
+		// something further left — the `…` marker and its separator.
+		marker: i32 = 0
+		if i > 0 { marker = text_cols("…") + len(SEP) }
+		if used + len(SEP) + text_cols(hint) + marker > max { break }
+		kept = keys[i:len(keys)]
+		used += len(SEP) + text_cols(hint)
+	}
+
+	line := keys_joined(kept, max)
+	if len(kept) == len(keys) {
+		return line // everything fit; no marker
+	}
+	// Mark the cut. If even the marker does not fit, the hints alone are shown —
+	// the exit hint is still there either way.
+	marked := cat("…", SEP, line)
+	if text_cols(marked) <= max {
+		return marked
+	}
+	return line
+}
+
+SEP :: "  "
+
+// cat joins three pieces without any format string, so no user-supplied text can
+// ever hit a format-specifier path (the `%!(EXTRA …)` class of bug).
+cat :: proc(a, b, c: string) -> string {
 	buf: [dynamic]byte
-	used: i32 = 0
+	append_bytes(&buf, a)
+	append_bytes(&buf, b)
+	append_bytes(&buf, c)
+	return string(buf[:])
+}
+
+// keys_joined renders every hint, untruncated (the `max` is only used to size
+// the buffer's growth, never to drop anything).
+keys_joined :: proc(keys: []Key_Hint, max: i32) -> string {
+	buf: [dynamic]byte
 	for &k in keys {
-		hint := fmt.tprintf("{} {}", k.key, k.action)
-		sep: i32 = 0
-		if len(buf) > 0 {
-			sep = 2
-		}
-		want := text_cols(hint)
-		if used+sep+want > max {
-			break
-		}
-		if sep > 0 {
-			append_bytes(&buf, "  ")
-		}
-		append_bytes(&buf, hint)
-		used += sep + want
+		if len(buf) > 0 { append_bytes(&buf, SEP) }
+		append_bytes(&buf, fmt.tprintf("{} {}", k.key, k.action))
 	}
 	return string(buf[:])
 }

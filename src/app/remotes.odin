@@ -98,6 +98,11 @@ remote_label :: proc(r: Remote) -> string {
 //	                 that file says. Every D5 guarantee is then void.
 //	-oProxyCommand=.. -> arbitrary command run by the transport itself.
 //
+// This is LAYER ONE. Layer two is the `--` terminator in SSH_BASE_ARGS, which
+// makes the transport unable to be hijacked even if this check is ever bypassed
+// (see the measured proof on that constant). Refusing the input is the polite
+// layer; the terminator is the load-bearing one.
+//
 // The class is closed at validation rather than by quoting, because the same
 // string has to work as an ssh operand, as `--remote`'s value and as a registry
 // key, and no single escape fixes all three. A device starting with `-` is not a

@@ -11,7 +11,13 @@
       flake = false;
     };
     termbox2 = {
-      url = "github:termbox/termbox2/master";
+      # Pinned by REV, not by branch. This used to track `/master`, which meant
+      # `nix flake update` silently moved the renderer under a project whose only
+      # job is to paint on it — and the README's "fully pinned" claim was only
+      # true of flake.lock, not of the input itself. Pinning the rev here makes
+      # the pin explicit and intentional: moving termbox2 is now a deliberate edit
+      # to this file rather than a side effect of an update command.
+      url = "github:termbox/termbox2/48cda6f83a4a1a98d3546beafe55b31a5861c21d";
       flake = false;
     };
   };

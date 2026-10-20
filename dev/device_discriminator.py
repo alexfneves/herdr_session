@@ -13,8 +13,18 @@ This script runs the REAL TUI in a real pty against that pair and asserts on the
 rendered screen — what a user reads, not what a function returned:
 
   * the same session name appears as TWO rows, one per device
-  * typing either device in the filter narrows to THAT device's rows only
-  * the footer's attach preview carries the selected row's device verbatim
+  * typing either device in the filter narrows to THAT device's rows only, in
+    both directions
+
+NOT proven here, and deliberately so: "pressing enter on the alias row attaches to
+the ALIAS". Driving a real attach through the pty hands the terminal to herdr, so
+the assertion would be about whatever that session's UI happens to print rather
+than about our code. The argv-level proof — that the alias row yields
+`--remote <ALIAS>` verbatim and the primary row yields `--remote <PRIMARY>` —
+lives in `app-live`, where it is checked on the argv we would exec. Do not add a
+footer string check here and call it that proof: the word `attach` is in the
+mode-selection key hints whether or not a row is selected, so it would pass with a
+completely device-blind implementation.
 
 Run:
   BIN=./result/bin/herdr-session HERDR_SESSION_TEST_REMOTE=localhost \
@@ -128,11 +138,24 @@ def main():
         # PRIMARY — lives in `app-live` (`attach on the alias row carries the
         # ALIAS verbatim after --remote`), where it is asserted on the argv we
         # would exec rather than on a rendered side effect.
-        footer = p.screen.text()
-        check("the footer exposes attach for the selection (affordance present)",
-              "attach" in footer,
-              "footer shows the attach key")
-
+        # ── NO footer check here, on purpose ───────────────────────────────
+        # This file used to assert `"attach" in footer`. That check cannot fail:
+        # KEYS_MODE lists `a attach` as a key hint whether a row is selected or
+        # not, and the footer's per-host line legitimately names EVERY device
+        # with its status (`local ok 2  localhost ok 2  127.0.0.1 ok 2`), so
+        # "the footer names the selected row's device" is true for the wrong
+        # reason and "the footer names only the selected row's device" is false
+        # by design. There is no rendered selection affordance in this app that
+        # couples the highlight to a device string, so no screen check here can
+        # distinguish a device-correct build from a device-blind one.
+        #
+        # The proof that matters is at the argv level, where the device is an
+        # operand we control rather than a pixel: `app-live` asserts that the
+        # alias row produces `--remote <ALIAS>` verbatim and the primary row
+        # produces `--remote <PRIMARY>`, and `app-unit` pins the same for the
+        # fetch/cleanup argvs. Adding a weaker check here would be worse than
+        # nothing — it would read as coverage of the exact thing this fixture
+        # exists to test.
         p.send("\x03")
         time.sleep(0.4)
     finally:

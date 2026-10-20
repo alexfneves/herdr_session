@@ -488,7 +488,13 @@ live_per_host_isolation :: proc(remote: string) {
 	s := app.table_device(&t, remote)
 	b := app.table_device(&t, broken)
 	eq("healthy host status = ok", app.device_status_label(s.status), "ok")
-	check("healthy host has rows", true, fmt.tprintf("rows for {} = {}", remote, count_device_rows(&t, remote)))
+	// Was `check("healthy host has rows", true, ...)`: the label promised rows and
+	// the operand was a literal `true`, so `grep 'healthy host has rows'` read
+	// like coverage of something that was never asserted. Now it asserts the thing
+	// its own name claims, and it CAN fail — if the fixture's healthy host came
+	// back with an empty session list, this is the line that says so.
+	check("healthy host has rows", count_device_rows(&t, remote) > 0,
+		fmt.tprintf("rows for {} = {} (must be > 0)", remote, count_device_rows(&t, remote)))
 	eq("broken host status = unreachable", app.device_status_label(b.status), "unreachable")
 	eq_int("broken host contributed ZERO rows", count_device_rows(&t, broken), 0)
 	check("the healthy host's rows are all that is in the table",

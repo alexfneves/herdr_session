@@ -300,8 +300,8 @@
       },
       "original": {
         "owner": "termbox",
-        "ref": "master",
         "repo": "termbox2",
+        "rev": "48cda6f83a4a1a98d3546beafe55b31a5861c21d",
         "type": "github"
       }
     },
