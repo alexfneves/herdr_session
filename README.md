@@ -65,18 +65,21 @@ accidentally type into a filter you are not aiming at. See [Where you can type](
 
 | Key | Action |
 |-----|--------|
-| `Enter` | new local session (auto-generated name) |
+| `Enter` | **new** local session (auto-generated name) |
 | `n` | new **named** local session |
 | `r` | new remote session (auto-generated name) |
 | `s` | new **named** remote session |
-| `a` | **attach** to the selected session |
-| `d` | **delete** the selected session |
+| `a` | open the **attach** picker |
+| `d` | open the **delete** picker |
 | `t` | switch theme |
 | `Esc` | quit |
 
-That list is **complete**: `Enter n r s a d t Esc Ctrl-C`. Arrow keys move the
-selection; typing does **not** filter here. The filter line is still drawn above
-the list so the layout matches the states that do filter, but it stays empty and
+That list is **complete**: `Enter n r s a d t Esc Ctrl-C`. There are **no
+`Up`/`Down` bindings here and nothing is highlighted** — this state has no cursor,
+because its `Enter` creates a session rather than acting on a listed row (see
+[The highlighted row *is* the row `Enter` acts on`](#the-highlighted-row-is-the-row-enter-acts-on)).
+Typing does **not** filter here either: the filter line is still drawn above the
+list so the layout matches the states that do filter, but it stays empty and
 uneditable until you enter one of them.
 
 ### 2. Attach (`a`)
@@ -181,21 +184,34 @@ to move) and `PgUp` / `PgDn` (the list scrolls with the arrows; there is no pagi
 model). They are no-ops by decision, and the decision is recorded in
 `src/input/keymap.odin`.
 
-### The highlighted row *is* the selection
+### The highlighted row *is* the row `Enter` acts on
 
-A list is never shown without a highlight unless it is genuinely empty:
+The highlight is a **promise**: it tells you exactly what `Enter` will act on.
+So a row is highlighted only in the states where `Enter` actually acts on a row.
 
-- entering a list state highlights the **first** visible row — except the theme
-  picker, which opens on the theme **currently applied**;
-- if a filter removes the row you had selected, the highlight falls back to the
-  first row the filter leaves visible, and the selection moves with it;
-- an empty list has no highlight, and `Enter` there does nothing.
+| State | Highlight on entry |
+|-------|--------------------|
+| Landing screen (Mode selection) | **none** — nothing is pointed at |
+| Attach (`a`) | the first visible row |
+| Delete (`d`) | the first visible row |
+| Pick a remote host (`r`, `s`) | the first host |
+| Theme (`t`) | the theme **currently applied** |
+| Any list, after a filter removes your row | the first row the filter leaves visible |
+| An **empty** list | none — `Enter` does nothing |
 
-The point of the rule is that `Enter` always acts on precisely the row the screen
-is pointing at. When filtering shifts rows around, the selection is re-derived
-from the highlighted row rather than left pointing at a row that is no longer
-there — so a row can never be deleted or attached "from under" the cursor, and the
-cursor can never sit on nothing.
+Why the landing screen is deliberately left unhighlighted, even though it shows a
+full list: its `Enter` means **"New session"**. It does not target a listed row.
+Highlighting a row there would point at one thing and then do something else with
+it — the exact misleading UI this rule exists to prevent. The binding list agrees:
+Mode selection has **no `Up`/`Down`** keys at all, because there is no cursor in
+that state.
+
+In the picker states the rule is strict in both directions. When filtering shifts
+rows around, the selection is **re-derived from the highlighted row** rather than
+left pointing at a row that is no longer on screen — so a session can never be
+attached or deleted "from under" the cursor, and the cursor can never sit on
+nothing. Leaving a picker clears the selection along with the filter, so the
+landing screen never carries a stale pointer from two screens ago.
 
 ---
 

@@ -220,3 +220,64 @@ cursor to move in that state.
 4. Any R4 test asserting "first row highlighted in every list" must be **scoped to the picker states**
    and a new test must assert the opposite for `{Mode selection}` — show the corrected test rather than
    deleting the old one.
+
+---
+
+# RCH-5 — `tests/` folder, all tests in Odin, using `core:testing`
+
+**User requirement (2026-10-20).** Tests belong in a `tests/` folder, written in Odin, using the Odin
+testing suite. Investigation before recording — the current state is worse than "wrong folder":
+
+## Findings
+
+| Area | Lines | Notes |
+|---|---|---|
+| Product (`app`,`ui`,`render`,`terminal`,`input`) | **8,730** | already properly modular |
+| Test code living **inside `src/`** (`*_cases.odin`, `*_live.odin`) | **8,255** | `package main` |
+| `src/main.odin` | 1,612 | product TUI **and** the test dispatcher |
+| Python pty drivers (`dev/*.py`) | 2,282 | not allowed as our language |
+
+**Three real problems, not cosmetic:**
+
+1. **The product binary IS the test harness.** `main()` dispatches on `argv[1]`: default `tui`, but
+   ~30 named cases are baked in and **reachable by anyone who has the binary** — `app-live`,
+   `fetch-live`, `theme-set`, `config-save`, `probe`, `guard-attach`, `guard-delete`, `handoff`,
+   `layout-dump`… Test code ships, and so does its attack surface.
+2. **`core:testing` is not used anywhere.** Assertions are hand-rolled: `check_int`, `expect_cell`,
+   `expect_cmd`, `expect_noop`, `expect_state`, `say_raw` — bespoke plumbing to reinvent what the
+   standard library already does.
+3. **Tests outnumber the product** (~10.5k test-controlled lines vs 8.7k product), which makes
+   the misplacement expensive rather than trivial.
+
+## Target shape
+```
+src/                     PRODUCT ONLY. No test code. No argv case dispatch.
+  main.odin              entry + TUI only
+  app/ ui/ render/ terminal/ input/     (unchanged — already importable packages)
+tests/                   ALL tests, Odin only, `core:testing`
+  *_test.odin            unit: state, config/theme, model, herdr argv, render, ui
+  live_test.odin         integration against real herdr (fixture-gated)
+  pty_*.odin            Odin pty drivers replacing dev/*.py (posix.openpty + fork/exec)
+dev/                     thin bash runners ONLY (or deleted once nix runs the tests)
+```
+
+**Imports work without a rebuild of the module system** — current imports are relative
+(`./app`, `../clay-odin`), so `tests/` can use `import app "../src/app"`. Adding an `odin.json`
+module for clean `herdr_session/...` paths is a nice-to-have, not a prerequisite.
+
+**Build separation (required):** product build must not contain tests. Add a distinct test target
+(`odin test tests` / a second derivation) and wire `nix flake check` — there is currently **no check
+phase at all**, so CI never runs these.
+
+## Non-negotiable migration constraint
+> **Verification strength must not decrease.** Every assertion moved must be counted before and after.
+> If a suite goes from N to fewer than N assertions, that is a REGRESSION, not a cleanup — report it as
+> such rather than reporting a green suite.
+
+Port **one suite at a time**, prove parity, commit, then the next. Keep the house rule that *zero
+assertions executed = failure* (`core:testing` reports 0 tests as a pass otherwise).
+
+## Ordering
+This restructures the very files (`src/*_cases.odin`, `src/*_live.odin`, `dev/*`) that the in-flight
+RCH-3/RCH-4 work is editing. **It must run AFTER that lands** — two agents in those files is a
+guaranteed conflict.

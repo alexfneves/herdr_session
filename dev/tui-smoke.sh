@@ -139,6 +139,8 @@ run_scenario state-theme
 run_scenario state-error
 run_scenario boot-remote fixture
 run_scenario roundtrip fixture
+run_scenario del-key
+run_scenario mode-filter-immutable
 run_scenario refresh-key
 run_scenario delete-notice
 run_guards

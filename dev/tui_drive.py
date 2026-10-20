@@ -887,21 +887,32 @@ def scenario_mode_filter_immutable():
               p.wait_screen("mode_selection", 5.0) is not None, p.exit_info())
         p.read(0.6)
         rows_before = len([n for n in session_names() if n != "default"])
+        rows_before_screen = len([l for l in p.screen.lines()
+                                if re.match(r"^(local|[0-9a-fA-F:.]+)\s", l.strip())])
+        check("the landing list has visible rows to begin with",
+              rows_before_screen > 0,
+              "{} visible rows, {} non-default sessions".format(
+                  rows_before_screen, rows_before))
 
         p.keys(stray, pause=0.06, settle=1.0)
         txt = p.screen.text()
+        filt = [l.strip() for l in p.screen.lines() if "filter:" in l]
         check("typing {} unclaimed keys leaves the filter line EMPTY".format(len(stray)),
-              "filter: \u258f" in txt or "filter:  " in txt,
-              "filter line = {!r}".format(
-                  [l.strip() for l in p.screen.lines() if "filter:" in l][:1]))
-        check("…and no typed character leaked anywhere on the screen",
-              not any((c in txt) for c in "xyzqjvpmk" if c not in
-                     ("mode_selection",)),
-              "screen still shows the landing list")
+              filt and filt[0] in ("filter:", "filter: \u258f", "filter:"),
+              "filter line = {!r}".format(filt[:1]))
+        # NOTE: a single-character scan of the whole screen would be worthless —
+        # 'p' is in "pending", 'm' is in "mode_selection", 'k' is in plenty of
+        # ordinary words. "Nothing leaked" is only checkable where the leak would
+        # land: the filter line, asserted empty just above, and the row count,
+        # asserted unchanged just below.
+        rows_after = len([l for l in p.screen.lines()
+                        if re.match(r"^(local|[0-9a-fA-F:.]+)\s", l.strip())])
+        check("…and the table still shows every row (nothing filtered away)",
+              rows_after == rows_before_screen,
+              "rows {} before -> {} after stray typing".format(
+                  rows_before_screen, rows_after))
         check("…and the footer is still mode_selection (no state change)",
               "mode_selection" in txt, "footer unchanged")
-        check("…and the table was not filtered down",
-              rows_before > 0, "{} non-default sessions exist".format(rows_before))
 
         # The six mode keys must still work right after the stray typing, which
         # is what proves the stray keys were a no-op and not a swallowed prefix.
@@ -912,7 +923,7 @@ def scenario_mode_filter_immutable():
             time.sleep(0.9)
             p.read(0.6)
             got = p.screen.text()
-            check("[{}] still reaches {{}} after the stray typing".format(key),
+            check("[%s] still reaches %s after the stray typing" % (key, expect_footer),
                   expect_footer in got,
                   "footer should name {}".format(expect_footer))
             p.send("\x1b")            # Esc back to {Mode selection}
