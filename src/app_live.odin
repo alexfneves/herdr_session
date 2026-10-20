@@ -77,6 +77,7 @@ case_app_live :: proc() -> bool {
 	live_device_discriminator()
 	live_timeout()
 	live_detach_routes_to_the_device()
+	live_only_created_r1()
 	live_control_budget_live()
 	live_cleanup()
 
@@ -884,6 +885,109 @@ live_detach_routes_to_the_device :: proc() {
 		say(fmt.tprintf("    live remote cleanup stop argv:   {}", app_argv_text(ok_stop)))
 		say(fmt.tprintf("    live remote cleanup delete argv: {}", app_argv_text(ok_del)))
 	}
+}
+
+// live_only_created_r1 proves the SHIPPED default end-to-end against the real
+// herdr, with the two halves that make `only_created` the right policy rather
+// than a blunt one. It deliberately NEVER calls set_cleanup_policy: with D2 now
+// resolved, the thing worth proving is that the value the app starts on already
+// does the right thing, not that a policy we installed does it.
+//
+//   half 1  a session THIS APP created is destroyed by the detach, and the
+//           notice says so plainly — no error, no ambiguity.
+//   half 2  a session we merely ATTACHED to survives that same call under the
+//           same policy. This is the half that makes `always` unacceptable and
+//           `only_created` the honest answer: the user's own work is untouched.
+//
+//   half 3  already deleted elsewhere -> NO ERROR surfaced. herdr answers a
+//           delete of a gone name with {"deleted":true} / exit 0, so the notice
+//           stays a success sentence and never grows a NOT-cleaned clause.
+//           (The opposite failure mode — a scary error for a harmless race — is
+//           exactly what the requirement called out, so it is asserted here.)
+live_only_created_r1 :: proc() {
+	say("  — R1 LIVE: the shipped default destroys what we created, spares what we only joined")
+
+	p := app.cleanup_policy()
+	eq("no policy is set by this test; the default is what runs",
+		app.cleanup_policy_label(p), "only_created")
+	if p != .only_created {
+		say("    ABORT: the default is not only_created, so nothing below proves R1")
+		return
+	}
+
+	created := "hs-t-r1-owned"
+	guest   := "hs-t-r1-joined"
+	teardown_scratch_named(created, "pre-run safety")
+	teardown_scratch_named(guest, "pre-run safety")
+
+	if !spawn_scratch_session_pty(created) {
+		say("    SKIP: could not create the 'created here' scratch session")
+		return
+	}
+	if !spawn_scratch_session_pty(guest) {
+		say("    SKIP: could not create the 'already there' scratch session")
+		teardown_scratch_named(created, "skip path")
+		return
+	}
+	before := list_now()
+	check("both scratch sessions exist before the detach",
+		contains_name(before, created) && contains_name(before, guest),
+		fmt.tprintf("names={}", names_of(before)))
+
+	// ── half 1: the one we created is destroyed ──
+	n_own := app.post_detach(app.DEVICE_LOCAL, created, true)
+	say(fmt.tprintf("    detach notice (created here): {}", n_own))
+	gone := !contains_name(list_now(), created)
+	check("THE SESSION WE CREATED IS GONE from herdr after the detach", gone,
+		fmt.tprintf("names={}", names_of(list_now())))
+	check("…and the notice states it plainly, with no error wording",
+		strings.contains(n_own, "stopped and deleted") &&
+			!strings.contains(n_own, "NOT cleaned") &&
+			!strings.contains(n_own, "failed"),
+		fmt.tprintf("notice={}", n_own))
+
+	// ── half 2: the one we only attached to SURVIVES the identical call ──
+	n_guest := app.post_detach(app.DEVICE_LOCAL, guest, false)
+	say(fmt.tprintf("    detach notice (only attached): {}", n_guest))
+	kept := contains_name(list_now(), guest)
+	check("THE SESSION WE ONLY ATTACHED TO IS STILL THERE", kept,
+		fmt.tprintf("names={}", names_of(list_now())))
+	check("…and the notice says it was left running, not deleted",
+		strings.contains(n_guest, "left running") &&
+			!strings.contains(n_guest, "deleted"),
+		fmt.tprintf("notice={}", n_guest))
+
+	// The two notices must DIFFER for the two origins under one policy. If they
+	// ever print the same sentence, the created/attached distinction has been
+	// lost somewhere and `only_created` has quietly become `always` or `never`.
+	check("…and the two notices are NOT the same sentence",
+		n_own != n_guest,
+		fmt.tprintf("created=%q joined=%q", n_own, n_guest))
+
+	// ── half 3: already deleted -> no error surfaced ──
+	// Stop THEN delete: herdr will not delete a running session, and a
+	// half-performed out-of-band teardown would not be "already deleted", it
+	// would be this test's own bug pretending to be a race.
+	app.run_capture(app.stop_argv(guest), app.CONTROL_TIMEOUT)
+	app.run_capture(app.delete_argv(guest), app.CONTROL_TIMEOUT)
+	check("the attached session was deleted out-of-band first",
+		!contains_name(list_now(), guest), fmt.tprintf("names={}", names_of(list_now())))
+	n_raced := app.post_detach(app.DEVICE_LOCAL, guest, true)
+	say(fmt.tprintf("    detach notice (already gone): {}", n_raced))
+	check("already-deleted surfaces NO ERROR — no NOT-cleaned, no failure text",
+		!strings.contains(n_raced, "NOT cleaned") &&
+			!strings.contains(n_raced, "failed") &&
+			!strings.contains(n_raced, "error"),
+		fmt.tprintf("notice={}", n_raced))
+	check("…and the list is unchanged by deleting something already gone",
+		!contains_name(list_now(), guest) && !contains_name(list_now(), created),
+		fmt.tprintf("names={}", names_of(list_now())))
+
+	teardown_scratch_named(created, "end of R1 live")
+	teardown_scratch_named(guest, "end of R1 live")
+	check("teardown leaves no R1 scratch behind",
+		!contains_name(list_now(), created) && !contains_name(list_now(), guest),
+		fmt.tprintf("names={}", names_of(list_now())))
 }
 
 // live_control_budget_live measures the control path against the black-holed

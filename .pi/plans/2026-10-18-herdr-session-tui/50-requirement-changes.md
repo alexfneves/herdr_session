@@ -180,3 +180,43 @@ R4 supersedes the `-1`, but the danger is removed a different way by strengtheni
 With that, "always highlighted" is *safer* than `-1`, not less safe: Enter can never act on a row that
 isn't visibly pointed at. An **empty** list still yields `sel = -1` with `held` invalid, and Enter is a
 no-op (spec: "If nothing was selected, pressing the key does nothing").
+
+---
+
+# RCH-4 — CORRECTION to R4: `{Mode selection}` must show NO highlight
+
+**User correction (2026-10-20), supersedes the "always highlight" half of RCH-3/R4.**
+
+R4 as originally recorded said a list must always have something highlighted unless empty, first element
+by default. That is **still correct for the picker states**, but **wrong for `{Mode selection}`**.
+
+## Final rule
+
+| State | Highlight on entry |
+|---|---|
+| `{Mode selection}` | **NONE** — `sel = -1`, no row pointed at |
+| `{Select session to attach}` | first visible row |
+| `{Select session to delete}` | first visible row |
+| `{Select remote server…}` | first visible row |
+| `{Select theme}` | the **currently applied** theme |
+| any list, after its selection was filtered away | first *visible* row |
+| **empty** list | none (`sel = -1`), Enter is a no-op |
+
+## Why this is the right shape, not a contradiction
+The highlight is a **promise about what `Enter` will act on**. In the picker states `Enter` acts on the
+pointed row, so one must always be pointed at. In `{Mode selection}` **`Enter` means "New session"**
+(spec: `[Enter] New session …`) — it does **not** act on any listed row. A highlighted row there would
+point at something and then do something else with it: exactly the misleading UI R4 existed to prevent.
+
+`{Mode selection}` also has **no `Up`/`Down` bindings in the spec**, which confirms it: there is no
+cursor to move in that state.
+
+## Consequences (must hold)
+1. `a.sel = -1` in `{Mode selection}` **and** `held = NO_SELECTION` — never a stale selection from a
+   picker the user just left.
+2. **Returning to `{Mode selection}` from any picker clears the selection**, along with the filter.
+3. The invariant from RCH-3 survives, sharpened: **the highlighted row is exactly the row `Enter` acts
+   on.** No highlight ⇒ `Enter` acts on nothing (or on the state's own meaning, for a create).
+4. Any R4 test asserting "first row highlighted in every list" must be **scoped to the picker states**
+   and a new test must assert the opposite for `{Mode selection}` — show the corrected test rather than
+   deleting the old one.

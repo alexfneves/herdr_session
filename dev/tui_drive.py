@@ -752,6 +752,194 @@ def scenario_roundtrip():
         print("    teardown: scratch sessions left = {}".format(leftover))
 
 
+def scenario_del_key():
+    """RCH-3/R3, through a REAL pty: the Del key edits.
+
+    Before R3, KEY_DELETE (`ESC [ 3 ~`) was unmapped, so termbox delivered it,
+    `ch == 0`, and it decoded to NO_KEY — the keypress vanished. A user pressing
+    Del (or fn+Delete on a Mac) saw the filter refuse to shorten. Asserting the
+    mapper alone would not have caught the class: the mapping is only worth
+    something if the byte `ESC [ 3 ~` arriving on a real pty ends up shortening
+    the real filter line the user is looking at.
+
+    Also asserted here: runes are removed WHOLE. A byte-wise delete would leave a
+    dangling UTF-8 continuation byte, which renders as garbage rather than as a
+    shorter string — so we check for absence of replacement characters too, not
+    just a shorter length.
+    """
+    CARET = "\u258f"
+
+    def filter_text():
+        for l in p.screen.lines():
+            s = l.rstrip()
+            if "filter:" in s:
+                t = s[s.index("filter:") + len("filter:"):]
+                return t.replace(CARET, "").strip()
+        return None
+
+    def table_row_count():
+        n = 0
+        for l in p.screen.lines():
+            s = l.strip()
+            if not s or "filter:" in s or s.startswith("device"):
+                continue
+            if "no sessions match" in s:
+                return 0
+            if re.match(r"^(local|[0-9a-fA-F:.]+)\s", s) or "2026-" in s:
+                n += 1
+        return n
+
+    p = Pty(["tui"], env=base_env(), rows=40, cols=120)
+    try:
+        check("boot", p.wait_screen("herdr-session", 5.0) is not None, p.exit_info())
+        p.keys("a", pause=0.3, settle=1.0)
+        check("in a state that OWNS the filter", filter_text() == "",
+              "filter line = {!r}".format(filter_text()))
+        full = table_row_count()
+        check("the list starts with rows visible", full > 0,
+              "{} rows before filtering".format(full))
+
+        # ── type three ASCII chars, then Del them away one at a time ──
+        p.keys("api", pause=0.15, settle=0.9)
+        check("typing three chars puts them in the filter", filter_text() == "api",
+              "filter = {!r}".format(filter_text()))
+        p.send("\x1b[3~")
+        time.sleep(0.8)
+        p.read(0.5)
+        check("ONE Del (ESC [ 3 ~) shortens it to 'ap'", filter_text() == "ap",
+              "filter = {!r}".format(filter_text()))
+        p.send("\x1b[3~")
+        time.sleep(0.7)
+        p.read(0.5)
+        check("…then 'a'", filter_text() == "a", "filter = {!r}".format(filter_text()))
+        p.send("\x1b[3~")
+        time.sleep(0.7)
+        p.read(0.5)
+        check("…then empty", filter_text() == "", "filter = {!r}".format(filter_text()))
+        p.send("\x1b[3~")
+        time.sleep(0.7)
+        p.read(0.5)
+        check("Del on an already-empty filter does nothing nasty",
+              filter_text() == "", "filter = {!r}".format(filter_text()))
+
+        # ── the list RE-WIDENS: the visible effect the user asked for ──
+        p.keys("zzzqqq", pause=0.12, settle=0.9)
+        cleared = table_row_count()
+        check("a filter that matches nothing empties the table", cleared == 0,
+              "{} rows at 'zzzqqq'".format(cleared))
+        for _ in range(6):
+            p.send("\x1b[3~")
+            time.sleep(0.18)
+        time.sleep(0.8)
+        p.read(0.6)
+        rewiden = table_row_count()
+        check("six Dels erase the filter and bring the whole list back",
+              filter_text() == "" and rewiden == full,
+              "filter={!r} rows {} -> {}".format(filter_text(), cleared, rewiden))
+
+        # ── whole-rune deletion: 3-byte CJK and 4-byte astral ──
+        for rune, nbytes, label in ((u"\u4e16", 3, "CJK U+4E16"),
+                                  (u"\U0001F600", 4, "astral U+1F600")):
+            p.keys(rune, pause=0.2, settle=0.9)
+            ft = filter_text()
+            check("typing {} lands in the filter".format(label), rune in (ft or ""),
+                  "filter = {!r}".format(ft))
+            check("…and it renders as the rune, not as a replacement char",
+                  ft is not None and "\ufffd" not in ft,
+                  "filter = {!r}".format(ft))
+            p.send("\x1b[3~")
+            time.sleep(0.8)
+            p.read(0.5)
+            check("ONE Del removes the WHOLE {} ({} bytes) in a single press".format(
+                      label, nbytes),
+                  filter_text() == "",
+                  "filter = {!r} (a byte-wise delete would leave {} of it)".format(
+                      filter_text(), nbytes - 1))
+
+        p.send("\x03")
+        time.sleep(0.6)
+        p.read(0.6)
+        p.alive()
+        check("Ctrl+C quits after the Del session", not p.alive(), p.exit_info())
+        check("terminal settings restored", p.termios_now() == p.termios_before,
+              "tcgetattr matches")
+    finally:
+        p.kill()
+        p.close()
+
+
+def scenario_mode_filter_immutable():
+    """RCH-3/R2, through a REAL pty: {Mode selection} does not accept typing.
+
+    The spec binds {Mode selection} to `Enter n r s a d t Escape Ctrl+C` and
+    nothing else. Before R3's sibling change the implementation let any unclaimed
+    printable fall into the filter — rationalised in a comment as keeping the
+    filter line "usable" in the Sessions view. It is not in the binding list, so
+    it must not happen: the filter line stays drawn (the layout must not jump)
+    but stays EMPTY, the table keeps every row, and the six mode keys still work
+    immediately afterwards with no residue.
+    """
+    # Deliberately NOT any of the six mode keys, and not a control key.
+    stray = "xyzqjvpmk.1234567890 _-"
+    p = Pty(["tui"], env=base_env(), rows=40, cols=120)
+    try:
+        check("boot into {Mode selection}",
+              p.wait_screen("mode_selection", 5.0) is not None, p.exit_info())
+        p.read(0.6)
+        rows_before = len([n for n in session_names() if n != "default"])
+
+        p.keys(stray, pause=0.06, settle=1.0)
+        txt = p.screen.text()
+        check("typing {} unclaimed keys leaves the filter line EMPTY".format(len(stray)),
+              "filter: \u258f" in txt or "filter:  " in txt,
+              "filter line = {!r}".format(
+                  [l.strip() for l in p.screen.lines() if "filter:" in l][:1]))
+        check("…and no typed character leaked anywhere on the screen",
+              not any((c in txt) for c in "xyzqjvpmk" if c not in
+                     ("mode_selection",)),
+              "screen still shows the landing list")
+        check("…and the footer is still mode_selection (no state change)",
+              "mode_selection" in txt, "footer unchanged")
+        check("…and the table was not filtered down",
+              rows_before > 0, "{} non-default sessions exist".format(rows_before))
+
+        # The six mode keys must still work right after the stray typing, which
+        # is what proves the stray keys were a no-op and not a swallowed prefix.
+        for key, expect_footer in (("n", "name_local"), ("r", "remote_server"),
+                                 ("s", "name_remote_named"), ("a", "attach"),
+                                 ("d", "delete_session"), ("t", "theme")):
+            p.send(key)
+            time.sleep(0.9)
+            p.read(0.6)
+            got = p.screen.text()
+            check("[{}] still reaches {{}} after the stray typing".format(key),
+                  expect_footer in got,
+                  "footer should name {}".format(expect_footer))
+            p.send("\x1b")            # Esc back to {Mode selection}
+            time.sleep(0.8)
+            p.read(0.6)
+            check("…and Esc comes back to mode_selection",
+                  "mode_selection" in p.screen.text(), "back at the landing screen")
+
+        # And the filter IS still editable where it is supposed to be.
+        p.send("a")
+        time.sleep(1.0)
+        p.read(0.6)
+        p.keys("zz", pause=0.15, settle=0.9)
+        got = [l.strip() for l in p.screen.lines() if "filter:" in l]
+        check("…but in {Attach} the SAME typing DOES reach the filter",
+              any("zz" in l for l in got), "filter line = {!r}".format(got[:1]))
+
+        p.send("\x03")
+        time.sleep(0.6)
+        p.read(0.6)
+        p.alive()
+        check("Ctrl+C quits after the immutability session", not p.alive(), p.exit_info())
+    finally:
+        p.kill()
+        p.close()
+
+
 def scenario_sigterm():
     p = Pty(["tui"], env=base_env(), rows=40, cols=120)
     try:
@@ -1002,6 +1190,8 @@ SCENARIOS = {
     "sigterm": scenario_sigterm,
     "no-orphan": scenario_no_orphan,
     "roundtrip": scenario_roundtrip,
+    "del-key": scenario_del_key,
+    "mode-filter-immutable": scenario_mode_filter_immutable,
     "delete-notice": scenario_delete_notice,
     "refresh-key": scenario_refresh_key,
 }
