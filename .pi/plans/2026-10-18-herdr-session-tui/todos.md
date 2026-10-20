@@ -1823,7 +1823,7 @@ T0.1 → T0.2                    ← toolchain risk retired; `nix run .` works  
   → T5.1 → T5.2 → T5.3         ← views + frame (RCH-1 applied: no outer border) ✅
   → T5.4                       ← the state machine (side-effect-free)      ✅
   → T5.5  ✅ DONE                ← executor + real poll loop; `nix run .` is a terminal program
-  → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6   ← config/themes/resize, next up
+  → T6.1 → T6.2 → T6.5 → T6.3 → T6.4 → T6.6   ← config/themes/resize  ✅ THE PLAN IS COMPLETE
 ```
 `nix build` must stay green at every arrow. **Do not reorder T1.2 later** — it is the assumption the whole
 plan rests on (premortem **A1**) and it is cheapest to validate before feature work exists.

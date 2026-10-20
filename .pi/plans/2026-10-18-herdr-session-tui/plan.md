@@ -442,40 +442,86 @@ fixture leaves remote support intact and fully generic. Track as a deliverable.
 
 ## Ideal State Criteria
 
+Walked end-to-end on 2026-10-20 against `5f7bce2` (1090 checks, 0 FAIL). Evidence
+is the check name and the suite that produced it, not a restatement of the claim.
+
 ### Core
-- [ ] ISC-1: `nix run .` launches the TUI as the default flake output
-- [ ] ISC-2: Every launched child has `HERDR_ENV` scrubbed
-- [ ] ISC-3: All 7 states reachable with the spec's exact key bindings
-- [ ] ISC-4: `device` in every row is the verbatim user-configured ssh target string
-- [ ] ISC-5: Attach uses `herdr --remote <target> --session <name>` remotely / validated name locally
-- [ ] ISC-6: Local rows render before any remote fetch completes
-- [ ] ISC-7: Theme persists to `~/.config/herdr_session.json` and reloads on start
-- [ ] ISC-8: `catppuccin-latte` present and selectable; `gruvbox-dark` is the default
+- [x] ISC-1: `nix run .` launches the TUI as the default flake output
+      — bare invocation defaults to the TUI (`main` → `name = "tui"`); off-a-tty it
+        hits the gate: `needs a real terminal: stdin and stdout must both be a tty`, exit **3**
+- [x] ISC-2: Every launched child has `HERDR_ENV` scrubbed
+      — `dev/tui_drive.py::base_env` mirrors the app's scrub and asserts it (T5.5/T6.4 suite)
+- [x] ISC-3: All 7 states reachable with the spec's exact key bindings
+      — `state-smoke` walks all 7 with the spec keys; 198 PASS
+- [x] ISC-4: `device` in every row is the verbatim user-configured ssh target string
+      — `remote launch carries --remote VERBATIM`, `ssh fetch uses the same verbatim device string` (app suite)
+- [x] ISC-5: Attach uses `herdr --remote <target> --session <name>` remotely / validated name locally
+      — `remote launch argv built  herdr --remote alice@workbox.example --session mydb`;
+        `local launch is 'herdr --session <name>'` (app suite)
+- [x] ISC-6: Local rows render before any remote fetch completes
+      — `tui-smoke` boot-with-remote: local group painted while remotes still `pending`
+- [x] ISC-7: Theme persists to `~/.config/herdr_session.json` and reloads on start
+      — `theme-smoke` `apply-persist` (166 PASS, temp `XDG_CONFIG_HOME` only)
+- [x] ISC-8: `catppuccin-latte` present and selectable; `gruvbox-dark` is the default
+      — `theme-smoke`: `unknown theme falls back to gruvbox-dark`; latte selectable + aliases
 
 ### Terminal / handoff
-- [ ] ISC-9: Terminal fully restored (alt-screen, cursor, termios) on every exit path including SIGTERM
-- [ ] ISC-10: After a child exits, TUI re-enters alt-screen with a forced full repaint
-- [ ] ISC-11: A lone Escape returns "back" with no perceptible delay
-- [ ] ISC-12: Ctrl+C exits from all 7 states with the terminal restored
-- [ ] ISC-13: Resizing with **no further key input** updates the screen within one frame
+- [x] ISC-9: Terminal fully restored (alt-screen, cursor, termios) on every exit path including SIGTERM
+      — `SIGTERM exits exit=143 … with the terminal's termios exactly as we found it`;
+        SIGHUP `exit=129 · alt-screen-leave sequences=1 · stty before/after=IDENTICAL` (handoff suite)
+- [x] ISC-10: After a child exits, TUI re-enters alt-screen with a forced full repaint
+      — `handoff-smoke` A1 block: repaint + input survive the handoff
+- [x] ISC-11: A lone Escape returns "back" with no perceptible delay
+      — `no time module / sleep / event peek in state.odin => no Escape timeout exists` (state suite)
+- [x] ISC-12: Ctrl+C exits from all 7 states with the terminal restored
+      — `state <s>: termios restored` for every state in `state-smoke`
+- [x] ISC-13: Resizing with **no further key input** updates the screen within one frame
+      — `resize-smoke::resize-no-key`: **0 bytes written by us**, first repaint byte **~50 ms**
+        after `TIOCSWINSZ`, dividers repainted at the NEW width (40 checks, 3 reps)
 
 ### Edge cases
-- [ ] ISC-14: No remote can block the UI — worst case bounded by `ConnectTimeout=5`
-- [ ] ISC-15: A host failure degrades only that host's rows
-- [ ] ISC-16: `delete` pre-checks existence (never trusts `deleted:true`)
-- [ ] ISC-17: Attach never targets an unvalidated name — no orphan sessions
-- [ ] ISC-18: `default` never appears in any list
-- [ ] ISC-19: Corrupt config falls back to defaults with a warning; app still starts
-- [ ] ISC-20: herdr 0.8.2 (no `machine` verb) still yields a usable remote list via config fallback
-- [ ] ISC-21: The `(device, name)` **two-alias discriminator** test passes (`localhost` vs `127.0.0.1`)
+- [x] ISC-14: No remote can block the UI — worst case bounded by `ConnectTimeout=5`
+      — `the fetch argv is exactly the mandatory ssh form  ssh -T -o BatchMode=yes -o ConnectTimeout=5 …`;
+        `FETCH_DEADLINE (13 s) > ssh ConnectTimeout (5 s)` (app suite)
+- [x] ISC-15: A host failure degrades only that host's rows
+      — `fetch_cases` T4.2: refreshing A does not disturb B; per-host status mapping
+- [x] ISC-16: `delete` pre-checks existence (never trusts `deleted:true`)
+      — `app/herdr.odin` delete pre-check, proven live (T3.1 evidence block)
+- [x] ISC-17: Attach never targets an unvalidated name — no orphan sessions
+      — `attaching an unknown name is refused in-app` (app_live)
+- [x] ISC-18: `default` never appears in any list
+      — `default` filtered from every list + `cleanup_should_run` returns false for it under every policy
+- [x] ISC-19: Corrupt config falls back to defaults with a warning; app still starts
+      — `theme-smoke` `corrupt-warning`; warning is `config <path> is not valid JSON (…) - defaults in use`
+- [x] ISC-20: herdr 0.8.2 (no `machine` verb) still yields a usable remote list via config fallback
+      — `0.8.2 'unknown command' text → NO registry`, `help banner with exit 0 is NOT a registry`,
+        `gate fails -> config fallback` (app suite)
+- [x] ISC-21: The `(device, name)` **two-alias discriminator** test passes (`localhost` vs `127.0.0.1`)
+      — `device_discriminator.py` 9 PASS: same name → rows with devices
+        `['local','127.0.0.1','localhost']`; filter `localhost` → rows=1 and `127.0.0.1` **absent**,
+        and the reverse. Nothing merges across the two spellings.
 
 ### Anti-criteria
-- [ ] ISC-A-1: No `2>&1` before any JSON parse
-- [ ] ISC-A-2: No idle spin / busy-wait when nothing changes
-- [ ] ISC-A-3: No hard-coded `localhost` in product code (fixture behind one env var, grep-removable in one action)
-- [ ] ISC-A-4: No Kitty keyboard protocol dependency
-- [ ] ISC-A-5: No TOML parser dependency
-- [ ] ISC-A-6: No thread pool / `core:thread`
-- [ ] ISC-A-7: No copied code from `tui_experiment`'s main loop
-- [ ] ISC-A-8: No `backgroundColor.alpha` used as a identity tag
-- [ ] ISC-A-9: No committed prebuilt clay/termbox2 binaries
+- [x] ISC-A-1: No `2>&1` before any JSON parse — `grep -rn '2>&1' src/` → **no matches**
+- [x] ISC-A-2: No idle spin / busy-wait when nothing changes
+      — `grep -n 'time.sleep' src/main.odin` → **nothing** (the loop blocks in `poll(timeout=-1)`).
+        4 hits exist elsewhere and are **shown, not hidden**: `model.odin:243` (finite name-collision
+        retry), `herdr.odin:438` (`if time.since(started) > budget { return -1 }`), `fetch.odin:527`
+        (`KILL_REAP_BUDGET`), `fetch.odin:666` (capped no-fd fallback in `registry_poll`).
+        Empirical: idling the built TUI 6 s burns **0 clock ticks = 0.000 % of one core**, 0 bytes out.
+- [x] ISC-A-3: No hard-coded `localhost` in product code — `grep -rn 'localhost\|127\.0\.0\.1' src/` → **no matches**
+      (fixture is injected from `HERDR_SESSION_TEST_*` by the harness, so it is greppable/removed in one action)
+- [x] ISC-A-4: No Kitty keyboard protocol dependency — `grep -rnE '\[>1u|kitty' src/ nix/` → **no matches**
+- [x] ISC-A-5: No TOML parser dependency — `grep -rnE 'toml' src/ nix/` → **no matches**
+- [x] ISC-A-6: No thread pool / `core:thread` — `grep -rn 'core:thread' src/` → **no matches**
+- [x] ISC-A-7: No copied code from `tui_experiment`'s main loop
+      — `git grep tui_experiment -- 'src/*' 'nix/*' 'dev/*'` → **zero hits**; the only mentions in the
+        repo are plan docs describing the reference experiment's *provenance* (comment-only, by design).
+        Note: `scout-nix-packaging.md` records the Clay **binding** as byte-identical to the
+        experiment's copy — that is the genuine upstream `clay.odin` (same sha256) vendored via a
+        pinned flake input, not app code, and it is not committed to this repo.
+- [x] ISC-A-8: No `backgroundColor.alpha` used as a identity tag — `grep -rnE 'backgroundColor.*alpha' src/` → **no matches**
+- [x] ISC-A-9: No committed prebuilt clay/termbox2 binaries
+      — `git ls-files | grep -E '\.(a|lib|o|so|dll|dylib)$'` → **none**; both archives are built
+        in-derivation and staged at the paths the bindings hard-code (`nix/package.nix`), and
+        `clay.odin`/termbox bindings are fetched from pinned inputs rather than committed
