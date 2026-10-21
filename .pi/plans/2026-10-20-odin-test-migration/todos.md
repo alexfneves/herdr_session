@@ -586,7 +586,58 @@ proven** — every downstream assertion inherits its correctness. *ISC-A-3*
 
 ---
 
-### T5 — The Pty driver: spawn, observe, measure
+### T5 — The Pty driver: spawn, observe, measure  ✅ DONE (d3322cf + 761ef2e + 17562ea + d59dea2)
+
+> **DONE 2026-10-22.** `tests/pty/pty.odin` + `tests/pty/pty_test.odin`.
+> **51 assertions green.** Whole lane: **218** (width 67 + ffi 27 + screen 73 + pty 51),
+> 38 tests, ~6.0 s, deterministic over repeat runs. Product (`odin build ./src`) and
+> `nix build .` both green. No orphan children, no leaked fds, no leftover `/dev/pts`.
+>
+> **Filename correction:** the driver lives in **`pty.odin`**, not `driver.odin` —
+> `driver` is a reserved word in Odin (the procedure-receiver name) and using it as a
+> module name is asking for confusion.
+>
+> **Four plan corrections found while implementing:**
+>
+> 1. **`cpu_ticks`'s end-relative indexing is WRONG and the plan mandates it.** The plan
+>    says *"indexed from the END of the field list — `comm` may contain spaces"*. On a
+>    modern Linux 52-field `/proc/<pid>/stat`, index `-15` is **`processor`** and `-14`
+>    is **`rt_priority`** — not `utime`/`stime`. The python in `dev/tui_drive.py:383-387`
+>    has been summing the wrong two columns. A synthetic line with a `comm` containing
+>    spaces and a `)` proves it: end-index reports `4194304 / 100` where the true
+>    `utime/stime` are `33 / 44`. Ported instead as: anchor on first `(` and **last**
+>    `)`, then `rest[11]` = utime, `rest[12]` = stime. Cross-checked against
+>    `/proc/<pid>/schedstat`, which needs **no field arithmetic at all** — two
+>    independent sources agreeing is what makes "right column" a fact.
+>
+> 2. **The single-thread check as specified measures the wrong thing.** Asserting
+>    `/proc/self/status` `Threads == 1` reads a **process-global** value that picks up
+>    whatever is linked in, including the test runner's own machinery. Three builds of
+>    this lane reported **1, 2 and 3** threads for the *identical* single filtered test
+>    — the assertion was passing and failing for reasons unrelated to the harness. Now
+>    asserts (a) the compile-time knob via the same `#config(ODIN_TEST_THREADS, 0)` the
+>    runner reads, and (b) that a full driver cycle adds **zero** threads, which is the
+>    part actually ours. Related trap: `os.file_info_slice_delete` was measured taking the
+>    test binary from 1 thread to 2, so the leak-check avoids `os.read_directory` entirely
+>    and uses `waitpid(-1, WNOHANG)` — which is also a *stronger* child-leak proof.
+>
+> 3. **`resize_latency` needs a drain the python does not have.** `wait_screen` returns the
+>    instant its needle appears and leaves the rest of that frame unread in the pty buffer.
+>    Marking the burst index at that moment credits the resize with bytes it did not cause —
+>    the mirror image of the "measured the window instead of the arrival" bug this task
+>    exists to fix, and just as silent. Added a `pty_read` drain before the mark. Validated
+>    separately: this app emits **0 bytes when idle** (asserted), so a post-resize burst is
+>    provably causal rather than chatter. A **negative control** (same measurement against a
+>    killed child MUST time out) is what makes "a repaint arrived" mean anything.
+>
+> 4. **`watch_screen`'s pending-set shape was kept** and is asserted directly: both labels'
+>    first-seen times come from ONE scanning loop, so neither can be a timestamp of when
+>    the harness happened to look.
+>
+> `herdr_cli`/`session_names` are delivered (see `T5d`): delegated to the product's own
+> `app.run_capture` so parent-side resolution and the whole-`HERDR_*` scrub are the
+> product's rules, not a hand-maintained three-name list.
+
 
 **Owner:** P · **Depends on:** T4 · **Blocks:** T11, T12, T13, T14
 
