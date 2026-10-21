@@ -101,7 +101,7 @@ Pty_Driver :: struct {
 	raw : [dynamic]u8,
 
 	bursts  : [dynamic]Burst,
-	t0      : time.Time,
+	t0      : time.Tick, // monotonic; see elapsed_ms
 	written : int, // bytes WE sent: the "no key was pressed" proof (ISC-13)
 
 	termios_before : posix.termios,
@@ -109,6 +109,14 @@ Pty_Driver :: struct {
 
 	exit_status : c.int,
 	has_exit    : bool,
+
+	// Set once a read on the master reports end-of-stream. Every wait loop
+	// must honour it: after the child dies the master reads 0 (or EIO)
+	// forever, so a `while now < deadline` loop that keeps calling read()
+	// becomes a busy-spin that burns a core for the whole timeout and makes a
+	// "timed out" result indistinguishable from a hang. Observed directly:
+	// without this guard the suite never returned at all.
+	eof : bool,
 
 	// The product's own coalescing accounting, driven by this harness so the
 	// evidence string is the product's string.
@@ -207,7 +215,7 @@ pty_spawn :: proc(argv: []string, rows, cols: i32, cwd: string = "") -> (d: ^Pty
 	if cwd_c != nil { free(rawptr(cwd_c)) }
 
 	d.child = pid
-	d.t0 = time.now()
+	d.t0 = time.tick_now()
 	return d, ""
 }
 
@@ -284,10 +292,10 @@ free_cstring_array :: proc(a: [^]cstring) {
 // harness forever when the app is waiting for input, and a spin is the
 // idle-loop the plan forbids. The poll timeout IS the wait.
 pty_read :: proc(d: ^Pty_Driver, wait_ms: f64) -> int {
-	deadline_ms := ms_since(time.now(), wait_ms)
+	deadline_ms := ms_until(d, wait_ms)
 	got := 0
 	for {
-		left_ms := deadline_ms - ms_now()
+		left_ms := deadline_ms - elapsed_ms(d)
 		if left_ms <= 0 { break }
 		fd := posix.pollfd{
 			fd      = d.master,
@@ -306,7 +314,13 @@ pty_read :: proc(d: ^Pty_Driver, wait_ms: f64) -> int {
 		if n == 0 { break }
 		buf : [65536]u8
 		rn := posix.read(d.master, &buf[0], c.size_t(len(buf)))
-		if rn <= 0 { break }
+		if rn <= 0 {
+			// 0 on a pty master means every slave reference is gone OR the
+			// child exited; EIO is what Linux actually returns once the pty
+			// pair is torn down. Either way the stream is over.
+			d.eof = true
+			break
+		}
 		el := elapsed_ms(d)
 		append(&d.bursts, Burst{t_ms = el, len = int(rn)})
 		for i := 0; i < int(rn); i += 1 {
@@ -322,10 +336,13 @@ pty_read :: proc(d: ^Pty_Driver, wait_ms: f64) -> int {
 // Screen, not byte stream — see the header of screen.odin for why the byte
 // stream cannot answer this.
 pty_wait_screen :: proc(d: ^Pty_Driver, needle: string, timeout_ms: f64, pump_ms: f64 = 50) -> f64 {
-	end := ms_now() + timeout_ms
+	end := ms_until(d, timeout_ms)
 	for {
 		if screen_contains(&d.screen, needle) { return elapsed_ms(d) }
-		if ms_now() >= end { return -1 }
+		if over_due(d, end) { return -1 }
+		// Once the stream is over there is no future read that will change
+		// the answer, so stop rather than burn the whole timeout.
+		if d.eof { return -1 }
 		pty_read(d, pump_ms)
 	}
 }
@@ -368,9 +385,9 @@ pty_watch_screen :: proc(d: ^Pty_Driver, labels: []Watch_Label, timeout_ms: f64,
 	for _ in labels { append(&found, false) }
 	remaining := len(labels)
 	seen := make([dynamic]Seen_Label)
-	end := ms_now() + timeout_ms
+	end := ms_until(d, timeout_ms)
 
-	for remaining > 0 && ms_now() < end {
+	for remaining > 0 && !over_due(d, end) {
 		txt_buf : [dynamic]u8
 		screen_text(&d.screen, &txt_buf)
 		now_txt := string(txt_buf[:])
@@ -444,12 +461,22 @@ Resize_Evidence :: struct {
 // visible without parsing content: a new burst after the mark means the app
 // answered.
 pty_resize_latency :: proc(d: ^Pty_Driver, rows, cols: i32, timeout_ms: f64 = 2000) -> Resize_Evidence {
+	// DRAIN FIRST. Anything already sitting in the pty buffer when we mark is
+	// output the app produced BEFORE the resize, and counting it as the
+	// repaint credits the resize with bytes it did not cause — the mirror
+	// image of the "measured the window" bug the python fixed, and just as
+	// silent. (Without this, a wait_screen that returned as soon as its
+	// needle appeared leaves the rest of that frame unread, and the
+	// "latency" comes back at a few hundred microseconds no app can achieve.)
+	// The python's resize_latency has no drain; this port adds one.
+	pty_read(d, 250)
+
 	mark := len(d.bursts)
 	send_ms := elapsed_ms(d)
 	pty_resize(d, rows, cols)
-	end := ms_now() + timeout_ms
+	end := ms_until(d, timeout_ms)
 	ev := Resize_Evidence{rows = rows, cols = cols, ok = false, timed_out = true}
-	for ms_now() < end {
+	for !over_due(d, end) && !d.eof {
 		pty_read(d, 50)
 		if len(d.bursts) > mark {
 			// The FIRST new burst is the repaint arriving. Its own timestamp
@@ -536,21 +563,79 @@ pty_termios_now :: proc(d: ^Pty_Driver) -> (posix.termios, bool) {
 
 // pty_cpu_ticks: utime+stime of the CHILD only, in clock ticks, from /proc.
 //
-// INDEXED FROM THE END OF THE FIELD LIST. Field 2 of /proc/<pid>/stat is
-// `comm`, the process name in parens, and it may contain spaces — counting
-// from the front then shifts every later field by an unknown amount and the
-// "utime" you read is really some other field. Counting back from the end
-// (utime is 15th from the end, stime 14th) is space-independent.
+// THE PYTHON'S INDICES WERE WRONG, AND THIS PORT DOES NOT INHERIT THEM.
+// dev/tui_drive.py:355-366 reads `fields[-15]` and `fields[-14]` with the
+// comment "comm can contain spaces; count from the END so the indexes are
+// stable". The end-indexing instinct is right — a `comm` like
+// `(my session) S` shifts every front-relative index. But the offsets are
+// wrong for a modern 52-field stat line:
+//
+//     utime is FIELD 14  -> index 13 -> **-39** from the end
+//     stime is FIELD 15  -> index 14 -> **-38** from the end
+//     fields[-15] is FIELD 38 = `processor`
+//     fields[-14] is FIELD 39 = `rt_priority`
+//
+// So the python was summing the CPU the process last ran on with its
+// real-time priority. That is not CPU time, and it changes for reasons that
+// have nothing to do with load. An "idle <= 2 ticks" assertion built on it
+// was measuring scheduling placement. This is the same class of defect B9
+// calls out for exit codes: a plausible number taken from the wrong field.
+//
+// THE ROBUST PARSE, which is what procps itself does:
+//   1. comm is wrapped in parens and may contain ANY bytes including ')' —
+//      so take the FIRST '(' and the LAST ')'.
+//   2. Everything after the closing ') ' is a fixed field list that does not
+//      depend on comm at all: rest[0] = state (field 3), so
+//      utime (field 14) is rest[11] and stime (field 15) is rest[12].
+// This is immune to spaces in comm AND to the kernel appending trailing
+// fields, which is exactly what broke the end-index approach.
 pty_cpu_ticks :: proc(d: ^Pty_Driver) -> (i64, bool) {
 	path := fmt.tprintf("/proc/{}/stat", int(d.child))
 	data, ok := read_file_bytes(path)
-	if !ok || len(data) < 40 { return 0, false }
-	fields := split_ws(data)
-	// utime is fields[-15], stime fields[-14]; need at least 15 to exist.
-	if len(fields) < 15 { return 0, false }
-	u := parse_i64(fields[len(fields)-15])
-	s := parse_i64(fields[len(fields)-14])
+	if !ok { return 0, false }
+	u, s, pok := parse_stat_cpu_ticks(data)
+	if !pok { return 0, false }
 	return u + s, true
+}
+
+// parse_stat_cpu_ticks implements the canonical '(' … last ')' anchoring.
+parse_stat_cpu_ticks :: proc(data: []u8) -> (utime: i64, stime: i64, ok: bool) {
+	open_paren := -1
+	for i := 0; i < len(data); i += 1 {
+		if data[i] == '(' { open_paren = i; break }
+	}
+	close_paren := -1
+	i := len(data)
+	for i > 0 {
+		i -= 1
+		if data[i] == ')' { close_paren = i; break }
+	}
+	if open_paren < 0 || close_paren < 0 || close_paren <= open_paren { return 0, 0, false }
+	rest := split_ws(data[close_paren+1:])
+	// rest[0] is state = field 3. utime is field 14 -> rest[11];
+	// stime is field 15 -> rest[12].
+	if len(rest) < 13 { return 0, 0, false }
+	u := parse_i64(rest[11])
+	st := parse_i64(rest[12])
+	if u < 0 || st < 0 { return 0, 0, false }
+	return u, st, true
+}
+
+// pty_cpu_ticks_schedstat reads the same quantity from /proc/<pid>/schedstat,
+// which reports utime/stime directly in NANOSECONDS and needs no field
+// arithmetic at all. Used as an independent cross-check of the parse above:
+// agreement between two different /proc files is evidence neither is being
+// mis-indexed. CLK_TCK is 100 on Linux, so one tick is 10 ms.
+pty_cpu_ticks_schedstat :: proc(pid: posix.pid_t) -> (i64, bool) {
+	data, ok := read_file_bytes(fmt.tprintf("/proc/{}/schedstat", int(pid)))
+	if !ok { return 0, false }
+	f := split_ws(data)
+	if len(f) < 2 { return 0, false }
+	u_ns := parse_i64(f[0])
+	s_ns := parse_i64(f[1])
+	if u_ns < 0 || s_ns < 0 { return 0, false }
+	// 10 ms per tick at CLK_TCK=100.
+	return (u_ns + s_ns) / 10_000_000, true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -596,26 +681,35 @@ pty_close :: proc(d: ^Pty_Driver) {
 // Small utilities (self-contained: this lane owns them)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// All timing in this file is milliseconds on an f64 axis, computed from
-// `time.since` against a captured base Time. `Time + Duration` is not an
-// operation in Odin, so a deadline is "ms since a base" compared numerically
-// rather than a future Time constructed with `+`.
+// All timing in this file is milliseconds on an f64 axis, measured from the
+// driver's monotonic epoch (`time.Tick`, CLOCK_MONOTONIC_RAW on Linux).
+//
+// WHY THIS WAS REWRITTEN TWICE. The first version defined
+//     ms_now() = nanoseconds_since(time.now()) / 1e6
+// which is elapsed-since-itself: identically ~0 forever. Every deadline
+// comparison `ms_now() < end` was therefore always true and `pty_resize_latency`
+// looped until the harness killed it 3m20s later. A clock read must be
+// against something that is NOT the read itself. Using time.Tick (already
+// monotonic, not wall-clock) removes the whole class: there is one epoch per
+// driver and every reading is `tick_diff(epoch, now)`.
 elapsed_ms :: proc(d: ^Pty_Driver) -> f64 {
-	return ms_since(d.t0, 0)
-}
-
-// ms_since: milliseconds elapsed since `base`, plus a constant offset.
-ms_since :: proc(base: time.Time, add: f64) -> f64 {
-	return f64(time.duration_nanoseconds(time.since(base))) / 1e6 + add
-}
-
-ms_now :: proc() -> f64 {
-	return ms_since(time.now(), 0)
+	dur := time.tick_diff(d.t0, time.tick_now())
+	return f64(time.duration_nanoseconds(dur)) / 1e6
 }
 
 // ms_duration turns a millisecond count into a time.Duration for time.sleep.
 ms_duration :: proc(ms: f64) -> time.Duration {
 	return time.Duration(i64(ms * f64(time.Millisecond)))
+}
+
+// ms_until is a deadline expressed in the same axis as elapsed_ms.
+ms_until :: proc(d: ^Pty_Driver, wait_ms: f64) -> f64 {
+	return elapsed_ms(d) + wait_ms
+}
+
+// over_due compares a deadline against the clock.
+over_due :: proc(d: ^Pty_Driver, deadline_ms: f64) -> bool {
+	return elapsed_ms(d) >= deadline_ms
 }
 
 rune_to_utf8 :: proc(r: rune, out: ^[4]u8) -> int {
