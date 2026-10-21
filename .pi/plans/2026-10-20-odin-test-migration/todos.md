@@ -423,7 +423,28 @@ transfer or flagged as a regression. **A drop is a regression, said out loud —
 
 ---
 
-### T3 — Pty FFI + the width-parity table
+### T3 — Pty FFI + the width-parity table  ✅ DONE (899065b + aa339dd)
+
+> **DONE 2026-10-21.** `tests/pty/ffi.odin` + `tests/pty/width_test.odin` + 
+> `tests/pty/ffi_test.odin`. **94 assertions green** (67 width + 27 pty).
+> Two plan corrections found while implementing:
+> 1. The snippet in this task will **not compile**. Two procedures cannot both bind `ioctl`
+>    with different signatures (`Error: Redeclaration of foreign procedure 'ioctl' with
+>    different type signatures`). Bound it ONCE as `ioctl(fd, request, arg: rawptr)`,
+>    which is what C's variadic third argument actually is; `&ws` and `nil` both pass.
+> 2. **Width parity holds for every reachable rune, but the tables are NOT globally equal.**
+>    61,019 codepoints diverge (overwhelmingly unassigned Cn) and **491 assigned** ones
+>    diverge (SOFT HYPHEN, the three Hangul fillers, trigrams, circled numbers). None is
+>    reachable by this project. Rather than leave that as an assumption it is frozen as
+>    data in `DIVERGENT_NOT_REACHED`, with tests asserting the record still diverges and
+>    stays disjoint from `WIDTH_CASES`. No STOP condition was triggered.
+>
+> **ANSWER TO THE OPEN NIX QUESTION — a pty DOES work in the nix sandbox.**
+> Probed with a C program compiled and run *inside* a `nix build` sandbox
+> (`runCommand`, sandbox enabled):
+> `PTY_OK master=3 slave=4` / `WINSZ_OK 24x80` / `CTTY_CHILD_EXIT=0` /
+> `PTMX_OPEN=yes errno=0` / `PTS_DIR=present`.
+> → **the `pty` tier belongs in `nix flake check`, not only in `odinTestsFull`.**
 
 **Owner:** P · **Depends on:** T1 · **Blocks:** T4, and **every rune/character assertion anywhere**
 
@@ -492,7 +513,34 @@ green, or every mismatch is listed and escalated. *ISC-16*
 
 ---
 
-### T4 — The Screen emulator, ported. With its own tests.
+### T4 — The Screen emulator, ported. With its own tests.  ✅ DONE (736d9cc)
+
+> **DONE 2026-10-21.** `tests/pty/screen.odin` + `tests/pty/screen_test.odin`.
+> **73 emulator-only assertions green**, fed raw byte strings — no pty, no app.
+> Ported from `dev/tui_drive.py:55-196`; **not** byte-grepped.
+>
+> All six plan-mandated minimum cases are present (split UTF-8 at every byte
+> boundary; `ESC ( B` / `ESC ) 0` / `ESC # 8` do not smear; OSC does not reach
+> the grid; wide glyph blanks N+1 and the cursor lands at N+2; diff-style stream
+> reconstructs the full row; J/K verbs, and `H` ≡ `f`).
+>
+> Two deliberate divergences from the python, both improvements with a named
+> failure mode, both documented in the file header:
+> 1. **Escape parser state persists across `feed()`.** The python regex `break`-ed
+>    on a truncated escape and dropped the rest of the chunk. A pty fragments a
+>    write at any byte, so that is data loss on a correct stream.
+> 2. **Carry buffer is per-`Screen`**, so two Screens cannot corrupt each other.
+>
+> Four findings came out of writing the tests — all were wrong expectations in
+> the test, not emulator bugs, and are now asserted with the reason inline:
+> **LF alone does not return the column**; **TAB is a flat +8, not a tab-stop
+> snap**; **leading blanks are content** (only the tail is stripped); and
+> **bare `CSI J` is n=1 and therefore clears nothing** in the python, so a
+> test wanting ED-0 must emit the `0`.
+>
+> Size note: `Screen` uses a fixed `[64*256]rune` grid (`MAX_SCREEN_ROWS/COLS`)
+> so it stays off the stack-overflow threshold; a 256x512 grid is 524 KB and the
+> compiler warns per declaration.
 
 **Owner:** P · **Depends on:** T3 · **Blocks:** every pty assertion in T11, T12, T13, T14
 
