@@ -135,6 +135,8 @@ Pty_Driver :: struct {
 // red product test.
 pty_spawn :: proc(argv: []string, rows, cols: i32, cwd: string = "") -> (d: ^Pty_Driver, err: string) {
 	bin := pty_resolve_bin()
+	// `d` is heap-allocated so the child's fork inherits a stable pointer;
+	// the parent must release it in pty_close or every spawn leaks a driver.
 	if !pty_bin_exists(bin) {
 		return nil, fmt.tprintf("binary not found: {}", bin)
 	}
@@ -594,6 +596,7 @@ pty_cpu_ticks :: proc(d: ^Pty_Driver) -> (i64, bool) {
 	data, ok := read_file_bytes(path)
 	if !ok { return 0, false }
 	u, s, pok := parse_stat_cpu_ticks(data)
+	delete(data)
 	if !pok { return 0, false }
 	return u + s, true
 }
@@ -628,6 +631,7 @@ parse_stat_cpu_ticks :: proc(data: []u8) -> (utime: i64, stime: i64, ok: bool) {
 // mis-indexed. CLK_TCK is 100 on Linux, so one tick is 10 ms.
 pty_cpu_ticks_schedstat :: proc(pid: posix.pid_t) -> (i64, bool) {
 	data, ok := read_file_bytes(fmt.tprintf("/proc/{}/schedstat", int(pid)))
+	defer delete(data)
 	if !ok { return 0, false }
 	f := split_ws(data)
 	if len(f) < 2 { return 0, false }
@@ -675,6 +679,7 @@ pty_close :: proc(d: ^Pty_Driver) {
 	posix.close(d.slave)
 	delete(d.raw)
 	delete(d.bursts)
+	free(d)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -722,7 +727,9 @@ rune_to_utf8 :: proc(r: rune, out: ^[4]u8) -> int {
 // /proc/<pid>/stat, which reports a size of 0 even though reading it yields
 // content — so any size-based short-circuit must be avoided.
 read_file_bytes :: proc(path: string) -> ([]u8, bool) {
-	fd := posix.open(th.cstr(path), posix.O_Flags{})
+	cpath := th.cstr(path)
+	defer free(rawptr(cpath))
+	fd := posix.open(cpath, posix.O_Flags{})
 	if int(fd) < 0 { return nil, false }
 	defer posix.close(fd)
 	out : [dynamic]u8

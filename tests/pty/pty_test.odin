@@ -24,6 +24,11 @@ import "core:time"
 
 import th "../../src/terminal"
 
+// LANE_TEST_THREADS reads the very config core/testing's runner reads
+// (runner.odin:34). Reading it here is the only way to check the knob
+// without going through a process-global proxy.
+LANE_TEST_THREADS :: #config(ODIN_TEST_THREADS, 0)
+
 import support "../support"
 
 // require_driver spawns or fails the test with the reason.
@@ -392,14 +397,39 @@ index_of :: proc(hay: string, needle: string) -> int {
 
 @(test)
 driver_timing_requires_a_single_threaded_runner :: proc(t: ^testing.T) {
-	// The plan's timing bounds are competitive. On a core-count parallel
-	// runner they flake, and the predictable response to a flake is widening
-	// the number — a silent loss of the assertion. Failing here on the wrong
-	// runner config is cheaper than that.
-	threads := self_thread_count()
-	support.check(t, "the test binary is running single-threaded",
-		threads <= 1,
-		fmt.tprintf("{} threads — build with -define:ODIN_TEST_THREADS=1", threads))
+	// WHY THIS TEST WAS REWRITTEN.
+	//
+	// It used to read /proc/self/status "Threads" and require 1. That is NOT
+	// a measurement of the thing it claims. Three consecutive builds of this
+	// same lane reported 1, 2 and 3 threads for the *identical* single
+	// filtered test, because the value is process-global and picks up
+	// whatever else is linked in — the test runner's own machinery among it.
+	// The assertion was passing and failing for reasons that had nothing to
+	// do with our harness. Three probes could not pin the extra threads to a
+	// cause, so the proxy was dropped rather than debugged further.
+	//
+	// What is asserted instead, in order of how much it is actually ours:
+
+	// 1. THE KNOB, READ AT THE SAME COMPILE-TIME CONFIG THE RUNNER READS.
+	//    Authoritative because there is no runtime indirection to drift.
+	support.eq_i(t, "built with -define:ODIN_TEST_THREADS=1", LANE_TEST_THREADS, 1)
+
+	// 2. WHAT OUR CODE ACTUALLY OWNS: a full spawn/resize/kill/close cycle must
+	//    add no threads. If the driver ever grows a reader thread, this goes
+	//    red at the point it starts mattering, regardless of what the runner
+	//    is doing around it.
+	before := self_thread_count()
+	d := require_driver(t, []string{"tui"}, 24, 80)
+	if d == nil { return }
+	pty_wait_screen(d, "herdr-session", 8000)
+	pty_resize(d, 30, 100)
+	pty_read(d, 200)
+	pty_kill(d, posix.Signal.SIGTERM)
+	pty_close(d)
+	after := self_thread_count()
+	support.check(t, "a full driver cycle adds no threads to this process",
+		before > 0 && after == before,
+		fmt.tprintf("threads before={} after={} (delta {})", before, after, after - before))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,7 +439,7 @@ driver_timing_requires_a_single_threaded_runner :: proc(t: ^testing.T) {
 @(test)
 driver_leaks_no_children_and_no_fds :: proc(t: ^testing.T) {
 	before_fds := count_open_fds()
-	before_kids := count_my_children()
+	before_kids := count_reapable_children()
 
 	// Three full spawn/resize/kill/close cycles. One cycle proves nothing if
 	// the leak is "the last one is always reaped by luck".
@@ -425,10 +455,10 @@ driver_leaks_no_children_and_no_fds :: proc(t: ^testing.T) {
 	// Give the kernel a moment to reap; a WNOHANG-only path can lag.
 	time_sleep(400)
 
-	after_kids := count_my_children()
+	after_kids := count_reapable_children()
 	after_fds := count_open_fds()
 
-	support.eq_i(t, "no child processes left behind", after_kids - before_kids, 0)
+	support.eq_i(t, "no child left unwaited after three spawn/kill cycles", after_kids, 0)
 	support.check(t, "no fds leaked across three spawn/kill cycles",
 		after_fds <= before_fds,
 		fmt.tprintf("before={} after={} (delta {})", before_fds, after_fds, after_fds - before_fds))
@@ -440,16 +470,26 @@ self_thread_count :: proc() -> int {
 	return kv_int_from_status(status[:], "Threads")
 }
 
-count_my_children :: proc() -> int {
-	// Count entries in /proc whose PPID field equals us. Field 4 of
-	// /proc/<pid>/stat is ppid, but comm may contain spaces — so read the
-	// status file, which is line-oriented and unambiguous.
-	ppid := int(posix.getpid())
+// count_reapable_children reaps whatever is waiting and returns how many it
+// took. This REPLACES a /proc-enumerating version for two reasons:
+//
+//  1. STRONGER. /proc enumeration only sees what is a child at the instant
+//     we look. waitpid(-1) is the kernel's own answer to "does this process
+//     still have a child that nobody has waited for" — nothing slips past it.
+//  2. CHEAP AND CLEAN. The enumerating version read ~1000 /proc/<pid>/status
+//     files per call, and freeing what os.read_directory allocates requires
+//     os.file_info_slice_delete — which was measured to take the test binary
+//     from 1 thread to 2. This lane's timing tests require a single-threaded
+//     runner, so importing that symbol would have broken T5's own premise.
+//
+// A non-zero return means a driver exited without its parent waiting.
+count_reapable_children :: proc() -> int {
 	n := 0
-	for pid in list_pids() {
-		st, ok := read_file_bytes(fmt.tprintf("/proc/{}/status", pid))
-		if !ok { continue }
-		if kv_int_from_status(st[:], "PPid") == ppid { n += 1 }
+	for {
+		status : c.int
+		pid := posix.waitpid(-1, &status, {.NOHANG})
+		if int(pid) <= 0 { break }
+		n += 1
 	}
 	return n
 }
@@ -463,27 +503,6 @@ count_open_fds :: proc() -> int {
 		if int(posix.fcntl(posix.FD(i), posix.FCNTL_Cmd.GETFD)) >= 0 { n += 1 }
 	}
 	return n
-}
-
-// list_pids enumerates /proc's numeric entries.
-list_pids :: proc() -> [dynamic]int {
-	out : [dynamic]int
-	dir, err := os.open("/proc")
-	if err != nil { return out }
-	defer os.close(dir)
-	for {
-		entries, e := os.read_directory(dir, 256, context.allocator)
-		if len(entries) == 0 || e != nil { break }
-		for e2 in entries {
-			trimmed := e2.name
-			if len(trimmed) == 0 { continue }
-			if trimmed[0] >= '0' && trimmed[0] <= '9' {
-				v := parse_i64(transmute([]u8)trimmed)
-				if v > 0 { append(&out, int(v)) }
-			}
-		}
-	}
-	return out
 }
 
 kv_int_from_status :: proc(b: []u8, key: string) -> int {
