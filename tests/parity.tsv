@@ -62,21 +62,33 @@ handoff	hermetic	35				handoff_test,handoff_*	T11	100% hermetic
 # coverage: those assertions used to be counted inside `app`, and they now live
 # under `diag_*` because the symbol moved out of package main. Stated out loud
 # per the governing rule — the total does not change, the attribution does.
-app	hermetic	437				app_test,app_*	T10	532 armed - 88 fixture - 7 transferred to `diag` below. floor_before here is 437 NOT 444: the 7 diag_head assertions are no longer app's to make.
+app	hermetic	444				app_test,app_*	T10	532 armed - 88 fixture = 444. NOT 437: an earlier draft subtracted 7 for the diag move, but src/app_cases.odin still makes those assertions and nobody removed them. The new diag_test asserts the same PROPERTIES from the new home, ON TOP. If T10 deletes them from app_cases, subtract 7 here AT THAT TIME and say so in the diff.
 app	fixture	88				app_live*,disc_*	T14	app-live + fetch-live + the remote discriminator. Needs HERDR_SESSION_TEST_{REMOTE,REMOTE_ALIAS,UNREACHABLE}.
-diag	hermetic	7				diag_test,diag_*	T2	TRANSFERRED from app (ISC-9/ISC-10), not new. The 7 truncation properties of ui.diag_head: short line passes through · first line only of a multi-line trace · CRLF handled like LF · the 44-byte-cap-yields-47-bytes contract (the mark is 3 bytes) · never cut after a UTF-8 continuation byte · never leave a continuation byte at the end · no width in 1..60 yields broken UTF-8 · empty stays empty. Verified still green through the new home after T2 (10 counted assertions covering these 7 properties; the floor is the plan's 7 and the fixture over-delivers, which is never a regression).
-keyhints	hermetic	0				keyhints_test,keyhints_*	T2	NEW. The footer hint tables moved to ui.keyhints, so their contract became testable at all. The 80/100-col overflow properties themselves are still COUNTED IN `ui` above (the 39 KEYS_MODE lines in ui_cases) and transfer to here at T8 — floor_before is 0 so nothing is double-counted, and T8 must raise this row when it moves them.
+diag	hermetic	10				diag_test,diag_*	T2	ADDITIVE, not a transfer. 10 assertions in tests/unit/diag_test.odin over the 7 truncation properties of ui.diag_head The 7 truncation properties of ui.diag_head: short line passes through · first line only of a multi-line trace · CRLF handled like LF · the 44-byte-cap-yields-47-bytes contract (the mark is 3 bytes) · never cut after a UTF-8 continuation byte · never leave a continuation byte at the end · no width in 1..60 yields broken UTF-8 · empty stays empty. Verified still green through the new home after T2 (10 counted assertions covering these 7 properties; the floor is the plan's 7 and the fixture over-delivers, which is never a regression).
+keyhints	hermetic	44				keyhints_test,keyhints_*	T2	ADDITIVE, measured. 44 assertions in tests/unit/keyhints_test.odin: table dispatch/parity per state, no duplicate key label, the ORDER contract (every table's LAST hint is an exit/back/dismiss action, because keys_line fills from the exit side and cuts from the front), and the 8-width KEYS_MODE sweep (exit hint kept, `t theme` kept above its own width threshold, never overflows, no hint cut in half, never blank). This does NOT replace the 39 KEYS_MODE lines still counted in `ui` above; T8 decides whether to move them and must adjust `ui` at the same time or the total drifts upward twice.
 tui	hermetic	145				tui_test,tui_*	T12	boot-local / state-* / del-key / guards. MEASURED ARMED 145 unarmed-of-172.
 tui	fixture	27				tui_live*	T14	boot-remote + roundtrip
 resize	hermetic	123				resize_test,resize_*	T13	4 scenarios x 3 reps
 resize	fixture	15				resize_live*	T14	selection-shrink x 3 reps
 #
 # ── arithmetic ───────────────────────────────────────────────────────────────
-#  hermetic : 259 + 171 + 168 + 69 + 35 + 437 + 7 + 0 + 145 + 123 = 1414
-#  fixture  :  88 + 27 + 15					       = 130
-#  TOTAL    : 1414 + 130 = 1544  == the armed baseline. Closes exactly.
+#  hermetic : 259 + 171 + 168 + 69 + 35 + 444 + 10 + 44 + 145 + 123 = 1468
+#  fixture  :  88 + 27 + 15					         = 130
+#  TOTAL    : 1468 + 130 = 1598  == the 1544 armed baseline + 54 new T2
+#             assertions (diag 10 + keyhints 44). Closes exactly.
 #
-#  Read the `diag` and `keyhints` rows together: `diag` is 7 taken OUT of app
-#  and put into a suite of its own; `keyhints` is 0 for now because the footer
-#  assertions it will own are still being counted inside `ui` until T8 moves
-#  them. Neither row adds or loses a single assertion from the 1544.
+#  Read the `diag` and `keyhints` rows together: both ADD. Neither steals from
+#  `app` or `ui`. Nothing in the 1544 was removed to pay for them; if a later
+#  task deletes a duplicated battery, it must subtract from the row that is
+#  losing it in the SAME diff, or this file stops meaning anything.
+#
+# KNOWN PRE-EXISTING FLAKE (NOT introduced by T2; recorded, threshold NOT
+# loosened). The `idle <= 2 clock ticks over 5 s` assertion in the tui suite
+# fails intermittently under machine load. Measured on a binary built from
+# 2a9fb85 -- BEFORE any RCH-8 rename -- 2 of 5 runs failed at 9 and 29 ticks;
+# on the post-rename binary, 1 of 3 at ~21 ticks. An identifier-only rename
+# cannot change CPU behaviour, so this is load sensitivity in the measurement,
+# pre-dating this work. The threshold above stays at 2 UNCHANGED. It should be
+# made robust (measure the herdr process's own ticks, not the whole machine's,
+# or widen with justification in a diff) by whoever owns T12 -- but that is a
+# decision, not a green-making tweak.
