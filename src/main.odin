@@ -946,7 +946,7 @@ tui_host_line :: proc() -> string {
 		if d.label != "" { name = d.label }
 		one := fmt.tprintf("{} {} {}", name, host_status_word(d.status), n)
 		if d.status != .ok && d.status != .pending && d.detail != "" {
-			one = fmt.tprintf("{} — {}", one, diag_head(d.detail, 44))
+			one = fmt.tprintf("{} — {}", one, ui.diag_head(d.detail, 44))
 		}
 		if out == "" {
 			out = one
@@ -955,24 +955,6 @@ tui_host_line :: proc() -> string {
 		}
 	}
 	return out
-}
-
-// diag_head takes the first line of a multi-line diagnostic and caps it at
-// `max` BYTES cut on a rune boundary, so a truncated accented character cannot
-// leak a replacement glyph into the footer.
-diag_head :: proc(s: string, max: int) -> string {
-	end := len(s)
-	for i := 0; i < len(s); i += 1 {
-		if s[i] == '\n' || s[i] == '\r' { end = i; break }
-	}
-	head := s[:end]
-	if len(head) <= max { return head }
-	cut := max
-	// 0x80..0xBF are UTF-8 continuation bytes: never cut just after one, and never
-	// leave one at the end of the string.
-	for cut > 0 && head[cut-1] & 0xc0 == 0x80 { cut -= 1 }
-	for cut > 0 && cut < len(head) && head[cut] & 0xc0 == 0x80 { cut -= 1 }
-	return fmt.tprintf("{}{}", head[:cut], "…")
 }
 
 tui_state_text :: proc() -> string {
@@ -1136,84 +1118,36 @@ tui_build_theme_rows :: proc() {
 	for r in rows { append(&tui.theme_rows, r) }
 }
 
-// tui_keys is the footer's honest list of what works RIGHT NOW. Anything not
-// listed does nothing, which is what makes the footer a contract instead of
-// decoration.
+// tui_keys is the footer's honest list of what works RIGHT NOW. The tables
+// themselves moved to src/ui/keyhints.odin in Task 2 so their width contract
+// could be unit-tested; this keeps the caller shape and forwards the state the
+// dispatcher used to read out of the global.
 tui_keys :: proc() -> []ui.Key_Hint {
-	#partial switch tui.machine.state {
-	case .mode_selection:
-		return KEYS_MODE[:]
-	case .attach:
-		return KEYS_ATTACH[:]
-	case .delete_session:
-		return KEYS_DELETE[:]
-	case .name_local, .name_remote_named:
-		return KEYS_NAME[:]
-	case .remote_server:
-		return KEYS_PICK[:]
-	case .theme:
-		return KEYS_THEME[:]
-	case .error:
-		return KEYS_ERROR[:]
-	}
-	return KEYS_MODE[:]
+	return ui.key_hints_for(tui.machine.state)
 }
 
-KEYS_MODE : [8]ui.Key_Hint = {
-	ui.Key_Hint{"enter", "new local session"},
-	ui.Key_Hint{"n", "named local"},
-	ui.Key_Hint{"r", "new remote"},
-	ui.Key_Hint{"s", "named remote"},
-	ui.Key_Hint{"a", "attach"},
-	ui.Key_Hint{"d", "delete"},
-	ui.Key_Hint{"t", "theme"},
-	ui.Key_Hint{"esc", "quit"},
+// These are REFERENCES to ui's tables, not copies (`&ui.KEYS_*`, so `KEYS_MODE[:]`
+// below reads the very same memory keyhints.odin owns). One table, one truth:
+// the pre-migration suites in ui_cases.odin still name KEYS_MODE directly, and a
+// copy here would let the two drift apart while both looked green.
+KEYS_MODE   := &ui.KEYS_MODE
+KEYS_ATTACH := &ui.KEYS_ATTACH
+KEYS_DELETE := &ui.KEYS_DELETE
+KEYS_NAME   := &ui.KEYS_NAME
+KEYS_PICK   := &ui.KEYS_PICK
+KEYS_THEME  := &ui.KEYS_THEME
+KEYS_ERROR  := &ui.KEYS_ERROR
+
+// diag_head moved to src/ui/text.odin in Task 2. This is a thin forwarder, not
+// a second implementation: the old suite in src/app_cases.odin still calls the
+// unqualified name, and it must keep passing until its own port (T10) retires
+// it. Deleting the symbol outright would have meant deleting its seven
+// truncation assertions, which is exactly the silent loss the parity rule
+// forbids.
+diag_head :: proc(s: string, max: int) -> string {
+	return ui.diag_head(s, max)
 }
 
-KEYS_ATTACH : [5]ui.Key_Hint = {
-	ui.Key_Hint{"up/down", "select"},
-	ui.Key_Hint{"type", "filter"},
-	ui.Key_Hint{"enter", "attach (existing only)"},
-	ui.Key_Hint{"esc", "back"},
-	ui.Key_Hint{"ctrl-c", "quit"},
-}
-
-KEYS_DELETE : [5]ui.Key_Hint = {
-	ui.Key_Hint{"up/down", "select"},
-	ui.Key_Hint{"type", "filter"},
-	ui.Key_Hint{"enter", "stop + delete"},
-	ui.Key_Hint{"esc", "back"},
-	ui.Key_Hint{"ctrl-c", "quit"},
-}
-
-KEYS_NAME : [4]ui.Key_Hint = {
-	ui.Key_Hint{"type", "A-Z a-z 0-9 . _ -"},
-	ui.Key_Hint{"enter", "create"},
-	ui.Key_Hint{"esc", "back"},
-	ui.Key_Hint{"ctrl-c", "quit"},
-}
-
-KEYS_PICK : [5]ui.Key_Hint = {
-	ui.Key_Hint{"up/down", "select"},
-	ui.Key_Hint{"type", "filter"},
-	ui.Key_Hint{"enter", "choose"},
-	ui.Key_Hint{"esc", "back"},
-	ui.Key_Hint{"ctrl-c", "quit"},
-}
-
-KEYS_THEME : [5]ui.Key_Hint = {
-	ui.Key_Hint{"up/down", "select"},
-	ui.Key_Hint{"type", "filter"},
-	ui.Key_Hint{"enter", "apply theme"},
-	ui.Key_Hint{"esc", "back"},
-	ui.Key_Hint{"ctrl-c", "quit"},
-}
-
-KEYS_ERROR : [3]ui.Key_Hint = {
-	ui.Key_Hint{"enter", "dismiss"},
-	ui.Key_Hint{"esc", "dismiss"},
-	ui.Key_Hint{"ctrl-c", "quit"},
-}
 
 // ── the loop ─────────────────────────────────────────────────────────────
 
