@@ -176,11 +176,15 @@ ensure_tally :: proc(t: ^testing.T, g: ^Group) {
 	// exist. It must never fault (core:testing runs it as the last thing that
 	// will ever run for this test) and it must not allocate, so it reads a
 	// pointer we hand it rather than closing over anything.
-	testing.cleanup(t, tally_cleanup, transmute(rawptr)(g))
+	// cast, not transmute: this is pointer -> pointer, which is exactly what
+	// cast permits and vet endorses. `transmute` is for cases the type system
+	// cannot justify; here it can, and using it needfully silences vet's check
+	// for the genuinely unsafe conversions elsewhere.
+	testing.cleanup(t, tally_cleanup, cast(rawptr)(g))
 }
 
 tally_cleanup :: proc(raw: rawptr) {
-	g := transmute(^Group)(raw)
+	g := cast(^Group)(raw)
 	if g == nil { return }
 	fmt.printfln("HS_TALLY {} pass={} fail={} skip={}",
 		group_name(g),

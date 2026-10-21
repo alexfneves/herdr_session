@@ -22,6 +22,50 @@ import app "../../src/app"
 import ui "../../src/ui"
 import support "../support"
 
+// The dispatcher must cover EVERY value of app.State, named explicitly here.
+//
+// key_hints_for uses a #partial switch, so a NEW state is a compile error --
+// good -- but a state that silently falls through to the KEYS_MODE fallback is
+// not. Naming each state in the test is what makes "we added a mode and its
+// footer is wrong" a red assertion rather than a footer that shows the wrong
+// keys until a human notices. This is also why `app` is imported: the test
+// asserts against the product's own enum, not a list the test invented.
+@(test)
+keyhints_covers_every_declared_app_state :: proc(t: ^testing.T) {
+	states : []app.State = {
+		app.State.mode_selection,
+		app.State.name_local,
+		app.State.remote_server,
+		app.State.name_remote_named,
+		app.State.attach,
+		app.State.delete_session,
+		app.State.theme,
+		app.State.error,
+	}
+	missing := ""
+	for st in states {
+		if len(ui.key_hints_for(st)) == 0 {
+			if missing == "" { missing = fmt.tprintf("{}", st) }
+			else { missing = fmt.tprintf("{}, {}", missing, st) }
+		}
+	}
+	support.check(t, "every declared app.State yields a usable hint table",
+		missing == "", fmt.tprintf("states with no hints: '{}'", missing))
+
+	// And every declared table's state is one the dispatcher knows about, so
+	// the two lists cannot drift apart in either direction.
+	declared := 0
+	for th in ui.all_hint_tables() {
+		found := false
+		for st in states { if st == th.state { found = true; break } }
+		support.check(t, fmt.tprintf("table '{}' declares a state the dispatcher knows", th.name),
+			found, "")
+		declared += 1
+	}
+	support.eq_i(t, "the number of declared tables equals the number of app.States",
+		declared, len(states))
+}
+
 // every state dispatches to a non-empty table
 @(test)
 keyhints_every_state_returns_a_nonempty_table :: proc(t: ^testing.T) {

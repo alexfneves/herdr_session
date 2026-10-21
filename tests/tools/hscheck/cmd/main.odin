@@ -89,7 +89,7 @@ main :: proc() {
 		// stale file we would validate the last run, not this one — and a suite
 		// that crashed before writing would look green on someone else's numbers.
 		os.remove(report_json)
-		exit := hc.spawn_and_capture(s.binary, out_log, err_log, env)
+		sp := hc.spawn_and_capture(s.binary, out_log, err_log, env, a.timeout_ms)
 
 		out_text := read_text(out_log)
 		err_text := read_text(err_log)
@@ -101,21 +101,46 @@ main :: proc() {
 			log_text = combined,
 			registered = total,
 			have_reg = have,
-			run_ok = exit >= 0,
-			exit = int(exit),
+			run_ok = sp.started && !sp.timed_out,
+			exit = int(sp.exit),
 		}
 		v := hc.evaluate_suite(s, ev)
-		if exit != 0 && hc.verdict_ok(&v) {
+		v.timed_out = sp.timed_out
+		v.elapsed_ms = sp.elapsed_ms
+
+		// Rule 9 -- the suite ran out of time. Checked BEFORE anything else is
+		// reported, because a timed-out suite's counts are not counts at all:
+		// they are whatever happened to be emitted before we stopped waiting.
+		// Saying "10 assertions passed" for a truncated run would be a lie
+		// dressed as evidence.
+		if sp.timed_out {
+			hc.clear_problems(&v)
+			hc.add_problem(&v, fmt.tprintf(
+				"TIMEOUT after {} ms (limit {} ms) -- the suite never finished, so NOTHING " +
+				"about its assertion counts is meaningful. It was sent SIGTERM and then " +
+				"SIGKILL to its whole process group so no child of it survives this gate. " +
+				"Killed outright: {}. Partial log: {}",
+				sp.elapsed_ms, a.timeout_ms, sp.killed, out_log))
+		}
+
+		if sp.exit != 0 && !sp.timed_out && hc.verdict_ok(&v) {
 			// A non-zero exit with no rule tripped is its own problem: the suite
 			// died somewhere the ledger did not record.
-			hc.add_problem(&v, fmt.tprintf("suite binary exited {} — a non-zero exit with no "+
-				"counted failure means the harness broke, not that an assertion failed", exit))
+			hc.add_problem(&v, fmt.tprintf("suite binary exited {} -- a non-zero exit with no "+
+				"counted failure means the harness broke, not that an assertion failed", sp.exit))
 		}
 		_ = succ
 
-		fmt.printfln("-- {} (tier={}, floor={})", s.name, s.tier, s.floor)
+		fmt.printfln("-- {} (tier={}, floor={}, elapsed={}ms)", s.name, s.tier, s.floor, sp.elapsed_ms)
 		fmt.printfln("   registered={} pass={} fail={} skip={} exit={}",
 			v.registered, v.pass, v.fail, v.skip, v.exit)
+		// Show what the number is MADE OF. A bare count cannot be audited; the
+		// group list makes "is this even my suite's number?" answerable at a
+		// glance instead of after a debugging session.
+		fmt.printfln("   groups claimed by this row and present: {}", v.claimed_groups)
+		if v.unclaimed_groups != "(none)" {
+			fmt.printfln("   groups in this log NOT claimed by this row: {}", v.unclaimed_groups)
+		}
 
 		if len(v.problems) == 0 {
 			fmt.printfln("   [PASS] {} — {} assertions against a floor of {}", s.name, v.pass, s.floor)

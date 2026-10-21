@@ -1,7 +1,5 @@
 package hscheck
 
-import "core:fmt"
-import "core:strings"
 
 import support "../../support"
 

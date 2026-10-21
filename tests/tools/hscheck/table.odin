@@ -1,7 +1,6 @@
 package hscheck
 
 import "core:fmt"
-import "core:os"
 import "core:strings"
 
 import support "../../support"
@@ -31,13 +30,25 @@ Cmd_Args :: struct {
 	allow_skip : bool,
 	help       : bool,
 	unknown    : [dynamic]string,
+	// Per-suite wall-clock limit. A gate with no bound on its child is a gate
+	// that can hang CI indefinitely; the timeout is not a convenience, it is
+	// what makes "stuck" distinguishable from "working".
+	timeout_ms : i64,
 }
+
+// DEFAULT_TIMEOUT_MS is deliberately generous (10 min) rather than tight. The
+// point is not to police fast suites, it is to guarantee termination. A limit
+// tight enough to catch a slow suite is a limit that fails a suite under load
+// for reasons unrelated to correctness -- and the dead-host tests already run
+// close to 6.5 s each. Generous but BOUNDED beats exact but sometimes wrong.
+DEFAULT_TIMEOUT_MS :: 600_000
 
 parse_args :: proc(args: []string) -> Cmd_Args {
 	a : Cmd_Args = {}
 	a.parity = "tests/parity.tsv"
 	a.tier = "all"
 	a.report_dir = "hs-reports"
+	a.timeout_ms = DEFAULT_TIMEOUT_MS
 	for x in args {
 		if x == "--help" || x == "-h" { a.help = true
 		} else if starts_with(x, "--parity=") { a.parity = x[len("--parity="):]
@@ -45,6 +56,7 @@ parse_args :: proc(args: []string) -> Cmd_Args {
 		} else if starts_with(x, "--tier=") { a.tier = x[len("--tier="):]
 		} else if starts_with(x, "--report-dir=") { a.report_dir = x[len("--report-dir="):]
 		} else if x == "--allow-skip" { a.allow_skip = true
+		} else if starts_with(x, "--timeout=") { a.timeout_ms = parse_ms(x[len("--timeout="):])
 		} else { append(&a.unknown, x) }
 	}
 	return a
@@ -157,6 +169,7 @@ resolve_suites :: proc(
 			allow_skip = allow_skip,
 			notes = row.notes,
 			report_json = report,
+			claims = row.files,
 		})
 	}
 	return suites, problems
@@ -228,4 +241,25 @@ ledger_selfcheck :: proc() -> [dynamic]string {
 			"can be trusted for parity", a.pass, a.fail, a.skip, b.pass, b.fail, b.skip))
 	}
 	return out
+}
+
+// parse_ms accepts "90s", "1500ms", or a bare number of milliseconds.
+// A non-positive or unparseable value falls back to the default rather than to
+// zero: a typo in a timeout must not turn into "kill everything instantly",
+// which would look like a suite that fails for a reason it does not have.
+parse_ms :: proc(s: string) -> i64 {
+	if len(s) == 0 { return DEFAULT_TIMEOUT_MS }
+	mult : i64 = 1
+	body := s
+	if len(s) > 2 && s[len(s)-2:] == "ms" { mult = 1; body = s[:len(s)-2]
+	} else if len(s) > 1 && s[len(s)-1] == 's' { mult = 1000; body = s[:len(s)-1] }
+	n : i64 = 0
+	digits := 0
+	for i := 0; i < len(body); i += 1 {
+		if body[i] < '0' || body[i] > '9' { return DEFAULT_TIMEOUT_MS }
+		n = n * 10 + i64(body[i] - '0')
+		digits += 1
+	}
+	if digits == 0 { return DEFAULT_TIMEOUT_MS }
+	return n * mult
 }

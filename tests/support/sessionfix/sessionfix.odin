@@ -132,14 +132,15 @@ begin :: proc(t: ^testing.T, label: string) -> Scratch {
 	// no claim on the namespace and must not run a teardown that acts on a
 	// snapshot it never validly took.
 	if s.before.ok {
-		testing.cleanup(t, teardown_cb, transmute(rawptr)(&s))
+		// cast, not transmute: pointer -> pointer (see ledger.odin).
+	testing.cleanup(t, teardown_cb, cast(rawptr)(&s))
 		s.armed = true
 	}
 	return s
 }
 
 teardown_cb :: proc(raw: rawptr) {
-	s := transmute(^Scratch)(raw)
+	s := cast(^Scratch)(raw)
 	if s == nil { return }
 	end(s)
 }

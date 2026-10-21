@@ -71,6 +71,12 @@ Suite :: struct {
 	// built without it simply has no report, and Rule 2 says so rather than
 	// inventing a registered count.
 	report_json : string,
+	// claims is the parity row's `files` column: the ledger GROUPS this suite
+	// owns. Every assertion count and every rule-7 marker is attributed through
+	// this BEFORE it is charged to this suite. See claims.odin for why the
+	// unattributed case must never be folded in -- that is the hole that let
+	// one suite's printf fallout fail another suite's gate.
+	claims : string,
 }
 
 // Verdict :: the result of checking one suite. `problems` collects EVERY rule
@@ -85,10 +91,27 @@ Verdict :: struct {
 	problems : [dynamic]string,
 	ran      : bool,
 	exit     : int,
+	// Attribution, so a report can show WHAT a number is made of. A count
+	// with no stated provenance is not evidence.
+	claimed_groups   : string,
+	unclaimed_groups : string,
+	notes            : string,
+	// Rule 9 — the suite ran out of time. Distinct from a failure: nothing
+	// was asserted about the result, only that we stopped waiting for it.
+	timed_out  : bool,
+	elapsed_ms : i64,
 }
 
 verdict_ok :: proc(v: ^Verdict) -> bool {
 	return len(v.problems) == 0
+}
+
+// clear_problems drops prior findings. Used only when a later rule invalidates
+// them entirely: on a timeout, "10 assertions passed" is not a partially
+// useful fact, it is a meaningless one, and leaving it in the report next to
+// the timeout invites someone to read it as progress.
+clear_problems :: proc(v: ^Verdict) {
+	clear(&v.problems)
 }
 
 add_problem :: proc(v: ^Verdict, msg: string) {
@@ -216,16 +239,46 @@ evaluate_suite :: proc(s: Suite, ev: SuiteEvidence) -> Verdict {
 
 	// Rule 3 — a tally must exist.
 	rows := parse_tallies(ev.log_text)
-	tallies := max_by_group(rows[:])
-	p, f, sn := fold_total(tallies[:])
+	all_tallies := max_by_group(rows[:])
+
+	// SCOPE THE NUMBERS TO THIS ROW'S CLAIMED GROUPS.
+	//
+	// Without this, one binary holding many groups pointed at one row makes
+	// that row's number a sum of other suites' assertions, and a floor is
+	// then compared against a number that has nothing to do with the suite it
+	// names. Every claim in this table is only as good as the attribution
+	// behind it.
+	claimed := filter_claimed_tallies(all_tallies[:], s.claims)
+	my_groups := groups_of(claimed[:])
+	seen_groups := groups_of(all_tallies[:])
+	not_mine := subtract_groups(seen_groups[:], my_groups[:])
+
+	p, f, sn := fold_total(claimed[:])
 	v.pass = p
 	v.fail = f
 	v.skip = sn
+	v.claimed_groups = join_groups(my_groups[:])
+	v.unclaimed_groups = join_groups(not_mine[:])
 
-	if len(tallies) == 0 {
+	if len(all_tallies) == 0 {
 		add_problem(&v, "NO HS_TALLY LINE in the log — the ledger never recorded an " +
 			"assertion. A suite that ran to completion without emitting one asserted " +
 			"nothing; absence is treated as failure, not as pass")
+		return v
+	}
+
+	// Rule 3b — the row must actually OWN something in this log.
+	//
+	// A typo in the `files` column otherwise produces a suite that runs, has
+	// tallies, and scores 0 of its own -- and against a floor of 0 it would
+	// pass. That is the silent-empty-suite failure mode, arriving from the
+	// other direction.
+	if len(claimed) == 0 {
+		add_problem(&v, fmt.tprintf(
+			"this parity row claims NO group present in the log. Groups seen: {}. " +
+			"Row claims: {}. A mis-typed `files` column makes a suite silently score " +
+			"zero of its own assertions -- refuse rather than score it",
+			join_groups(seen_groups[:]), if_empty(s.claims)))
 		return v
 	}
 
@@ -250,15 +303,121 @@ evaluate_suite :: proc(s: Suite, ev: SuiteEvidence) -> Verdict {
 			p, s.floor, s.floor - p))
 	}
 
-	// Rule 7 — printf fallout.
-	if support.has_fallout(ev.log_text) {
+	// Rule 7 — printf fallout, SCOPED TO THIS SUITE'S CLAIMED GROUPS.
+	//
+	// Previously this scanned the whole log, so a `%!` inside
+	// theme_hygiene_test failed the `state` suite's gate. A rule that fails
+	// the wrong suite is worse than no rule: it teaches people to distrust a
+	// green/red signal rather than to fix the bug. The theme bug is real and
+	// is reported separately, under its OWN group, where it belongs.
+	fallout_claimed := fallout_for_groups(ev.log_text, my_groups[:])
+	if fallout_claimed.count > 0 {
 		add_problem(&v, fmt.tprintf(
-			"{} printf format-fallout marker(s) in the log — a mistyped verb produces a " +
-			"plausible line whose NUMBERS are wrong, which is the worst possible failure " +
-			"mode for a timing claim", support.found_in(ev.log_text)))
+			"{} printf format-fallout marker(s) in THIS suite's lines — a mistyped verb " +
+			"produces a plausible line whose NUMBERS are wrong, which is the worst " +
+			"possible failure mode for a timing claim. First offender: {}", fallout_claimed.count,
+			fallout_claimed.first))
+	}
+	// Foreign fallout is surfaced, not charged. Visible, but it does not make
+	// this suite red.
+	fallout_other := fallout_except_groups(ev.log_text, my_groups[:])
+	if fallout_other.count > 0 {
+		v.notes = fmt.tprintf("{} note: {} format-fallout marker(s) in this log belong to " +
+			"groups this row does NOT claim ({}) -- reported against them, not against " +
+			"this suite. First: {}", v.notes, fallout_other.count,
+			fallout_other.groups, fallout_other.first)
 	}
 
 	return v
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group filtering over tallies and log lines
+// ─────────────────────────────────────────────────────────────────────────────
+
+FalloutReport :: struct {
+	count  : int,
+	first  : string,
+	groups : string,
+}
+
+filter_claimed_tallies :: proc(t: []TallyRow, spec: string) -> [dynamic]TallyRow {
+	claims := split_claims(spec, context.temp_allocator)
+	out : [dynamic]TallyRow = {}
+	for r in t {
+		if group_claimed(claims[:], r.group) { append(&out, r) }
+	}
+	return out
+}
+
+groups_of :: proc(t: []TallyRow) -> [dynamic]string {
+	out : [dynamic]string = {}
+	for r in t { append_if_absent(&out, r.group) }
+	return out
+}
+
+subtract_groups :: proc(a: []string, b: []string) -> [dynamic]string {
+	out : [dynamic]string = {}
+	for x in a {
+		found := false
+		for y in b { if x == y { found = true; break } }
+		if !found { append(&out, x) }
+	}
+	return out
+}
+
+// fallout_for_groups counts `%!` markers ONLY on lines attributed to `groups`.
+fallout_for_groups :: proc(log: string, groups: []string) -> FalloutReport {
+	rep : FalloutReport = {}
+	gs : [dynamic]string = {}
+	for bad in support.scan_lines(log) {
+		g := group_of_line(bad.line)
+		if len(g) == 0 { continue }
+		hit := false
+		for q in groups { if q == g { hit = true; break } }
+		if !hit { continue }
+		rep.count += bad.occurs
+		append_if_absent(&gs, g)
+		if len(rep.first) == 0 {
+			rep.first = fmt.tprintf("line {} [{}]: {}", bad.line_no, g, clip(bad.line, 140))
+		}
+	}
+	rep.groups = join_groups(gs[:])
+	return rep
+}
+
+// fallout_except_groups counts markers on lines NOT attributed to `groups` --
+// including unattributable ones, so nothing is simply dropped.
+fallout_except_groups :: proc(log: string, groups: []string) -> FalloutReport {
+	rep : FalloutReport = {}
+	gs : [dynamic]string = {}
+	for bad in support.scan_lines(log) {
+		g := group_of_line(bad.line)
+		hit := false
+		if len(g) > 0 {
+			for q in groups { if q == g { hit = true; break } }
+		}
+		if hit { continue }
+		rep.count += bad.occurs
+		label := g
+		if len(label) == 0 { label = "<unattributed>" }
+		append_if_absent(&gs, label)
+		if len(rep.first) == 0 {
+			rep.first = fmt.tprintf("line {} [{}]: {}", bad.line_no, label, clip(bad.line, 140))
+		}
+	}
+	rep.groups = join_groups(gs[:])
+	return rep
+}
+
+clip :: proc(s: string, n: int) -> string {
+	if len(s) <= n { return s }
+	return fmt.tprintf("{}…", s[:n])
+}
+
+if_empty :: proc(s: string) -> string {
+	if len(s) == 0 { return "(empty)" }
+	return s
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
