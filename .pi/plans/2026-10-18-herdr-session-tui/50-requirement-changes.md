@@ -387,3 +387,40 @@ So the plan does **not** need to "finish" RCH-3/4 — only to **keep parity** wi
 ## Migration rule that matters more than the layout
 > **Assertion-count parity per suite.** Port one suite, count before/after, commit. Fewer assertions
 > after = **regression**, said out loud. Plus: guard against `core:testing` scoring **0 tests as a pass**.
+
+---
+
+# RCH-8 — Migration blocker: `package terminal` collides with `core:terminal`
+
+**Found by Agent S during T1/T2; independently reproduced by the orchestrator** on the committed tree with
+`odin build -build-mode:test` of a probe linking `core:testing` + our `app` package:
+
+```
+share/core/terminal/internal_os.odin(4:1) Error: Duplicate declaration of 'package terminal'
+	A package name must be unique
+	There is no relation between a package name and the directory that contains it, so they can be completely different
+src/terminal/handoff.odin(1:1) found at previous location
+```
+
+**Chain:** `core:testing` → `core:log` → `core:terminal`. Any test binary that links `app`/`ui`
+(transitively `src/terminal`) **cannot link at all**. Import aliasing does **not** fix it — the
+**package clause itself** must change.
+
+**Blast radius without the fix:** T6–T14 (every suite port) plus T2's own unit tests. Would have stalled
+the entire migration cold.
+
+## DECISION (orchestrator): APPROVED — rename the package identifier only
+
+`package terminal` → **`package termhandoff`**, mechanical:
+- `src/terminal/handoff.odin`, `src/terminal/resize.odin` — the clause only
+- `src/app/{exec,herdr,fetch}.odin`, `src/main.odin` — import alias + `terminal.` references
+
+**Why this does NOT violate RCH-7's "no folder reorg" pin:**
+- Directory stays `src/terminal/`
+- Import paths stay `"../terminal"`
+- Only the **package identifier** changes — and the compiler itself states the package name and the
+  directory are unrelated. **This is a test-enabling rename, not a layout refactor.**
+
+**Approved for Agent S to apply directly** (S verified it on a worktree copy: product builds; a test
+binary importing `app` passes; importing `ui` passes), with a temporary lane extension to
+`src/terminal/**` and `src/app/{exec,herdr,fetch}.odin`. No other agent is concurrently writing there.

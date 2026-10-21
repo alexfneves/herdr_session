@@ -199,3 +199,21 @@ All of these were paid for during T6.1/T6.2 on **odin dev-2026-09**, against the
 - **Odin cannot parse an inline composite literal as a `for … in` expression**:
   `for s in []State{.a, .b} {` is a syntax error. Bind the slice to a name
   first. Two separate encounters in one file; both were the same cause.
+
+## Odin test-migration traps (Agent S, T1 — all cost real time)
+1. **`@fini` NEVER runs in a `-build-mode:test` binary** — the runner exits without unwinding. A ledger
+   relying on it silently emits nothing. Use `testing.cleanup`.
+2. **A heap-allocated global ledger segfaults** — allocated against the first test's context allocator
+   and freed when that test ends, leaving `^Group` pointers dangling in later cleanups. Must be a
+   **static global**.
+3. **`ODIN_TEST_JSON_REPORT` is a `#config` — COMPILE-TIME, not an env var.** Setting it in the
+   child's env does nothing; the binary was built with `""` baked in and writes no report. The report
+   path is a property of the **build**, so the nix wiring must bake it per-suite and tell the gate
+   where to look.
+4. `fmt.println` is the **variadic print** — `fmt.println("{} x", y)` prints a literal `{}`.
+   Format strings need `fmt.printfln`.
+5. `cast[T]x` is **not this Odin's cast** — use `T(x)` or `transmute(T)(x)`.
+6. `[^]cstring` has no backing memory until assigned from an allocated array — build a
+   `[dynamic]cstring` **before `fork()`** and transmute, because the child must not allocate.
+7. **bash:** `local a="$1" b="$a/x"` trips `set -u` — every word of a `local` line expands **before**
+   any assignment. Declare them separately.
