@@ -56,12 +56,15 @@ package pty
 import "core:c"
 import "core:fmt"
 import "core:mem"
+import "core:strings"
+import "core:encoding/json"
 import "core:sys/posix"
 import "core:os"
 import "core:time"
 import "core:unicode/utf8"
 
 import th "../../src/terminal"
+import app "../../src/app"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -661,6 +664,98 @@ pty_product_evidence_format :: proc() -> string {
 	th.note_resize(&c)
 	th.note_paint(&c)
 	return th.summary(&c)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// herdr_cli / session_names — the CLI side of the driver
+// (tui_drive.py:394-409). T11-T14 read session state through these.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Herdr_Cli_Result :: struct {
+	code      : i32,
+	stdout    : string,
+	stderr    : string,
+	spawned   : bool,
+	timed_out : bool,
+}
+
+// pty_herdr_cli runs the `herdr` CLI with our variables removed.
+//
+// DELEGATED to the product's own app.run_capture rather than porting the
+// python's subprocess.run, because run_capture already honours the two
+// properties this lane must not get wrong:
+//   1. the program is resolved IN THE PARENT, so PATH is searched against
+//      the scrubbed environment and not our inherited one (the product
+//      learned that the hard way; execvp would silently defeat the scrub);
+//   2. stdout and stderr stay SEPARATE — herdr's error JSON lands on
+//      stderr, and merging them (or piping through 2>&1) corrupts the parse.
+//
+// The python pops exactly three names (HERDR_ENV, HERDR_SESSION,
+// HERDR_SOCKET_PATH). child_environment() drops the WHOLE HERDR_*
+// namespace, which is what the product actually does. Using the product's
+// scrub means the harness cannot drift from the product; a hand-maintained
+// three-name list is precisely the thing that goes stale the day a fourth
+// HERDR_ variable appears.
+pty_herdr_cli :: proc(args: []string, timeout: time.Duration = 15 * time.Second) -> Herdr_Cli_Result {
+	argv := make([]string, len(args) + 1)
+	argv[0] = "herdr"
+	for i := 0; i < len(args); i += 1 { argv[i+1] = args[i] }
+	defer delete(argv)
+
+	c := app.run_capture(argv, timeout)
+	r := Herdr_Cli_Result{
+		code      = c.code,
+		spawned   = c.spawned,
+		timed_out = c.timed_out,
+	}
+	// Copied out before the Capture's own buffers are released.
+	if len(c.out) > 0 { r.stdout = strings.clone(string(c.out[:])) }
+	if len(c.err) > 0 { r.stderr = strings.clone(string(c.err[:])) }
+	return r
+}
+
+Session_Entry :: struct {
+	name : string `json:"name"`,
+}
+
+Sessions_Doc :: struct {
+	sessions : []Session_Entry `json:"sessions"`,
+}
+
+// pty_session_names returns every session name, sorted. Returns nil (NOT an
+// empty slice pretending to be a result) when the CLI failed, so a caller can
+// tell "no sessions" from "could not ask".
+pty_session_names :: proc() -> ([]string, bool) {
+	r := pty_herdr_cli([]string{"session", "list", "--json"})
+	if !r.spawned { return nil, false }
+	if r.code != 0 || len(r.stdout) == 0 { return nil, false }
+
+	doc : Sessions_Doc
+	if err := json.unmarshal_string(r.stdout, &doc); err != nil {
+		return nil, false
+	}
+	out : [dynamic]string
+	for e in doc.sessions {
+		append(&out, strings.clone(e.name))
+	}
+	insertion_sort_strings(out[:])
+	return out[:], true
+}
+
+// insertion_sort_strings — deliberately hand-rolled. core:sort wants a
+// sort.Interface, which is more ceremony than a list of session names
+// deserves, and the lists here are small enough that asymptotics are
+// irrelevant. Sortedness is asserted by a test, not assumed.
+insertion_sort_strings :: proc(xs: []string) {
+	for i := 1; i < len(xs); i += 1 {
+		j := i
+		for j > 0 && xs[j-1] > xs[j] {
+			tmp := xs[j-1]
+			xs[j-1] = xs[j]
+			xs[j] = tmp
+			j -= 1
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

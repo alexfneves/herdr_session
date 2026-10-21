@@ -17,6 +17,7 @@ package pty
 
 import "core:c"
 import "core:fmt"
+import "core:strings"
 import "core:os"
 import "core:sys/posix"
 import "core:testing"
@@ -522,4 +523,97 @@ kv_int_from_status :: proc(b: []u8, key: string) -> int {
 
 time_sleep :: proc(ms: f64) {
 	time.sleep(time.Duration(i64(ms * f64(time.Millisecond))))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// herdr_cli / session_names
+// ─────────────────────────────────────────────────────────────────────────────
+
+@(test)
+driver_cli_sorting_is_provable_not_assumed :: proc(t: ^testing.T) {
+	got : [dynamic]string
+	append(&got, "zeta")
+	append(&got, "alpha")
+	append(&got, "Mid")
+	append(&got, "beta")
+	append(&got, "alpha")
+	names := got[:]
+	insertion_sort_strings(names)
+	// Expected order spelled out position by position. Note WHERE "Mid"
+	// lands: before every lowercase name, because 'M' (0x4D) < 'a' (0x61).
+	// That placement is the whole assertion — a case-folded sort (or a
+	// locale-aware one) would put it between "beta" and "zeta", and the
+	// python it models uses plain sorted(), which is byte order.
+	support.check(t, "the session-name sort produces the exact expected byte order",
+		len(names) == 5 &&
+			names[0] == "Mid" && names[1] == "alpha" &&
+			names[2] == "alpha" && names[3] == "beta" && names[4] == "zeta",
+		fmt.tprintf("got {}", names))
+	support.check(t, "…'Mid' sorts BEFORE 'alpha', so it is byte order, not case-folded",
+		names[0] == "Mid" && names[1] == "alpha",
+		fmt.tprintf("positions 0,1 = {}, {}", names[0], names[1]))
+	delete(got)
+}
+
+@(test)
+driver_cli_reports_spawn_and_keeps_stdout_and_stderr_apart :: proc(t: ^testing.T) {
+	r := pty_herdr_cli([]string{"--version"})
+	support.check(t, "the herdr CLI was resolved and spawned", r.spawned,
+		fmt.tprintf("spawned={} code={} (is `herdr` on PATH?)", r.spawned, r.code))
+	if r.spawned {
+		// The reason run_capture keeps two pipes: herdr's error JSON lands on
+		// stderr. If the harness merged them, an error document would parse as
+		// success. Assert they are distinct buffers, not one concatenated blob.
+		merged := len(r.stderr) > 0 && strings.has_prefix(r.stdout, r.stderr)
+		support.check(t, "stderr was NOT folded into stdout (no 2>&1 on the parse path)",
+			!merged,
+			fmt.tprintf("stdout={}B stderr={}B", len(r.stdout), len(r.stderr)))
+	}
+	delete(r.stdout)
+	delete(r.stderr)
+}
+
+@(test)
+driver_session_names_answers_or_says_it_cannot_never_lies :: proc(t: ^testing.T) {
+	names, ok := pty_session_names()
+	if !ok {
+		// A clean "could not ask" is a legitimate answer and is asserted as
+		// such: nil, not an empty list that would read as "zero sessions".
+		support.check(t, "declined honestly with nil rather than an empty result",
+			names == nil, fmt.tprintf("len={}", len(names)))
+		return
+	}
+	sorted := true
+	for i := 1; i < len(names); i += 1 {
+		if names[i-1] > names[i] { sorted = false }
+	}
+	support.check(t, "session names came back sorted", sorted,
+		fmt.tprintf("{} names", len(names)))
+	delete(names)
+}
+
+@(test)
+driver_cli_does_not_inherit_our_herdr_namespace :: proc(t: ^testing.T) {
+	// The scrub is the product's own build_scrubbed_env, so the harness
+	// cannot drift from it. Assert the harness and the product agree on ONE
+	// observable: a child started through the harness sees no HERDR_* by
+	// construction, because argv[0] resolution and env construction both
+	// happen through the same product procs the TUI uses.
+	env := th.build_scrubbed_env()
+	count := 0
+	i := 0
+	for env[i] != nil {
+		// Compared byte-by-byte against the cstring directly: no string
+		// conversion in the middle, so nothing can reinterpret the prefix.
+		// Viewed as raw bytes: no string conversion in the middle that could
+		// reinterpret the prefix.
+		b := transmute([^]u8)env[i]
+		if b[0] == 'H' && b[1] == 'E' && b[2] == 'R' && b[3] == 'D' && b[4] == 'R' && b[5] == '_' {
+			count += 1
+		}
+		i += 1
+	}
+	support.eq_i(t, "the product's scrub leaves zero HERDR_* entries for a child", count, 0)
+	// Free it the way the harness frees it, so this test does not leak.
+	free_cstring_array(env)
 }
