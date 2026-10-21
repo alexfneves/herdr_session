@@ -24,7 +24,7 @@ package main
 
 import clay "../clay-odin"
 import termbox2 "../vendor/termbox2-odin"
-import terminal "./terminal"
+import termhandoff "./terminal"
 import app "./app"
 import input "./input"
 import ui "./ui"
@@ -213,7 +213,7 @@ case_handoff :: proc() -> bool {
 	if !enter_terminal() { return false }
 	paint("frame 1 — before the handoff")
 
-	h := terminal.handoff_run({"sleep", "2"}, home_dir())
+	h := termhandoff.handoff_run({"sleep", "2"}, home_dir())
 	check("child exit == 0", h.exit == 0, fmt.tprintf("got {} (killed_by={})", h.exit, h.killed_by))
 	check("terminal re-acquired", h.ok, fmt.tprintf("ok={} err={} ({})", h.ok, h.err,
 		termbox2.tb_strerror(h.err)))
@@ -265,7 +265,7 @@ case_child :: proc(cwd: string, argv: []string) -> bool {
 		int(posix.getpid()), int(posix.getpgrp()), int(posix.getsid(0))))
 	say("  (the child prints its own pid/pgid/sid + env straight to the inherited tty)")
 
-	h := terminal.handoff_run(argv, cwd)
+	h := termhandoff.handoff_run(argv, cwd)
 	check("handoff returned ok (terminal reacquired)", h.ok,
 		fmt.tprintf("ok={} err={} ({})", h.ok, h.err, termbox2.tb_strerror(h.err)))
 	say(fmt.tprintf("  CHILD exit={} killed_by={}", h.exit, h.killed_by))
@@ -353,7 +353,7 @@ Tui :: struct {
 	fds         : [dynamic]posix.pollfd,
 
 	notice   : string, // last executor line; cleared by the next keypress
-	coalescer : terminal.Coalescer, // T6.5 resize/coalescing accounting
+	coalescer : termhandoff.Coalescer, // T6.5 resize/coalescing accounting
 	dirty    : bool,
 	quitting : bool,
 
@@ -713,12 +713,12 @@ tui_on_resize :: proc() {
 	// frame_layout, re-clamps the selection and repaints. Doing it here instead
 	// of on the next keypress is what makes a resize visible WITHOUT a key.
 	//
-	// T6.5: the resize is also COUNTED. `terminal.note_resize` increments the
+	// T6.5: the resize is also COUNTED. `termhandoff.note_resize` increments the
 	// run of resize events that have not yet been laid out, and `tui_paint`
 	// closes that run when it paints. The HS_TUI_TRACE line is then the
 	// coalescing evidence: max_run = N means N border-drag resize events were
 	// absorbed by ONE layout pass.
-	terminal.note_resize(&tui.coalescer)
+	termhandoff.note_resize(&tui.coalescer)
 	tui.dirty = true
 }
 
@@ -850,7 +850,7 @@ tui_wait :: proc() -> bool {
 		// means "something actually broke", and a resize storm would otherwise
 		// look like a broken app. It lands in the coalescer's own eintr counter
 		// instead, where a test can require that it happened.
-		terminal.note_eintr(&tui.coalescer)
+		termhandoff.note_eintr(&tui.coalescer)
 	} else {
 		// A real poll failure (EBADF, EFAULT, EINVAL…). Do NOT loop on it: the
 		// caller ends the run as a lost terminal rather than re-entering a wait
@@ -997,7 +997,7 @@ tui_paint :: proc() {
 	if cols != tui.painter.cols || rows != tui.painter.rows {
 		ui.painter_resize(&tui.painter, cols, rows)
 	}
-	terminal.record_size(&tui.coalescer, cols, rows)
+	termhandoff.record_size(&tui.coalescer, cols, rows)
 
 	// ── T6.5: the terminal may not be able to hold a session list ─────────
 	//
@@ -1012,10 +1012,10 @@ tui_paint :: proc() {
 	// result until the terminal is big enough to show it, which is strictly
 	// better than the alternative of painting a truncated table where a name
 	// column of one cell would read as a bug.
-	if terminal.too_small(cols, rows) {
-		terminal.too_small_paint(&tui.coalescer)
+	if termhandoff.too_small(cols, rows) {
+		termhandoff.too_small_paint(&tui.coalescer)
 		ui.paint_notice(&tui.painter, cols, rows, &tui.pal,
-			terminal.too_small_message(cols, rows))
+			termhandoff.too_small_message(cols, rows))
 		termbox2.tb_present()
 		tui.dirty = false
 		TUI_FRAMES += 1
@@ -1048,7 +1048,7 @@ tui_paint :: proc() {
 	}
 	ui.frame_close(&tui.painter, f)
 	termbox2.tb_present()
-	terminal.note_paint(&tui.coalescer)
+	termhandoff.note_paint(&tui.coalescer)
 	tui.dirty = false
 	TUI_FRAMES += 1
 }
@@ -1197,7 +1197,7 @@ tui_dump_trace :: proc() {
 	// both. `max_run` is the coalescing proof and `too_small_paints` is the
 	// too-small/recovery proof; both are produced by the app's own counters
 	// rather than inferred by the harness from byte counts.
-	os.write_string(f, fmt.tprintf("resize {}\n", terminal.summary(&tui.coalescer)))
+	os.write_string(f, fmt.tprintf("resize {}\n", termhandoff.summary(&tui.coalescer)))
 	os.write_string(f, fmt.tprintf("diag last_peek_rc={} wait_rv={} wait_errno={} lost_reason={}\n",
 		TUI_LAST_PEEK_RC, TUI_WAIT_RV, TUI_WAIT_BLOCKED, TUI_LOST_REASON[0:]))
 	for fetch in app.registry_all(&tui.reg) {
@@ -1481,8 +1481,8 @@ tui_repaint_hook :: proc() {
 }
 
 main :: proc() {
-	terminal.set_full_repaint(tui_repaint_hook)
-	terminal.install_terminal_restore_handlers()
+	termhandoff.set_full_repaint(tui_repaint_hook)
+	termhandoff.install_terminal_restore_handlers()
 
 	args := os.args
 	// A bare `nix run .` is the APPLICATION, not the smoke driver: it runs the

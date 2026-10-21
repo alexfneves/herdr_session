@@ -44,7 +44,7 @@ package app
 import "core:fmt"
 import "core:time"
 
-import terminal "../terminal"
+import termhandoff "../terminal"
 
 // Effect_Kind is what the executor actually did. The poll loop maps these onto UI
 // consequences (repaint, error pane, exit) and nothing else.
@@ -66,7 +66,7 @@ Effect :: struct {
 	kind    : Effect_Kind,
 	argv    : []string,
 	message : string,         // one honest human line for the pane / log
-	handoff : terminal.Handoff,
+	handoff : termhandoff.Handoff,
 	refresh : bool,          // the model went stale: re-fetch local + remotes
 	theme   : string,        // set when kind == .applied
 }
@@ -325,7 +325,7 @@ do_theme :: proc(cmd: Command) -> Effect {
 // owning/releasing the terminal, the scrubbed env and the `$HOME` cwd is T2's
 // and is reused untouched.
 run_child :: proc(argv: []string, home: string) -> Effect {
-	h := terminal.handoff_run(argv, home)
+	h := termhandoff.handoff_run(argv, home)
 	eff := Effect{kind = .child, argv = argv, handoff = h}
 	if !h.ok {
 		// We could not get the screen back. handoff_run already told the user to

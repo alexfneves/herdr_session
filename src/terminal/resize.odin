@@ -1,4 +1,4 @@
-package terminal
+package termhandoff
 
 // ============================================================================
 // terminal.resize — the resize POLICY (T6.5)

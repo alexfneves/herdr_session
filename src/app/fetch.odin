@@ -68,7 +68,7 @@ import "core:strings"
 import "core:sys/posix"
 import "core:time"
 
-import terminal "../terminal"
+import termhandoff "../terminal"
 
 //-----------------------------------------------------------------------------
 // Deadline policy
@@ -225,12 +225,12 @@ spawn_fetch :: proc(device, label: string, kind: Fetch_Kind, argv: []string,
 
 	// Resolve in the PARENT: execvp() would search PATH with the inherited
 	// environment and silently undo the scrub (T1.2/T3.1).
-	prog := terminal.resolve_program(argv[0])
+	prog := termhandoff.resolve_program(argv[0])
 	if prog == nil {
 		return settle_failed_spawn(f, fmt.tprintf("{} not found", argv[0]))
 	}
 
-	child_argv := terminal.build_argv(argv)
+	child_argv := termhandoff.build_argv(argv)
 	child_env := child_environment()
 
 	pipes : [2][2]posix.FD
@@ -389,7 +389,7 @@ fetch_reap :: proc(f: ^Fetch) -> bool {
 	}
 	if r == 0 { return false } // still running
 	f.reaped = true
-	f.exit_code = terminal.exit_code(status)
+	f.exit_code = termhandoff.exit_code(status)
 	settle_exit(f, f.exit_code)
 	return true
 }

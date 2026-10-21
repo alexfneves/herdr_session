@@ -94,7 +94,7 @@ import "core:strings"
 import "core:sys/posix"
 import "core:time"
 
-import terminal "../terminal"
+import termhandoff "../terminal"
 
 //-----------------------------------------------------------------------------
 // Names
@@ -163,15 +163,15 @@ name_is_ok :: proc(name: string) -> bool {
 //-----------------------------------------------------------------------------
 
 // env_is_herdr_namespace reports whether an environment key belongs to herdr.
-// `terminal.HERDR_NAMESPACE` is the single source of truth (T1.2) so the launch
+// `termhandoff.HERDR_NAMESPACE` is the single source of truth (T1.2) so the launch
 // path and the reporting path cannot drift apart.
 env_is_herdr_namespace :: proc(key: string) -> bool {
-	return strings.has_prefix(key, terminal.HERDR_NAMESPACE)
+	return strings.has_prefix(key, termhandoff.HERDR_NAMESPACE)
 }
 
 // env_snapshot reads the current process environment into a map, for reporting
 // and for tests. The child never sees this map; it gets
-// `terminal.build_scrubbed_env()`, the NULL-terminated array execve() consumes.
+// `termhandoff.build_scrubbed_env()`, the NULL-terminated array execve() consumes.
 env_snapshot :: proc() -> (map[string]string, os.Error) {
 	env, err := os.environ(context.allocator)
 	if err != nil { return nil, err }
@@ -185,7 +185,7 @@ env_snapshot :: proc() -> (map[string]string, os.Error) {
 }
 
 // scrub_env is the map-level view of the same rule, so it can be asserted without
-// forking. `terminal.build_scrubbed_env` remains the only producer of a child
+// forking. `termhandoff.build_scrubbed_env` remains the only producer of a child
 // environment; this exists so a test can check "no HERDR_* keys, TERM survives".
 scrub_env :: proc(base: map[string]string) -> map[string]string {
 	out := make(map[string]string)
@@ -197,7 +197,7 @@ scrub_env :: proc(base: map[string]string) -> map[string]string {
 }
 
 child_environment :: proc() -> [^]cstring {
-	return terminal.build_scrubbed_env()
+	return termhandoff.build_scrubbed_env()
 }
 
 //-----------------------------------------------------------------------------
@@ -302,10 +302,10 @@ run_capture :: proc(argv: []string, timeout: time.Duration) -> Capture {
 	// Resolve in the *parent*. `execvp` would search PATH using the inherited
 	// environment rather than our scrubbed one, silently defeating rule 1
 	// (learned the hard way in T1.2).
-	prog := terminal.resolve_program(argv[0])
+	prog := termhandoff.resolve_program(argv[0])
 	if prog == nil { return none }
 
-	child_argv := terminal.build_argv(argv)
+	child_argv := termhandoff.build_argv(argv)
 	child_env := child_environment()
 
 	pipes : [2][2]posix.FD
@@ -444,7 +444,7 @@ reap_child :: proc(pid: posix.pid_t, budget: time.Duration) -> i32 {
 	started := time.now()
 	for {
 		r := posix.waitpid(pid, &status, {.NOHANG})
-		if r > 0 { return terminal.exit_code(status) }
+		if r > 0 { return termhandoff.exit_code(status) }
 		if r < 0 {
 			if posix.errno() == posix.Errno.EINTR { continue }
 			return -1
@@ -599,7 +599,7 @@ outcome_label :: proc(k: Outcome_Kind) -> string {
 // argv construction
 //-----------------------------------------------------------------------------
 
-// HERDR_BIN is resolved from PATH in the parent by `terminal.resolve_program`,
+// HERDR_BIN is resolved from PATH in the parent by `termhandoff.resolve_program`,
 // deliberately not baked in as an absolute path: the user owns herdr
 // (home-manager), and 0.8.2-vs-0.9.x drift is theirs to manage — not something
 // we paper over by hiding it inside our own PATH.

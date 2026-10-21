@@ -1,4 +1,4 @@
-package terminal
+package termhandoff
 
 // The leave → exec → wait → re-enter sequence from plan §Terminal handoff.
 //
