@@ -139,7 +139,7 @@ Do **not** use the inherited `1461` — it understated `ui` by 78 and was intern
 **Schema for `tests/parity.tsv`:**
 ```
 suite	tier	floor_before	pass_after	fail_after	skipped	notes
-state	hermetic	259			T6	100% hermetic
+state	hermetic	259	270	0	0	T6	DELIVERED 259 required + 11 additive = 270. 100% hermetic, 0 fail, 0 skip, 43 registered. Ported to tests/unit/state_*.odin on the existing ledger; the old bash suite still reports 259/0.
 render	hermetic	69			T7	100% hermetic
 ui	hermetic	168			T8	100% hermetic (NOT the stale 90)
 theme	hermetic	171	142	0	0	T9	DELIVERED 135 required (129 in-proc + 6 hygiene) + 7 additive = 142. GAP 36 deferred to T14 under tier `pty`. 135 + 36 = 171 floor holds.
@@ -655,7 +655,22 @@ those holes are NOT portable):
 
 ---
 
-### T6 — Suite: `state` (floor 259)
+### T6 — Suite: `state` (floor 259)  ✅ DONE (c02e00c + 1250d62)
+
+> **DONE 2026-10-22 (U1).** `tests/unit/state_harness.odin` + `state_machine_test.odin` +
+> `state_offline_test.odin` + `state_surface_test.odin` + `state_safety_test.odin`.
+> **259 required + 11 additive = 270, 0 fail, 0 skip** — gate: `270 against a floor of 259`,
+> 43 registered, stable over 5 runs; `nix build .` green. The old bash suite still reports
+> `259 PASS / 0 FAIL`. The 189 `state-machine` and 54 `state-offline` assertion **names** diff
+> 1:1 against the baseline logs — 0 missing, 0 renamed, no filler.
+> **Three findings worth keeping:** (1) `core:os`'s `_environ` **duplicates its leading entry** on
+> this toolchain (`n=180` over 178 distinct keys) — every offline count/compare is DISTINCT-KEY
+> based. (2) The offline run must stay **in-process**: `env -i` as a child would run on a ledger
+> nobody reads, and `state-offline`'s 54 assertions would silently leave the suite. (3) There is
+> **no support-wide environment mutex** — see `SUPPORT-ENV-MU` in the `state` row of
+> `tests/parity.tsv`; `ODIN_TEST_THREADS=1` covers this today.
+> **Not proven by this suite (unchanged):** that anything appears on a screen, and that the real
+> remote is ever contacted.
 
 **Owner:** U1 · **Depends on:** T2 · **Source:** `dev/state-smoke.sh` + `src/state_cases.odin`
 
@@ -686,6 +701,9 @@ not a screen cell) → compound `expectf(t, m.state == want && cmd.kind == want_
 ISC-A-4 no Kitty protocol · D12/ISC-18 no Command ever targets `default`.
 
 **Acceptance:** floor 259 met. Floor misses **named**, not summarised.
+**Met: 270 ≥ 259, no miss.** A live review note for T15: gate rule 7 (`%!` sweep) currently trips
+on a pre-existing `theme_hygiene_test` line (`%!(EXTRA <UNSET>)`) whenever suites share a log file —
+per-suite reports keep it attributed where it belongs. Nothing in the `state` groups emits fallout.
 
 ---
 

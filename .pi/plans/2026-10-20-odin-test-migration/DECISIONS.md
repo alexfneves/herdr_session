@@ -101,3 +101,58 @@ summing distinct lines **double-counts** (naive sum of the 24 lines gives 820; t
 ## Verified by the orchestrator (not taken on report)
 `odin build ./tests/pty -build-mode:test -define:ODIN_TEST_THREADS=1` → **"Finished 24 tests. All tests were successful."**
 Max-per-group: width 67 / ffi 27 / screen 73 = **167**, 0 fail.
+
+---
+
+## D-T6 — `state` lands at 270 against the 259 floor; three findings the next suite inherits
+
+**Delivered (U1, c02e00c + 1250d62).** `tests/unit/state_harness.odin` + `state_machine_test.odin`
++ `state_offline_test.odin` + `state_surface_test.odin` + `state_safety_test.odin`.
+Gate run: **270 pass / 0 fail / 0 skip, 43 registered**, stable over 5 consecutive runs;
+`nix build .` green. The old bash suite still reports `259 PASS / 0 FAIL`.
+The 189 `state-machine` and 54 `state-offline` assertion **names** diff **1:1** against the baseline
+logs — 0 missing, 0 renamed, no filler substituted for a real check. The 11 extra are itemised in the
+`state` row of `tests/parity.tsv`.
+
+### Finding 1 — `core:os`'s `_environ` duplicates its leading entry on this toolchain
+
+`len(os.environ)` reported **180** over **178** distinct keys: `HOME` appeared twice with the *same*
+value. Any assertion of the form "N variables remain" is wrong against the raw slice. Every count and
+comparison in `state_offline_test.odin` is **DISTINCT-KEY** based. Anyone porting an environment
+assertion later: do not trust the entry count.
+
+### Finding 2 — the offline run must stay IN-PROCESS; `env -i` as a child silently loses the suite
+
+The old shape was `env -i … herdr-session state-offline`, a child process. A child tallies into its
+own ledger copy and the parent reports nothing — so porting the child literally would drop
+`state-offline`'s 54 assertions out of the suite's count while still printing a green line somewhere.
+The swap therefore happens in the process that owns the ledger: all-distinct-key snapshot into a `.bss`
+byte pool → **refuse to strip** if the snapshot does not fit (a truncated restore is worse than not
+running) → `clear_env` + 3 vars → run → restore → verify key-by-key. Each battery then carries its own
+counted proof that its window really was stripped, so "ran offline" is never inherited from a prior case.
+
+### Finding 3 — `SUPPORT-ENV-MU` (a request to S, NOT done here: the support layer is not mine to touch)
+
+There is **no support-wide mutex for environment mutation**. Each offline proc holds its own
+`ST_ENV_MU`, which serialises the offline file against *itself* but cannot see the theme suite's
+`XDG_WRITE_MU`. **A per-file mutex only covers the files that remember to take it.** The concrete
+hazard: a theme XDG swap live while the offline window has `HOME` unset resolves against the
+developer's real `~/.config/herdr_session.json`.
+
+`ODIN_TEST_THREADS=1` — already mandated for the unit binary — is what keeps this safe **today**.
+Ask: one mutex in `tests/support` that **every** environment mutation in **every** suite takes, so the
+safety is structural rather than a coincidence of the thread setting.
+
+### Two notes for T15 (gate wiring)
+
+* Gate rule 7 (`%!` sweep) currently trips on a **pre-existing** `theme_hygiene_test` line
+  (`%!(EXTRA <UNSET>)`) **whenever suites share one log file.** Per-suite report files keep that
+  failure attributed where it belongs. Nothing in any `state_*` group emits fallout.
+* `hs_check` takes the report path as `--suite=NAME=BINARY:REPORT_JSON`. Without `:REPORT_JSON` the
+  suite goes red on rule 2 ("registered count unknown") even at a passing assertion total — correct
+  behaviour, worth documenting in the T15 wiring so it is not misread as a floor failure.
+
+### What T6 still does not prove (unchanged from the old suite)
+
+That anything appears on a screen, and that the real remote is ever contacted. `state` is the state
+machine and the surface only; the pty and fixture tiers own those claims.
