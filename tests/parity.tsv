@@ -1,0 +1,82 @@
+# tests/parity.tsv — THE parity record. Single source of truth for
+# before/after assertion counts, per suite, per tier.
+#
+# Columns (tab-separated; the plan's schema, plus `files` and `task`):
+#
+#   suite          the suite name the gate keys on
+#   tier           hermetic | fixture
+#                  hermetic = no network, no ssh, no remote fixture; runs in the
+#                  nix sandbox. fixture = needs the armed remote triple.
+#   floor_before   assertions this suite made BEFORE the move. This is the floor
+#                  the gate enforces. It is a MEASURED number, never a static
+#                  grep of call sites — loops multiply at runtime and a static
+#                  count silently under-reports.
+#   pass_after     assertions after the move. Filled by the gate as suites land.
+#   fail_after     as above.
+#   skipped        as above.
+#   files          the ledger GROUP names this suite claims. A group is the
+#                  basename of the test file that made the assertion
+#                  (tests/unit/diag_test.odin -> `diag_test`). A group that NO
+#                  row claims is reported UNACCOUNTED by the gate instead of
+#                  being folded into some other suite's total — that is how a
+#                  new test file becomes visible rather than invisible inside a
+#                  passing number.
+#   task           the todo that carries this row
+#   notes
+#
+# THE RULE THIS FILE EXISTS FOR
+#
+#   Fewer assertions after the move is a REGRESSION — said out loud, never
+#   reported as a green suite.
+#
+# BASELINE — measured, fixture-armed, ALLOW_SKIP=0 (T0 CLOSED).
+# The inherited `1461` is superseded and must not be used: it understated `ui`
+# by 78 and was internally inconsistent by 5. Hermetic 1414 + fixture 130 =
+# armed 1544, closing exactly.
+#
+#	 state 259 · app+disc 532 · tui 172 · theme 171 · resize 138 · ui 168
+#	 render 69 · handoff 35					TOTAL 1544 PASS / 0 FAIL / 0 SKIP
+#
+# FROZEN TIMING THRESHOLDS — verbatim, so a later widening is visible as a
+# diff rather than invisible as a flake fix. Nobody may loosen one to make a
+# suite go green.
+#
+#   paint			   <= 4/5/6 s
+#   idle			   <= 2 clock ticks over 5 s
+#   resize first repaint	   < 500 ms
+#   "working:" after Enter	   < 1 s
+#   dead-host verdict	   <= 6.5 s   (ssh ConnectTimeout=5 + 1 s slack)
+#   delete_notice gap	   >= 2.0 s and < 12 s
+#   resize_latency timeout	   2 s
+#
+# ── rows ─────────────────────────────────────────────────────────────────────
+#
+# 100 % hermetic suites: the whole floor lands in the hermetic tier.
+state	hermetic	259				state_test,state_*	T6	100% hermetic. The any_failed save/restore sites (old state_cases.odin:1349-1358) become support.mark/support.block_failed, one @(test) proc per formerly-shared block.
+theme	hermetic	171				theme_test,theme_*	T9	100% hermetic
+ui	hermetic	168				ui_test,ui_*	T8	100% hermetic. NOT the stale 90 — the whole +78 is ui-frame (14->92), grown by the RCH-1 no-outer-border proof set and the footer-hint work and never re-totalled. MEASURED ARMED: frame 92 + sessions 16 + shrink 12 + edit 20 + list 17 + float 11 = 168. Verified green again after the T2 re-home (92+16+12+20+17+11).
+render	hermetic	69				render_test,render_*	T7	100% hermetic. Wires in the enter_terminal/leave_terminal pair tests/support/terminal.odin provides.
+handoff	hermetic	35				handoff_test,handoff_*	T11	100% hermetic
+#
+# app+disc 532 armed splits three ways. The `diag` row is a TRANSFER, not new
+# coverage: those assertions used to be counted inside `app`, and they now live
+# under `diag_*` because the symbol moved out of package main. Stated out loud
+# per the governing rule — the total does not change, the attribution does.
+app	hermetic	437				app_test,app_*	T10	532 armed - 88 fixture - 7 transferred to `diag` below. floor_before here is 437 NOT 444: the 7 diag_head assertions are no longer app's to make.
+app	fixture	88				app_live*,disc_*	T14	app-live + fetch-live + the remote discriminator. Needs HERDR_SESSION_TEST_{REMOTE,REMOTE_ALIAS,UNREACHABLE}.
+diag	hermetic	7				diag_test,diag_*	T2	TRANSFERRED from app (ISC-9/ISC-10), not new. The 7 truncation properties of ui.diag_head: short line passes through · first line only of a multi-line trace · CRLF handled like LF · the 44-byte-cap-yields-47-bytes contract (the mark is 3 bytes) · never cut after a UTF-8 continuation byte · never leave a continuation byte at the end · no width in 1..60 yields broken UTF-8 · empty stays empty. Verified still green through the new home after T2 (10 counted assertions covering these 7 properties; the floor is the plan's 7 and the fixture over-delivers, which is never a regression).
+keyhints	hermetic	0				keyhints_test,keyhints_*	T2	NEW. The footer hint tables moved to ui.keyhints, so their contract became testable at all. The 80/100-col overflow properties themselves are still COUNTED IN `ui` above (the 39 KEYS_MODE lines in ui_cases) and transfer to here at T8 — floor_before is 0 so nothing is double-counted, and T8 must raise this row when it moves them.
+tui	hermetic	145				tui_test,tui_*	T12	boot-local / state-* / del-key / guards. MEASURED ARMED 145 unarmed-of-172.
+tui	fixture	27				tui_live*	T14	boot-remote + roundtrip
+resize	hermetic	123				resize_test,resize_*	T13	4 scenarios x 3 reps
+resize	fixture	15				resize_live*	T14	selection-shrink x 3 reps
+#
+# ── arithmetic ───────────────────────────────────────────────────────────────
+#  hermetic : 259 + 171 + 168 + 69 + 35 + 437 + 7 + 0 + 145 + 123 = 1414
+#  fixture  :  88 + 27 + 15					       = 130
+#  TOTAL    : 1414 + 130 = 1544  == the armed baseline. Closes exactly.
+#
+#  Read the `diag` and `keyhints` rows together: `diag` is 7 taken OUT of app
+#  and put into a suite of its own; `keyhints` is 0 for now because the footer
+#  assertions it will own are still being counted inside `ui` until T8 moves
+#  them. Neither row adds or loses a single assertion from the 1544.
