@@ -68,3 +68,36 @@ nothing about `/dev/ptmx`. This determines whether the **`pty` tier** belongs in
 > **A task's `Depends on:` must include every capability its FLOOR requires.**
 > T9's floor required a pty driver; T9 depended on T2. That is how 36 assertions became orphaned.
 > Apply this check to every remaining task before dispatch, not just the one that surfaced it.
+
+---
+
+## D-T15 — the sandbox question is ANSWERED: the `pty` tier belongs in `nix flake check`
+
+Agent P probed it empirically inside a real `nix build` sandbox (`pkgs.runCommand`, sandbox enabled):
+```
+PTY_OK master=3 slave=4 · WINSZ_OK 24x80 · CTTY_CHILD_EXIT=0
+PTMX_OPEN=yes errno=0 · PTS_DIR=present · WRITABLE_TMP=yes
+```
+**`/dev/ptmx` is available and a forked child can take the controlling terminal.** There is **no sandbox
+reason to defer pty-tier tests.**
+
+→ **T15 design decision: `pty`-tier tests go in `nix flake check`.** Only `fixture`-tier (real ssh /
+remote herdr) is excluded from CI. Corrects the earlier assumption that pty might not survive the sandbox.
+
+## OPEN — parity rows for lane P, owed by S (do NOT lose these)
+P deliberately did **not** touch `tests/parity.tsv` (not its lane). Rows ready to add, **additive, not
+transfers** — S must re-verify the arithmetic with its own script:
+```
+pty  pty  width-parity table (tb_wcwidth vs python)   67   T3  frozen reachable set + recorded divergence record
+pty  pty  pty alloc/resize/ctty/teardown             27   T3  interrogability probes
+pty  pty  Screen emulator (ported, unit-tested)      73   T4  no byte-grep anywhere in the lane
+```
+Ledger groups: `width_test`, `ffi_test`, `screen_test`.
+
+**Verification note for whoever adds these:** `HS_TALLY` lines are **cumulative snapshots per test**, so
+summing distinct lines **double-counts** (naive sum of the 24 lines gives 820; the correct
+**max-per-group** total is **167**). Use max-per-group, as the gate already does.
+
+## Verified by the orchestrator (not taken on report)
+`odin build ./tests/pty -build-mode:test -define:ODIN_TEST_THREADS=1` → **"Finished 24 tests. All tests were successful."**
+Max-per-group: width 67 / ffi 27 / screen 73 = **167**, 0 fail.
