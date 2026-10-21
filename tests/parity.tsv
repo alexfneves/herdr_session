@@ -66,17 +66,64 @@ handoff	hermetic	35				handoff_test,handoff_*	T11	100% hermetic
 app	hermetic	444				app_test,app_*	T10	532 armed - 88 fixture = 444. NOT 437: an earlier draft subtracted 7 for the diag move, but src/app_cases.odin still makes those assertions and nobody removed them. The new diag_test asserts the same PROPERTIES from the new home, ON TOP. If T10 deletes them from app_cases, subtract 7 here AT THAT TIME and say so in the diff.
 app	fixture	88				app_live*,disc_*	T14	app-live + fetch-live + the remote discriminator. Needs HERDR_SESSION_TEST_{REMOTE,REMOTE_ALIAS,UNREACHABLE}.
 diag	hermetic	10				diag_test,diag_*	T2	ADDITIVE, not a transfer. 10 assertions in tests/unit/diag_test.odin over the 7 truncation properties of ui.diag_head The 7 truncation properties of ui.diag_head: short line passes through · first line only of a multi-line trace · CRLF handled like LF · the 44-byte-cap-yields-47-bytes contract (the mark is 3 bytes) · never cut after a UTF-8 continuation byte · never leave a continuation byte at the end · no width in 1..60 yields broken UTF-8 · empty stays empty. Verified still green through the new home after T2 (10 counted assertions covering these 7 properties; the floor is the plan's 7 and the fixture over-delivers, which is never a regression).
-keyhints	hermetic	44				keyhints_test,keyhints_*	T2	ADDITIVE, measured. 44 assertions in tests/unit/keyhints_test.odin: table dispatch/parity per state, no duplicate key label, the ORDER contract (every table's LAST hint is an exit/back/dismiss action, because keys_line fills from the exit side and cuts from the front), and the 8-width KEYS_MODE sweep (exit hint kept, `t theme` kept above its own width threshold, never overflows, no hint cut in half, never blank). This does NOT replace the 39 KEYS_MODE lines still counted in `ui` above; T8 decides whether to move them and must adjust `ui` at the same time or the total drifts upward twice.
+keyhints	hermetic	54				keyhints_test,keyhints_*	T2	ADDITIVE, measured. 44 assertions in tests/unit/keyhints_test.odin: table dispatch/parity per state, no duplicate key label, the ORDER contract (every table's LAST hint is an exit/back/dismiss action, because keys_line fills from the exit side and cuts from the front), and the 8-width KEYS_MODE sweep (exit hint kept, `t theme` kept above its own width threshold, never overflows, no hint cut in half, never blank). This does NOT replace the 39 KEYS_MODE lines still counted in `ui` above; T8 decides whether to move them and must adjust `ui` at the same time or the total drifts upward twice.
 tui	hermetic	145				tui_test,tui_*	T12	boot-local / state-* / del-key / guards. MEASURED ARMED 145 unarmed-of-172.
 tui	fixture	27				tui_live*	T14	boot-remote + roundtrip
 resize	hermetic	123				resize_test,resize_*	T13	4 scenarios x 3 reps
 resize	fixture	15				resize_live*	T14	selection-shrink x 3 reps
 #
+pty_width	pty	67				width_test	T3	Floor INDEPENDENTLY RE-MEASURED by S via max-per-group, not taken from lane P's report: width_test pass=67 fail=0 skip=0. tb_wcwidth vs a python reference. Additive -- a capability that did not exist in the 1544 bash baseline, not a transfer out of it.
+pty_ffi	pty	27				ffi_test	T3	Re-measured: ffi_test pass=27 fail=0 skip=0. pty alloc/resize/ctty/teardown at the FFI layer.
+pty_screen	pty	73				screen_test	T4	Re-measured: screen_test pass=73 fail=0 skip=0. The ported screen emulator, unit-tested.
+pty_driver	pty	51				pty_test	T5	Re-measured: pty_test pass=51 fail=0 skip=0. Driver: spawn/observe/resize/kill/termios. Lane P total 218 across 38 tests, reproduced green end to end.
+
+# WHY `pty` IS ITS OWN TIER AND NOT `hermetic`
+#
+# Verified (D-T15): a real pty WORKS in the nix sandbox -- /dev/ptmx is
+# present and a child can take a controlling terminal. So this tier belongs in
+# `nix flake check` and does NOT need the armed remote fixture.
+#
+# It is still not the hermetic tier. It requires a device node hermetic tests
+# must never depend on, and a sandbox built without /dev/ptmx has to be able to
+# exclude these four rows WITHOUT taking the whole hermetic suite down. Folding
+# them into `hermetic` would couple them: one missing device node, and every
+# hermetic row fails for a reason that has nothing to do with what it tests.
+#
+# THE GATE NO LONGER DEFAULTS AN UNKNOWN TIER TO HERMETIC. It refuses the row
+# out loud. Until this change, a typo in the tier column -- or a new tier the
+# gate had not been taught, exactly like `pty` before now -- was silently filed
+# under hermetic. With tiering load-bearing for T15 that is the worst possible
+# failure: the tier column would look authoritative while being a guess.
+
 # ── arithmetic ───────────────────────────────────────────────────────────────
-#  hermetic : 259 + 171 + 168 + 69 + 35 + 444 + 10 + 44 + 145 + 123 = 1468
-#  fixture  :  88 + 27 + 15					         = 130
-#  TOTAL    : 1468 + 130 = 1598  == the 1544 armed baseline + 54 new T2
-#             assertions (diag 10 + keyhints 44). Closes exactly.
+#  hermetic : 259 + 171 + 168 + 69 + 35 + 444 + 10 + 54 + 145 + 123 = 1478
+#  fixture  :  88 + 27 + 15								         =  130
+#  pty      :  67 + 27 + 73 + 51  (lane P, EXISTS)                =  218
+#           +  36  (theme pty, DEFERRED -- tests not yet written)  =   36
+#             pty tier total                                      =  254
+#  ─────────────────────────────────────────────────────────────────────────
+#  TOTAL    : 1478 + 130 + 254                                   = 1862
+#    = 1544 (armed bash baseline)
+#    +   54 (T2: diag 10 + keyhints 44)
+#    +   10 (T2 keyhints raised 44 -> 54: the explicit app.State
+#           coverage walk added this session, so the +10 is locked in and a
+#           future deletion of it is caught rather than absorbed)
+#    +  218 (lane P: width 67 + ffi 27 + screen 73 + driver 51)
+#    +   36 (theme tty work, RESERVED not yet delivered)
+#
+#  Every number for work that EXISTS was re-measured through the gate with
+#  max-per-group by lane S, not copied from a lane's self-report. Lane P's
+#  reported 218 reproduced exactly (67/27/73/51, 38 tests, 0 fail, 0 skip).
+#  The naive line-sum over the same run reads 7999 -- which is why the
+#  max-per-group rule is not optional.
+#
+#  THE 36 IS NOT YET REAL. The `theme`/pty row claims `theme_pty_*`, groups
+#  no file produces yet. Running the gate against it TODAY fails rule 3b
+#  ("this row claims no group present in the log"), and that is the correct
+#  outcome: a reserved floor must fail rather than pass vacuously, so the row
+#  cannot quietly become a permanent exemption. Flagging it because
+#  `--tier=pty` is therefore RED until that work lands, by design -- do not
+#  "fix" it by lowering the floor.
 #
 #  Read the `diag` and `keyhints` rows together: both ADD. Neither steals from
 #  `app` or `ui`. Nothing in the 1544 was removed to pay for them; if a later

@@ -38,16 +38,25 @@ import support "../../support"
 Tier :: enum {
 	hermetic, // no network, no ssh, no remote fixture: runs in the nix sandbox
 	fixture,  // needs the armed remote fixture
+	// A real pty: /dev/ptmx, a child that can take a controlling terminal.
+	// Verified available inside the nix sandbox (D-T15), so this tier runs in
+	// `nix flake check` alongside hermetic. It is NOT the same tier as
+	// hermetic: it needs a device node hermetic tests must not require, and a
+	// sandbox without /dev/ptmx must be able to exclude it without taking the
+	// rest of the suite down with it.
+	pty,
 }
 
 tier_parse :: proc(s: string) -> (Tier, bool) {
 	if s == "hermetic" { return .hermetic, true }
 	if s == "fixture" { return .fixture, true }
+	if s == "pty" { return .pty, true }
 	return .hermetic, false
 }
 
 tier_label :: proc(t: Tier) -> string {
 	if t == .fixture { return "fixture" }
+	if t == .pty { return "pty" }
 	return "hermetic"
 }
 

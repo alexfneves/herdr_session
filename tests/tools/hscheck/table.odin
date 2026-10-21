@@ -161,10 +161,27 @@ resolve_suites :: proc(
 		tier_of_suite := row.tier
 		if tier != "all" && tier_of_suite != tier { continue }
 
+		// An unrecognised tier used to fall through to `.hermetic` silently.
+		// With tiering now load-bearing for T15 that is not a harmless default:
+		// a typo, or a genuinely new tier the gate has not been taught, would
+		// file real pty/fixture tests under "hermetic" and they would then run
+		// in a sandbox that cannot support them -- or be silently excluded from
+		// the tier that should have run them. Either way the tier column stops
+		// being trustworthy and nobody is told. Refuse the row instead.
+		tier_val, tier_ok := tier_parse(tier_of_suite)
+		if !tier_ok {
+			append(&problems, fmt.tprintf(
+				"suite '{}' has tier '{}' which this gate does not know (known: hermetic, " +
+				"fixture, pty). Refusing to guess: defaulting an unknown tier to hermetic " +
+				"would file tests under a tier they do not belong to, silently, which is " +
+				"worse than an error", name, tier_of_suite))
+			continue
+		}
+
 		append(&suites, Suite{
 			name = name,
 			binary = bin,
-			tier = tier_from_name(tier_of_suite),
+			tier = tier_val,
 			floor = row.floor,
 			allow_skip = allow_skip,
 			notes = row.notes,
