@@ -29,46 +29,57 @@ making that impossibility *mechanical*, not a matter of good intentions.
 > Fewer assertions after the move is a **REGRESSION** — said out loud, never reported as a green suite.
 > Plus: `core:testing` scores **0 tests as a pass**. Registered-count > 0 is a hard guard.
 
-**Authoritative baseline (fixture-armed, orchestrator-measured 2026-10-20 ~21:50):**
+**Authoritative baseline — MEASURED, fixture-armed, `ALLOW_SKIP=0` (T0 CLOSED):**
 
 ```
-state 259 · app+disc 532 · tui 172 · theme 171 · resize 138 · ui 90 (6/6) · render 69 · handoff 35
-TOTAL: 1461 PASS / 0 FAIL
+state 259 · app+disc 532 · tui 172 · theme 171 · resize 138 · ui 168 · render 69 · handoff 35
+TOTAL: 1544 PASS / 0 FAIL / 0 SKIP
 ```
 
-Use **1461** and those **per-suite** figures. RCH-5/6's "~1,354" prose and the scout's §1
-reconstruction (1,275) are **superseded** — do not cite them.
+**Use 1544 with those per-suite figures.** Evidence: `baseline-measurement.md` (same dir). Real config md5
+and the live herdr session set were verified untouched across the whole run; every suite's own teardown
+asserted the session list was restored exactly.
 
-### ⚠️ CORRECTION — the `ui` figure in that baseline is stale (measured 2026-10-20)
+Superseded — do not cite: RCH-5/6's "~1,354", the scout's §1 reconstruction (1,275), and **the
+originally-handed-down `1461`**.
 
-An un-armed run of all eight suites (`baseline-measurement.md`, same dir) shows the recorded total is an
-**understatement**. Per-suite vs the last recorded breakdown:
+### ⚠️ The handed-down `1461` was wrong in two ways
 
-| Suite | Recorded | Measured | Δ |
+A fixture-armed re-run found **seven of eight suites match their recorded figures exactly**. Two defects
+in the inherited numbers:
+
+**1. `ui` = 90 was stale; it is 168.** The last recorded per-case breakdown was
+*frame 14 · sessions 16 · shrink 12 · edit 20 · list 17 · float 11*. Measured: **frame 92**, the rest
+identical. `ui-frame` grew during **RCH-1 (no outer border)** and the footer-hint work and the aggregate
+was never re-totalled. The growth is real, not dump-miscounting — the harness's own per-case count and an
+independent `grep -c` over the same log section both give 92.
+> **This was the single largest silent-loss risk in the migration.** Porting `ui` against a floor of 90
+> would have allowed 78 assertions to vanish while still reporting "parity."
+
+**2. The stated total `1461` never matched its own components**, which sum to **1466** — a 5-off
+arithmetic slip, not lost coverage. This fully explains the "≈5 residual" from the earlier un-armed pass.
+
+### Hermetic / fixture split (drives nix tiering)
+
+| Suite | Armed | Unarmed | Fixture-gated |
 |---|---|---|---|
-| `state` | 259 | **259** | 0 — 100 % hermetic |
-| `theme` | 171 | **171** | 0 — 100 % hermetic |
-| `render` | 69 | **69** | 0 — 100 % hermetic |
-| `handoff` | 35 | **35** | 0 — 100 % hermetic |
-| `app+disc` | 532 | 444 | −88 fixture-gated |
-| `tui` | 172 | 145 | −27 fixture-gated (2 scenarios skipped) |
-| `resize` | 138 | 123 | −15 fixture-gated (3 runs skipped) |
-| `ui` | 90 | **168** | **+78** ⚠️ |
+| `state` | 259 | 259 | **0 — 100 % hermetic** |
+| `theme` | 171 | 171 | **0 — 100 % hermetic** |
+| `ui` | 168 | 168 | **0 — 100 % hermetic** |
+| `render` | 69 | 69 | **0 — 100 % hermetic** |
+| `handoff` | 35 | 35 | **0 — 100 % hermetic** |
+| `app+disc` | 532 | 444 | 88 |
+| `tui` | 172 | 145 | 27 |
+| `resize` | 138 | 123 | 15 |
+| **Total** | **1544** | **1414** | **130** |
 
-The entire `ui` delta is in **`ui-frame` (14 → 92)**; the other five cases match the historical record
-*exactly* (16/12/20/17/11). The cause is visible in the log: `ui-frame` now carries the **RCH-1
-no-outer-border geometry proofs** and the `KEYS_MODE` footer-overflow checks. They are real assertions —
-the harness's own count and an independent `grep -c` over the same log section **both give 92**.
+**Hermetic tier runnable in the nix sandbox: 1414 assertions, 0 fail.** Five suites
+(`state theme ui render handoff` = **585**) are entirely fixture-independent. The fixture delta closes
+exactly: 1414 + 130 = 1544.
 
-**Consequences:**
-- **`ui`'s floor is ~168, not 90.** Porting `ui` against a floor of 90 would have allowed **78 assertions
-to be dropped while still reporting "parity"** — the single largest silent-loss risk found so far.
-- Expected armed total is **≈1544** (1414 hermetic + 88 + 27 + 15), leaving a ≈5 residual to explain.
-- **`ui 1461` must not be treated as final.** T0's armed re-run sets the corrected floors; until then
-  `ui`'s floor is provisional at 168.
-- This vindicates risk **R-17** and the rule that only a real run may establish a baseline.
-- **534 assertions are proven 100 % hermetic** (`state`+`theme`+`render`+`handoff`) — the strongest
-core for the in-sandbox `nix flake check` tier.
+**Fixture arming is reproducible on a host with no `~/.ssh/config`** — loopback ssh works for both
+`localhost` and `127.0.0.1` (the discriminator needs both strings). Probe with `ssh`, not
+`/dev/tcp` (the raw socket check gives a false negative).
 
 ---
 
@@ -162,11 +173,11 @@ produces the exact failure class this migration exists to remove — a green che
 | Tier | Contents | Runs under `nix flake check`? |
 |---|---|---|
 | **hermetic** | Everything in `tests/unit/`, the pty local cases (`boot-local`, `state-*`, `del-key`, `mode-filter-immutable`, `sigterm`, `no-orphan`, `resize-*`, `handoff-*`, `render`, `ui`, `guard-*`) | ✅ Yes — and **zero skips permitted** |
-| **fixture** | `app-live`, `fetch-live`, `boot-remote`, `roundtrip`, `delete-notice`(needs `herdr`+ssh), `discriminator`, `selection-shrink` | ❌ Not in-sandbox. Run by `hs_check --tier=full` locally / in privileged CI, which enforces the **full 1461**. |
+| **fixture** | `app-live`, `fetch-live`, `boot-remote`, `roundtrip`, `delete-notice`(needs `herdr`+ssh), `discriminator`, `selection-shrink` | ❌ Not in-sandbox. Run by `hs_check --tier=full` locally / in privileged CI, which enforces the **full 1544**. |
 
 Wired as **two** check attributes: `checks.<sys>.odinTests` (in-sandbox, hermetic) and
 `checks.<sys>.odinTestsFull` (`__noChroot = true`, needs the fixture env passed through). Neither is a
-lie about what ran. The plan's parity table records the hermetic floor separately from the 1461 full
+lie about what ran. The plan's parity table records the hermetic floor separately from the 1544 full
 total — **measuring that split is Task 1, not an afterthought.**
 
 ### Uniform gate (approved tightening)
@@ -230,7 +241,7 @@ for pty tests **before** any of them is touched, so a flake is a real bug and no
 - **Its own test:** the 7 assertions land in `tests/unit/diag_test.odin`, asserting rune-boundary safety
   on a multi-byte head, a `\n`-terminated head, a cut that would split a continuation byte, and the `…` suffix.
 - **Parity note (said out loud):** these 7 move **from the `app` suite to `ui`/`diag`**. Record it as a
-  transfer line in `parity.tsv`: `app 532 → 525`, `diag 0 → 7`. Total unchanged.
+  transfer line in `parity.tsv`: `app (hermetic) 444 → 437`, `diag 0 → 7`. Total unchanged.
 
 ### B2 — `KEYS_MODE` + siblings (`src/main.odin:1162-1212`) — HARD BLOCKER, product data trapped in `main`
 The footer-overflow suite (`ui_cases.odin:505-532`, hints at 80/100 cols) depends on it.
@@ -350,7 +361,7 @@ and friends become:
 
 | # | Step | Owner | Depends on | Gate |
 |---|---|---|---|---|
-| 0 | **Re-measure and freeze the baseline.** One full fixture-armed run of the *current* 8 suites. Record per-suite totals **and** the hermetic/fixture split into `tests/parity.tsv` before any code moves. | S | — | 1461 reproduced or the discrepancy explained **before** proceeding |
+| 0 | **Freeze the baseline.** ✅ **DONE — see `baseline-measurement.md`.** Full fixture-armed run of all 8 suites with `ALLOW_SKIP=0`; per-suite totals + hermetic/fixture split recorded. Corrected total **1544** (the handed-down 1461 was stale on `ui` and arithmetically off by 5). | S | — | 1544 measured with 0 fail / 0 skip; corrections propagated |
 | 1 | **Support + gate skeleton.** `tests/support/*`, `tests/tools/hscheck`, `parity.tsv` schema. Include `HS_TALLY` emission, JSON-report reading, `%!` scan, the "gate asserts its own table non-empty" self-check. | S | 0 | `hs_check` fails on an empty suite table, passes on a 1-test fixture |
 | 2 | **Product re-homes.** `ui.diag_head`, `ui.key_hints_for()`. Product change + `nix build` green + the two new unit tests. | S | 1 | B1/B2 moved with their 7+overflow assertions; transfers recorded in `parity.tsv` |
 | 3 | **Pty FFI + width parity.** `tests/pty/ffi.odin`, `width_test.odin`. | P | 1 | `openpty`/`TIOCSWINSZ`/`TIOCSCTTY` proven; frozen rune table agrees |
@@ -358,17 +369,17 @@ and friends become:
 | 5 | **Pty driver.** `tests/pty/pty.odin` incl. `watch_screen`, `resize_latency`, `termios_now`, `cpu_ticks`, single-thread enforcement. | P | 4 | Spawn → resize → kill → termios-round-trip proven in a smoke test |
 | 6 | **Suite: `state`** (259) — `tests/unit/state_*.odin` + source-surface greps | U1 | 2 | floor 259 (minus transferred, plus seam tests) |
 | 7 | **Suite: `render`** (69) — incl. `expect_wire`, back-buffer grid, `dump_rows` bands | U2 | 2 | floor 69 |
-| 8 | **Suite: `ui`** (90 / 6 cases) — `bring_up`, `shrink_pty`, overflow | U3 | 2 | floor 90 |
+| 8 | **Suite: `ui`** (**168** / 6 cases — NOT the stale 90) — `bring_up`, `shrink_pty`, overflow | U3 | 2 | floor **168**, per-case 92/16/12/20/17/11 |
 | 9 | **Suite: `theme`** (171) — in-proc cases + hygiene block (real-config md5 before==after, XDG non-leak) | U4 | 2 | floor 171 |
 | 10 | **Suite: `app`** (532 − transferred) — `app_cases` + anti-criteria greps | U1 | 2,6 | floor recorded with the transfer line |
 | 11 | **Suite: `handoff`** (35) + **Odin probe binaries** replacing `sig_probe.py`/`env_probe.sh` | U5 | 5 | floor 35 with the probes proven |
 | 12 | **Suite: `tui`** (172) — boot-local, `state-*`, `del-key`, `mode-filter-immutable`, `sigterm`, `no-orphan`, `refresh-key`, guards | U3 | 5,7 | floor 172 |
 | 13 | **Suite: `resize`** (138) — 5 scenarios × 3 reps, trace parsing against `terminal/resize.odin`'s frozen format string | U5 | 5 | floor 138 |
-| 14 | **Fixture suites** — `app-live`, `fetch-live`, `boot-remote`, `roundtrip`, `delete-notice` (+ `SLOW_HERDR` shim ported intact), `discriminator`, `selection-shrink` | U4 | 11,12,13 | full 1461 reachable via `hs_check --tier=full` |
+| 14 | **Fixture suites** — `app-live`, `fetch-live`, `boot-remote`, `roundtrip`, `delete-notice` (+ `SLOW_HERDR` shim ported intact), `discriminator`, `selection-shrink` | U4 | 11,12,13 | full **1544** reachable via `hs_check --tier=full` |
 | 15 | **`nix` wiring.** Separate test derivation (wider source view), archive staging repeated verbatim, `checks.odinTests` + `checks.odinTestsFull`. **Product filter untouched.** | P | 1..14 | `nix flake check` runs the hermetic tier and is **provably not vacuous** |
 | 16 | **Delete `argv` dispatch.** The `switch`, `usage()`'s case list, all `case_*` procs, `guard_probe_rows`, `home_dir`, the smoke painter (`paint`/`draw_box`/`draw_text`/`force_repaint`/`FRAMES_PAINTED`) — **only now**, with the test binary registering its own painter. `TUI_ACTIVE`/`tui_repaint_hook` STAY (product wiring). | S | 6..15 | `grep` proves no test entrypoint remains; product `nix build` + full check green |
 | 17 | **Delete every `.sh`/`/py`.** `dev/*-smoke.sh`, `dev/lib.sh`, all 5 `dev/*.py`, and the two heredoc probes (gone with the `.sh`). `dev/local-build.sh` stays (build helper, not a test). | S | 14,15,16 | RCH-6 grep gates 1-4 green |
-| 18 | **Final report.** Honest total vs 1461, per suite, with every transfer and every accepted gap listed. | S | 17 | — |
+| 18 | **Final report.** Honest total vs **1544**, per suite, with every transfer and every accepted gap listed. | S | 17 | — |
 
 **Hard ordering constraints:**
 - Nothing touches `src/*_cases.odin` until **Task 0** has frozen the baseline.
@@ -450,7 +461,7 @@ Every one of these is a live assertion today and must be present after the port:
 - [ ] ISC-5: `hs_check` is a single Odin entrypoint that runs every suite
 - [ ] ISC-6: `nix flake check` runs the hermetic tier and is provably non-vacuous
 - [ ] ISC-7: Per-suite assertion counts recorded in `tests/parity.tsv` before and after
-- [ ] ISC-8: Full-tier total equals 1461 with the per-suite figures matched, or every delta is explained as a transfer
+- [ ] ISC-8: Full-tier total equals **1544** with the per-suite figures matched, or every delta is explained as a transfer
 - [ ] ISC-9: `ui.diag_head` exists in `src/ui/text.odin` with its 7 truncation assertions ported
 - [ ] ISC-10: `ui.key_hints_for()` exists in `src/ui/keyhints.odin` with the footer-overflow behaviour ported
 
@@ -507,7 +518,7 @@ everything else is mitigated mechanically.
 
 ## Definition of "done"
 
-`parity.tsv` shows 1461 assertions accounted for across the tiers with zero unexplained loss, the product
+`parity.tsv` shows **1544** assertions accounted for across the tiers with zero unexplained loss, the product
 binary contains no test entrypoint, the repo contains no test `.sh` or `.py` of ours, `nix flake check`
 executes the hermetic tier and fails loudly if it runs nothing, and every delta between the before and
 after columns is a recorded, explained transfer — never a quiet subtraction.

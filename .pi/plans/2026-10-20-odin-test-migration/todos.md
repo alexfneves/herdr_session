@@ -4,16 +4,21 @@
 **Audit:** `.pi/plans/2026-10-20-odin-test-migration/scout-context.md` (807 lines — the pre-migration audit)
 **Tag:** `odin-test-migration`
 **Repo:** `/home/alexfneves/gits/herdr_session`
-**Baseline:** **1461 PASS** as recorded — `state 259 · app+disc 532 · tui 172 · theme 171 · resize 138 · ui 90 · render 69 · handoff 35`
+**Baseline — MEASURED & CLOSED (fixture-armed, `ALLOW_SKIP=0`):**
+```
+state 259 · app+disc 532 · tui 172 · theme 171 · resize 138 · ui 168 · render 69 · handoff 35
+TOTAL: 1544 PASS / 0 FAIL / 0 SKIP
+```
+Evidence + reproducible fixture-arming recipe: `baseline-measurement.md` in this dir.
 
-> ### ⚠️ READ `baseline-measurement.md` IN THIS DIR BEFORE SETTING ANY FLOOR
-> A measured un-armed run has already shown the recorded baseline is **stale**.
-> **`ui` is 168, not 90** — the whole +78 is `ui-frame` (14→92, the RCH-1 no-outer-border geometry
-> proofs + footer-overflow checks). The other five `ui` cases match the historical record exactly.
-> **Four suites are proven 100 % hermetic:** `state 259 · theme 171 · render 69 · handoff 35` = **534**
-> assertions that run identically with or without the fixture.
-> Fixture delta measured: `app` −88 · `tui` −27 · `resize` −15. Expected armed total **≈1544**.
-> **Do not port against the prose numbers. Use the corrected floors.**
+> **The handed-down `1461` was wrong and must not be used.** Measured armed: **seven of eight suites match
+> their recorded figures exactly.** Two defects found: (1) **`ui` is 168, not 90** — the whole +78 is
+> `ui-frame` (14→92), which grew the RCH-1 no-outer-border proof set and the `KEYS_MODE` footer-overflow
+> checks and was never re-totalled; (2) the stated total `1461` never matched its own components, which sum
+> to `1466` — an arithmetic slip, not lost coverage.
+> **Hermetic tier = 1414** (what `nix flake check` can run: the sandbox has a pty but no network).
+> Five suites — `state theme ui render handoff` = **585** — are 100 % hermetic. Fixture delta 130 closes
+> exactly: 1414 + 130 = 1544.
 
 > Every todo is self-contained. Do not assume the worker read the plan prose — the decision-relevant
 > facts are inlined.
@@ -29,7 +34,7 @@
    derivation gets its own wider source view; the product keeps `src/` + `vendor/` only. These are
    different facts — do not conflate them.
 3. **RCH-3 / RCH-4 are DONE and verified.** Do not re-implement, re-litigate, or "improve" them.
-   Their assertions are a large share of the 1461 and must survive the port.
+   Their assertions are a large share of the 1544 and must survive the port.
 4. **Delete nothing before its replacement is green.** `.sh`/`.py` deletion is Task 17, last, always.
 5. **Toolchain pin:** `/nix/store/4ycdn03zvpadrpwb7c43gnr0gr23k597-odin-dev-2026-09/bin` — the path
    **says** `dev-2026-09`, `odin version` from it **prints** `dev-2026-10`. Pin by **store path**,
@@ -105,25 +110,24 @@ to `tests/support/` or `tests/pty/` are how suites quietly stop asserting the sa
 
 **Owner:** S · **Depends on:** nothing · **Blocks:** EVERYTHING
 
-**⚠️ STATUS: PARTIALLY DONE.** A measured un-armed run of all 8 suites is recorded in
-`baseline-measurement.md` (same dir). Real per-suite numbers, hermetic/fixture split, and the real-config
-md5 + live-session non-touch were all verified. **The armed re-run and the corrected floors are still owed.**
-Key measured results: hermetic total **1414**, 0 fail · `state/theme/render/handoff` are 100 % hermetic ·
-**`ui` = 168, not the recorded 90.**
+**✅ STATUS: CLOSED — fully measured, fixture-armed, `ALLOW_SKIP=0`. Nothing owed. Suite ports may start.**
 
-**Do not write any test code before this task is complete.**
+All eight suites were run armed (`localhost` + `127.0.0.1` loopback ssh, `192.0.2.201` unreachable) with
+**zero skips**, and the real config md5 + live session set were verified untouched across the whole run.
+**Corrected authoritative total: 1544 PASS / 0 FAIL / 0 SKIP.** See `baseline-measurement.md`.
+Do **not** use the inherited `1461` — it understated `ui` by 78 and was internally inconsistent by 5.
 
 **Create:** `tests/parity.tsv` — the single source of truth for before/after counts.
 
 1. `git status` must be clean. Build fresh: `dev/local-build.sh` (or `nix build`), export `BIN=`.
 2. Arm the fixture and run **all eight** existing suites once, collecting per-suite `[PASS]` totals:
    `state · app+disc · tui · theme · resize · ui · render · handoff`.
-3. **Reconcile against the recorded 1461.** If any figure differs, **stop and explain the discrepancy
-   before proceeding.** Do not silently adopt a new number.
-   **Already-done reconciliation (un-armed):** `state/theme/render/handoff` matched their recorded floors
-   exactly. `app`/`tui`/`resize` came in lower by exactly their fixture-gated amounts. **`ui` came in at
-   168 vs a recorded 90** — traced to `ui-frame` growing 14→92 and the aggregate never being updated.
-   The armed run must produce the corrected per-suite floors and retire the stale `ui 90`.
+3. **Reconcile against the corrected measured baseline (1544)** — `state 259 · app+disc 532 · tui 172 ·
+   theme 171 · resize 138 · ui 168 · render 69 · handoff 35`. If a figure differs from these, **stop and
+   explain before proceeding.**
+   **DONE:** armed run complete. Seven of eight suites matched their recorded figures exactly; `ui` was
+   corrected 90 → **168**, and the recorded total's 5-off arithmetic slip was explained (components sum
+   to 1466, not 1461). No coverage was ever lost — the numbers were just mis-added and stale.
 4. For each suite, also record the **tier split** — how many assertions are *hermetic* (no network, no
    ssh, no remote fixture) vs *fixture-required*. This split determines what `nix flake check` can
    honestly run (nix sandbox has a pty but **no network** — verified).
@@ -135,15 +139,23 @@ Key measured results: hermetic total **1414**, 0 fail · `state/theme/render/han
 **Schema for `tests/parity.tsv`:**
 ```
 suite	tier	floor_before	pass_after	fail_after	skipped	notes
-state	hermetic	259			T6
-render	hermetic	69			T7
-app	hermetic	525			T10	(532 - 7 diag_head transferred to T2)
-diag	hermetic	7			T2	(transfer from app, ISC-9)
-...
+state	hermetic	259			T6	100% hermetic
+render	hermetic	69			T7	100% hermetic
+ui	hermetic	168			T8	100% hermetic (NOT the stale 90)
+theme	hermetic	171			T9	100% hermetic
+handoff	hermetic	35			T11	100% hermetic
+app	hermetic	444			T10	532 armed - 88 fixture - 7 diag_head transferred
+app	fixture	88			T14	app-live + fetch-live + discriminator
+diag	hermetic	7			T2	transfer from app (ISC-9)
+tui	hermetic	145			T12	boot-local/state-*/del-key/guards
+tui	fixture	27			T14	boot-remote + roundtrip
+resize	hermetic	123			T13	4 scenarios x 3 reps
+resize	fixture	15			T14	selection-shrink x 3 reps
+# hermetic sum = 1414 ; fixture sum = 130 ; armed total = 1544
 ```
 
 **Acceptance:** `parity.tsv` exists with all 8 suites + tier split + frozen thresholds, and the before
-column sums to 1461 (or the difference is explained in a note). *ISC-7*
+column sums to 1544 (or the difference is explained in a note). *ISC-7*
 
 **Anti-patterns:** trusting a `grep -c` of static `check()` callsites as a baseline (**loops multiply at
 runtime** — `state_cases.odin` is 139 static callsites → 198 runtime lines). Trust only a real run.
@@ -262,7 +274,7 @@ fine. Verify before committing. If the signature in `main.odin:1145-1160` keys o
   the 80/100-col overflow behaviour from `src/ui_cases.odin:505-532` preserved (theme and quit are the
   LAST hints to go, guarded by `ui.text_cols("t theme") + 2 + ui.text_cols("esc quit")`).
 
-**Parity, said out loud:** 7 assertions **transfer from `app` (532→525) to `diag` (0→7)**. Record both
+**Parity, said out loud:** 7 assertions **transfer from `app` hermetic (444→437) to `diag` (0→7)**. Record both
 rows in `parity.tsv`. Total unchanged. *ISC-9, ISC-10*
 
 **Anti-patterns:** deleting the tests because the symbol is hard to move (**ISC-A-1**). Renaming for
@@ -289,7 +301,7 @@ Three facts that must stay distinct or you will block yourself:
 ```nix
 # nix/tests.nix — sketch. NOT copy-paste; adapt.
 # odinTests      : hermetic tier, runs in the sandbox, gate enforces zero skips
-# odinTestsFull  : __noChroot = true, needs the fixture env passed through — the real 1461 gate
+# odinTestsFull  : __noChroot = true, needs the fixture env passed through — the real 1544 gate
 checks = { odinTests = odinTestsDrv { }; odinTestsFull = odinTestsFullDrv { }; };
 ```
 
@@ -400,7 +412,7 @@ grep -rn "sig_probe\|env_probe" dev/                → nothing (the heredocs ar
 **Owner:** S · **Depends on:** T17
 
 Fill `tests/parity.tsv`'s after columns and produce the before/after table in the plan directory.
-Report the honest new total vs **1461**, per suite, with **every** delta explained as a recorded
+Report the honest new total vs **1544**, per suite, with **every** delta explained as a recorded
 transfer or flagged as a regression. **A drop is a regression, said out loud — not a green suite.**
 
 ---
@@ -628,11 +640,15 @@ ISC-A-4 no Kitty protocol · D12/ISC-18 no Command ever targets `default`.
 
 ---
 
-### T10 — Suite: `app` (floor 525 — see transfer)
+### T10 — Suite: `app` (hermetic floor **437** — tier split + transfer)
 
 **Owner:** U1 · **Depends on:** T2, T6 · **Source:** `dev/app-smoke.sh` + `src/app_cases.odin`
 
-**Parity, said up front:** floor is **525**, not 532 — 7 assertions moved to `diag` in **T2**. Record
+**Parity, said up front:** `app+disc` **armed = 532** = **444 hermetic + 88 fixture-gated** (`app-live`,
+`fetch-live`, `discriminator` — those belong to **T14**). Of the 444 hermetic, **7 transfer to `diag`** in
+**T2**, leaving this suite a **hermetic floor of 437**. Record every row in `parity.tsv`:
+`app hermetic 444→437` · `diag 0→7` · `app fixture 88`. **Transfers and a tier split, not a loss** — if
+you cannot account for the 7 or the 88, stop. Record
 both rows in `parity.tsv`. **This is a transfer, not a loss.** If you cannot account for the 7, stop.
 
 - `app-unit` → `case_app_unit` (`app_cases.odin:69`).
@@ -650,7 +666,7 @@ both rows in `parity.tsv`. **This is a transfer, not a loss.** If you cannot acc
   older 2-counter versions and resets `PASS_TOTAL=0` — under the uniform gate this suite gets the
   **strong** rules instead. That is an intentional tightening.
 
-**Acceptance:** floor 525 met with the transfer recorded.
+**Acceptance:** hermetic floor **437** met, with the 7-assertion transfer and the 88-assertion fixture split both recorded. *ISC-7*
 
 ---
 
@@ -680,11 +696,11 @@ both rows in `parity.tsv`. **This is a transfer, not a loss.** If you cannot acc
 
 ---
 
-### T8 — Suite: `ui` (floor **~168**, NOT 90 — 6 cases)
+### T8 — Suite: `ui` (floor **168**, NOT the stale 90 — 6 cases)
 
 **Owner:** U3 · **Depends on:** T2 · **Source:** `dev/ui-smoke.sh` + `src/ui_cases.odin`
 
-> **⚠️ THE FLOOR IS ~168, NOT THE RECORDED 90.** Measured per-case (see `baseline-measurement.md`):
+> **⚠️ THE FLOOR IS 168, NOT THE RECORDED 90** (confirmed by the armed run). Measured per-case (see `baseline-measurement.md`):
 > `frame 92 · sessions 16 · shrink 12 · edit 20 · list 17 · float 11 = 168`.
 > The recorded "90" had `frame 14` — it predates the RCH-1 no-outer-border geometry proofs and the
 > `KEYS_MODE` footer-overflow checks, and was never updated. **Porting against a 90 floor would let 78
@@ -709,7 +725,7 @@ both rows in `parity.tsv`. **This is a transfer, not a loss.** If you cannot acc
 - The old pass rule (`ui-smoke.sh:48`) accepts `RESULT: PASS` with **zero `[PASS]` lines** as a green
   "(0 checks)" case. **Not portable.** Strong rule instead.
 
-**Acceptance:** floor **~168** across all 6 cases, each individually at its measured count
+**Acceptance:** floor **168** across all 6 cases, each individually at its measured count
 (92/16/12/20/17/11) — **per-case, not just the total**, so a loss in one case cannot be hidden by a gain
 in another. *ISC-A-1*
 
@@ -890,7 +906,7 @@ check("…and spawned no child at all", kid == -1 && int(posix.errno()) == 10,
 
 ---
 
-### T14 — Fixture-gated suites (the remote half of the 1461)
+### T14 — Fixture-gated suites (the 130-assertion remote half of the 1544)
 
 **Owner:** U4 · **Depends on:** T11, T12, T13 · **Source:** `src/app_live.odin`, `src/fetch_live.odin`,
 `dev/device_discriminator.py`
@@ -926,7 +942,7 @@ check("…and spawned no child at all", kid == -1 && int(posix.errno()) == 10,
   are covered in T12/T13 — coordinate rather than duplicate.
 - Fixture arms **must self-skip loudly** (reason sentence) when unset, never silently pass.
 
-**Acceptance:** `hs_check --tier=full` reaches **1461 total** with the per-suite figures matched.
+**Acceptance:** `hs_check --tier=full` reaches **1544 total** with the per-suite figures matched.
 *ISC-8, ISC-A-9*
 
 ---
