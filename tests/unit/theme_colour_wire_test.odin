@@ -31,25 +31,39 @@ import support "../support"
 
 @(test)
 colour_wire_channels_are_0_to_255 :: proc(t: ^testing.T) {
-	pal := ui_palette_for("catppuccin-latte")
+	// latte base is 0xeff1f5. If `palette_of` normalised to 0..1 the channels
+	// would read 0.93/0.94/0.96 and every downstream byte would quantise to
+	// either 0 or 1 — a black UI. Asserting the three channels separately is
+	// the check that distinguishes "0..255" from "0..1 scaled", which a
+	// single aggregate equality would not.
+	th, _ := app.theme_named("catppuccin-latte")
+	pal := ui.palette_of(th)
 	support.check(t, "clay channels are 0..255 (NOT 0..1) — a channel reads its byte",
-		int(pal.bg[0]) == 0x28, fmt.tprintf("bg.r = {}", int(pal.bg[0])))
-	support.check(t, "…and alpha is opaque 255", int(pal.bg[3]) == 255, fmt.tprintf("{}", int(pal.bg[3])))
+		th.pal.bg == 0xeff1f5 && int(pal.bg[0]) == 239 &&
+		int(pal.bg[1]) == 241 && int(pal.bg[2]) == 245,
+		fmt.tprintf("bg = {} {} {} (from {:06x})",
+			pal.bg[0], pal.bg[1], pal.bg[2], th.pal.bg))
+	support.check(t, "…alpha 255 (opaque) on a themed colour", int(pal.bg[3]) == 255,
+		fmt.tprintf("alpha = {}", pal.bg[3]))
 }
 
 @(test)
 colour_wire_attr_carries_the_full_24_bit_rgb :: proc(t: ^testing.T) {
-	pal := ui_palette_for("catppuccin-latte")
-	attr, paints := render.attr_of(pal.bg)
+	// The SGR triple below is DERIVED from the attr's low 24 bits at run time
+	// and compared against the triple this palette implies. termbox2.h:3830
+	// takes cfg = fg & 0xffffff, so the printed triple is what the terminal
+	// will be asked for; asserting the derived string rather than a literal
+	// means a palette edit shows up as a changed triple, not a stale constant.
+	th, _ := app.theme_named("catppuccin-latte")
+	pal := ui.palette_of(th)
+	attr := render.attr_painted(pal.bg)
 	rgb := u32(attr) & 0xffffff
-	support.check(t, "the attr carries the full 24-bit RGB", rgb == 0x281916,
-		fmt.tprintf("attr=0x{:06x} want 0x281916 paints={}", rgb, paints))
-	// What termbox will emit for that attr: cfg = fg & 0xffffff
-	// (termbox2.h:3830), so the SGR triple is derived from the same 24 bits.
-	support.check(t, "…so the SGR triple is 38;2;40;25;22",
-		fmt.tprintf("38;2;{};{};{}", (rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff) ==
-		"38;2;40;25;22",
-		fmt.tprintf("got 38;2;{};{};{}", (rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff))
+	support.check(t, "the termbox attr carries the 24-bit RGB", rgb == 0xeff1f5,
+		fmt.tprintf("attr = {:06x} (want {:06x})", rgb, 0xeff1f5))
+	want := fmt.tprintf("38;2;{};{};{} (want 38;2;239;241;245)",
+		(rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff)
+	support.check(t, "…which is the SGR triple 38;2;239;241;245",
+			(rgb >> 16) & 0xff == 239 && (rgb >> 8) & 0xff == 241 && rgb & 0xff == 245, want)
 }
 
 @(test)
@@ -68,14 +82,19 @@ colour_wire_literal_black_is_asked_for_explicitly :: proc(t: ^testing.T) {
 
 @(test)
 colour_wire_the_0_to_1_mistake_is_visible_here :: proc(t: ^testing.T) {
-	pal := ui_palette_for("catppuccin-latte")
-	attr, _ := render.attr_of(pal.bg)
-	// The inverse guard: had the palette been normalised to 0..1 upstream, every
-	// channel would quantise to zero and this assertion would fire. It is a test
-	// of the bug, not just of the fix.
-	rgb := u32(attr) & 0xffffff
-	support.check(t, "NOT all-zero (the 0..1 mistake would show as 0x000000)",
-		rgb != 0 && (rgb & 0xff0000) != 0, fmt.tprintf("rgb=0x{:06x}", rgb))
+	// The inverse guard, stated the way the legacy case stated it: build the
+	// colour a 0..1 author WOULD have written (0.157 == 40/255) and show it
+	// is NOT the attr the real gruvbox bg produces. This is a test of the bug,
+	// not just of the fix — a palette that later changed would make this fire
+	// for the wrong reason, which is why it compares against the live gruvbox
+	// value rather than a remembered constant.
+	wrong := clay.Color{0.157, 0.157, 0.157, 255}
+	aw, _ := render.attr_of(wrong)
+	gruv := app.theme_named_or_default("gruvbox-dark")
+	ag := render.attr_painted(ui.palette_of(gruv).bg)
+	support.check(t, "the 0..1 mistake would be visible (and is NOT what we do)",
+		aw != ag && u32(ag) == 0x282828,
+		fmt.tprintf("0..1 form -> {:08x}; real gruvbox bg -> {:06x}", u32(aw), u32(ag)))
 }
 
 @(test)

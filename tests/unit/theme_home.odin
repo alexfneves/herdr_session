@@ -144,15 +144,30 @@ scratch_dir :: proc(tag: string) -> string {
 // swap_in points XDG_CONFIG_HOME at a fresh scratch dir and returns the prior
 // state so `swap_out` can restore it exactly — including the difference
 // between "was set to empty" and "was unset", which a naive restore flattens.
+// XDG_WRITE_MU serialises every swap. Acquired by swap_in, released by
+// swap_out / swap_out_no_t. It is held for the whole duration of a live
+// test on purpose: the critical section is not the setenv call, it is the
+// period during which the process's notion of "where config lives" is a
+// lie. Releasing it at setenv-return would leave that window open.
+XDG_WRITE_MU : sync.Mutex = {}
+
 swap_in :: proc(tag: string) -> (Home, os.Error) {
 	h : Home = {}
+	sync.mutex_lock(&XDG_WRITE_MU)
 	h.dir = scratch_dir(tag)
 	if err := os.mkdir_all(h.dir, app.CONFIG_DIR_MODE); err != nil {
+		sync.mutex_unlock(&XDG_WRITE_MU)
 		return h, err
 	}
 	h.real = fingerprint_real_config()
 	h.had_xdg, h.had_set = os.lookup_env("XDG_CONFIG_HOME", context.allocator)
+	if !PROC_XDG_CAPTURED {
+		PROC_XDG_CAPTURED = true
+		PROC_XDG_START = h.had_xdg
+		PROC_XDG_START_SET = h.had_set
+	}
 	if err := os.set_env("XDG_CONFIG_HOME", h.dir); err != nil {
+		sync.mutex_unlock(&XDG_WRITE_MU)
 		return h, err
 	}
 	count_guarded_swap()
@@ -167,6 +182,7 @@ swap_in :: proc(tag: string) -> (Home, os.Error) {
 //   2. the swap did not leak — the process now sees the same XDG_CONFIG_HOME
 //      it saw before the swap.
 swap_out :: proc(t: ^testing.T, label: string, h: ^Home) {
+	defer sync.mutex_unlock(&XDG_WRITE_MU)
 	// Unset is restored as unset. Empty-but-set would leave later tests
 	// resolving against "" instead of $HOME/.config.
 	if h^.had_set {
@@ -369,6 +385,7 @@ swap_theme_cfg :: proc(t: ^testing.T, tag: string) -> string {
 // one is not available. It keeps the same guarantees and prints the same
 // evidence; a violation is still loud.
 swap_out_no_t :: proc(h: ^Home) {
+	defer sync.mutex_unlock(&XDG_WRITE_MU)
 	if h^.had_set {
 		os.set_env("XDG_CONFIG_HOME", h^.had_xdg)
 	} else {
@@ -466,3 +483,140 @@ release_home_slot :: proc(i: int) {
 // avoids allocating, and these two helpers keep the cast in ONE place.
 int_to_rawptr :: proc(i: int) -> rawptr { return transmute(rawptr)(i) }
 rawptr_to_int :: proc(p: rawptr) -> i64 { return transmute(i64)(p) }
+
+// PROC_XDG_START is the value XDG_CONFIG_HOME held before the FIRST swap in
+// this process. Captured in swap_in (see above) because that is the earliest
+// point at which it can be both read and known to still be pristine.
+PROC_XDG_START : string = ""
+PROC_XDG_START_SET : bool = false
+PROC_XDG_CAPTURED : bool = false
+
+proc_xdg_start_display :: proc() -> string {
+	if !PROC_XDG_CAPTURED { return "<never captured>" }
+	if !PROC_XDG_START_SET { return "<UNSET>" }
+	return PROC_XDG_START
+}
+
+proc_xdg_now_display :: proc() -> string {
+	v, ok := os.lookup_env("XDG_CONFIG_HOME", context.allocator)
+	if !ok { return "<UNSET>" }
+	return v
+}
+
+proc_xdg_matches_start :: proc() -> bool {
+	if !PROC_XDG_CAPTURED { return false }
+	now, ok := os.lookup_env("XDG_CONFIG_HOME", context.allocator)
+	if ok != PROC_XDG_START_SET { return false }
+	if !ok { return true }
+	return now == PROC_XDG_START
+}
+
+//-----------------------------------------------------------------------------
+// the filesystem battery
+//-----------------------------------------------------------------------------
+//
+// Every filesystem operation the theme suite performs, in one place, making
+// NO counted assertions of its own. It exists so the hygiene test can prove
+// "the real config survived ALL of it" without depending on which other test
+// files happened to run first.
+//
+// That is the difference between a proof and a hope. A before/after bracket
+// around "the rest of the suite" only covers whatever ran inside it; if a
+// test was filtered out with ODIN_TEST_NAMES, or a file was renamed so it
+// sorts later, the bracket quietly covers less than it claims while still
+// printing green. Running the battery here means the coverage is a property
+// of THIS test, not of the run order.
+//
+// The outcomes are not asserted here on purpose: asserting them would
+// double-count the same property already counted by the save/live cases that
+// assert on these exact operations. Here the battery is SETUP for the
+// fingerprint; the fingerprint is the assertion.
+theme_fs_battery :: proc() {
+	h, err := swap_in("hygiene-battery")
+	if err != nil {
+		fmt.printfln("[HS] battery swap_in failed: {}", err)
+		return
+	}
+	path := cfg_file(h.dir)
+
+	// 1. create-from-nothing
+	app.config_save_theme(path, "catppuccin-latte")
+
+	// 2. merge over a hand-edited file (the key-preservation path)
+	battery_write(path, HAND_EDITED_DOC)
+	app.config_save_theme(path, "nord")
+
+	// 3. the other two writers, so a leak through either is caught
+	app.config_save_remotes(path, []app.Remote{app.Remote{device = "hygiene.example"}})
+	app.config_save_cleanup(path, "only_created")
+
+	// 4. hand-edit again, then save, so a stale-document bug is exercised
+	battery_write(path, HAND_EDITED_DOC)
+	app.config_save_theme(path, "gruvbox-dark")
+
+	// 5. the real loader over what the writers produced
+	app.config_load()
+
+	// 6. a corrupt file, then a save over it
+	battery_write(path, "{ broken {{{")
+	app.config_load()
+	app.config_save_theme(path, "nord")
+
+	// 7. an unreadable file (branch depends on privilege; either is fine)
+	battery_write(path, `{"theme":"nord"}`)
+	os.chmod(path, os.Permissions{})
+	app.config_load()
+	os.chmod(path, os.Permissions_Read_All + os.Permissions_Write_All)
+
+	// 8. a save into a directory that does not exist yet
+	deep := fmt.tprintf("{}/deep/deeper/{}", h.dir, app.CONFIG_FILE_NAME)
+	app.config_save_theme(deep, "nord")
+
+	// 9. absent-file load after everything above
+	os.remove(path)
+	app.config_load()
+
+	swap_out_no_t(&h)
+}
+
+// HAND_EDITED_DOC is the merge fixture. One copy, shared with the save case,
+// so the battery and the asserted case provably exercise the SAME document —
+// two near-identical literals is two things that can drift, and the drift
+// would show up as a merge bug that is really a fixture typo.
+HAND_EDITED_DOC :: `{
+  "hand_added_note": "do not eat this",
+  "theme": "catppuccin-latte",
+  "future_key": {"nested": [1, 2, 3]},
+  "remotes": ["my-host"]
+}`
+
+// battery_write is a loud-but-un counted write. Loud because a write that
+// silently fails would let the battery "prove" the real config survived a run
+// that never actually wrote anything; un counted because the counted proof is
+// the fingerprint, not the write.
+battery_write :: proc(path: string, body: string) {
+	if err := os.write_entire_file_from_string(path, body); err != nil {
+		fmt.printfln("[HS] battery write FAILED {} — {}", path, err)
+	}
+}
+
+// ensure_battery runs the battery exactly once per process and returns the
+// number of swaps it contributed. Both hygiene proofs call it, and neither is
+// allowed to pass on an empty aggregate: an idempotent runner means whichever
+// hygiene test the harness happens to schedule first is the one that pays for
+// the work, and the other still gets a non-empty number to assert against.
+BATTERY_MU : sync.Mutex = {}
+BATTERY_RUN : bool = false
+BATTERY_SWAPS : int = 0
+
+ensure_battery :: proc() -> int {
+	sync.mutex_lock(&BATTERY_MU)
+	defer sync.mutex_unlock(&BATTERY_MU)
+	if !BATTERY_RUN {
+		BATTERY_RUN = true
+		before := AGG.n
+		theme_fs_battery()
+		BATTERY_SWAPS = AGG.n - before
+	}
+	return BATTERY_SWAPS
+}
