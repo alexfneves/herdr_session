@@ -72,9 +72,23 @@ main :: proc() {
 	for s in suites {
 		out_log := fmt.tprintf("{}/{}.out.log", a.report_dir, s.name)
 		err_log := fmt.tprintf("{}/{}.err.log", a.report_dir, s.name)
-		report_json := fmt.tprintf("{}/{}.json", a.report_dir, s.name)
+		// The report path comes from the SUITE SPEC, not from report_dir. The
+		// path is baked into the binary at build time (`ODIN_TEST_JSON_REPORT` is
+		// a #config, not an env var), so the only entity that knows where it
+		// points is whoever built the binary. Handing the child an env var and
+		// hoping it writes to report_dir/<name>.json cannot work: the binary
+		// writes where it was compiled to write, which is why this gate used to
+		// report registered=0 forever while the report sat unread on disk.
+		report_json := s.report_json
+		if len(report_json) == 0 {
+			report_json = fmt.tprintf("{}/{}.json", a.report_dir, s.name)
+		}
 
 		env := build_suite_env(&a, s, report_json)
+		// Remove any report from a previous run BEFORE spawning. If we read a
+		// stale file we would validate the last run, not this one — and a suite
+		// that crashed before writing would look green on someone else's numbers.
+		os.remove(report_json)
 		exit := hc.spawn_and_capture(s.binary, out_log, err_log, env)
 
 		out_text := read_text(out_log)

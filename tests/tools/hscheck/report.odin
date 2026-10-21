@@ -17,7 +17,7 @@ import "core:encoding/json"
 Json_Report :: struct {
 	total    : int,
 	success  : int,
-	duration : f64,
+	duration : i64,
 	packages : map[string][]Json_Test,
 }
 

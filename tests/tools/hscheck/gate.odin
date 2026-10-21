@@ -134,10 +134,18 @@ parse_tallies :: proc(text: string) -> [dynamic]TallyRow {
 	ok : bool = false
 	r : TallyRow = {}
 	for line in split_lines(text) {
-		defer delete(line)
-		if !starts_with(line, "HS_TALLY ") { continue }
-		r, ok = parse_tally_line(line)
-		if ok { append(&out, r) }
+		if starts_with(line, "HS_TALLY ") {
+			r, ok = parse_tally_line(line)
+			if ok { append(&out, r) }
+		}
+		// Deleted at the END of the body, not via `defer`. Odin runs deferred
+		// calls at procedure EXIT, and these rows outlive this procedure: with a
+		// defer every TallyRow.group was a slice of freed memory by the time
+		// max_by_group read it. The gate then folded 8 garbage groups at 44
+		// each into the total (8*44 + 54 = 406) while still exiting "green" —
+		// a silent corruption of exactly the kind this whole gate exists to
+		// prevent, inside the gate itself.
+		delete(line)
 	}
 	return out
 }
@@ -290,7 +298,8 @@ parse_tally_line :: proc(line: string) -> (TallyRow, bool) {
 	sp := index_of_char(rest, ' ')
 	if sp <= 0 { return TallyRow{}, false }
 	r : TallyRow = {}
-	r.group = rest[:sp]
+	// CLONE, not a slice: see parse_tallies on why the row must own its bytes.
+	r.group = strings.clone(rest[:sp], context.allocator)
 	fields := split_space(rest[sp+1:])
 	got_p := false
 	got_f := false
