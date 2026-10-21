@@ -142,7 +142,8 @@ suite	tier	floor_before	pass_after	fail_after	skipped	notes
 state	hermetic	259			T6	100% hermetic
 render	hermetic	69			T7	100% hermetic
 ui	hermetic	168			T8	100% hermetic (NOT the stale 90)
-theme	hermetic	171			T9	100% hermetic
+theme	hermetic	171	142	0	0	T9	DELIVERED 135 required (129 in-proc + 6 hygiene) + 7 additive = 142. GAP 36 deferred to T14 under tier `pty`. 135 + 36 = 171 floor holds.
+theme	pty	36				T14	DEFERRED, NOT DELETED. The 36 tty-dependent theme assertions (picker-preselect 7, apply-persist 7, corrupt-warning 5, unknown-theme 5, sgr-truecolour 4, black-is-black 3, remote-from-config 5). Needs the tests/pty driver (T3-T5); lands as tests/it/live_theme_pty_*.odin. Not runnable this wave.
 handoff	hermetic	35			T11	100% hermetic
 app	hermetic	444			T10	532 armed - 88 fixture - 7 diag_head transferred
 app	fixture	88			T14	app-live + fetch-live + discriminator
@@ -749,6 +750,37 @@ in another. *ISC-A-1*
   `config_parse_json`/`config_save_*`, and fingerprint the real file before/after either way.
 
 **Acceptance:** floor 171 with every hygiene check ported. *ISC-A-1, ISC-18*
+
+**Status: ✅ DONE (T9, U4) — 135 of 171 delivered, 36 deferred to T14 under tier `pty`.**
+
+Delivered in `tests/unit/theme_*.odin`, all green in one process:
+
+| group | pass | legacy |
+|---|---|---|
+| `theme_set_test` | 13 | theme-set 13 |
+| `theme_resolve_test` | 23 | theme-resolve 23 |
+| `theme_config_parse_test` | 34 | config-parse 34 |
+| `theme_config_save_test` | 27 | config-save 27 |
+| `theme_config_live_test` | 21 | config-live 21 |
+| `theme_colour_wire_test` | 12 | colour-wire 11 (+1 additive) |
+| `theme_hygiene_test` | 6 | hygiene 6 |
+| `theme_preselect_test` | 6 | — additive, not a pty substitute |
+
+Required 129 in-proc + 6 hygiene = **135**; +7 additive = **142** counted.
+`135 + 36 deferred = 171` — the floor holds and the gap is visible in
+`tests/parity.tsv` on its own `theme`/`pty` row.
+
+Hygiene landed as runtime proof, not prose: every `swap_in` fingerprints the
+developer's real `~/.config/herdr_session.json` before pointing XDG at a
+scratch dir and re-fingerprints after restore. Verified run:
+`first_seen == last_seen == 0cce060b885d2796d87ef1f4fd8d98b5`, 7 swaps, 0 violations.
+
+Old suite re-checked armed: `BIN=./result/bin/herdr-session ALLOW_SKIP=0 ./dev/theme-smoke.sh`
+→ **171 PASS / 0 FAIL**. `nix build .` green.
+
+**Not done, on purpose:** the 36 tty-dependent assertions. `tests/pty/` does not
+exist yet and re-implementing a pty harness inside `tests/unit` is not T9's
+lane. See `DECISIONS.md` D-T9 (option A, option C is the permanent home).
 
 ---
 
