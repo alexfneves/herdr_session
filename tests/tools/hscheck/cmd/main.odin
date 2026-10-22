@@ -103,6 +103,7 @@ main :: proc() {
 			have_reg = have,
 			run_ok = sp.started && !sp.timed_out,
 			exit = int(sp.exit),
+			report_path = report_json,
 		}
 		v := hc.evaluate_suite(s, ev)
 		v.timed_out = sp.timed_out

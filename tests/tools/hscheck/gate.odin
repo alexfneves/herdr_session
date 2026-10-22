@@ -225,6 +225,13 @@ SuiteEvidence :: struct {
 	have_reg   : bool,
 	run_ok     : bool,
 	exit       : int,
+	// Where the report was LOOKED FOR. Named in the failure message on
+	// purpose: "no JSON report was produced" with no path attached sends the
+	// reader off guessing between the build define, the report-dir, and the
+	// suite spec. That guessing is not a diagnostic. Every report-path
+	// confusion this session came from a message that would not say where it
+	// had been looking.
+	report_path : string,
 }
 
 evaluate_suite :: proc(s: Suite, ev: SuiteEvidence) -> Verdict {
@@ -236,9 +243,13 @@ evaluate_suite :: proc(s: Suite, ev: SuiteEvidence) -> Verdict {
 
 	// Rule 2 — registered count.
 	if !ev.have_reg {
-		add_problem(&v, "no JSON test report was produced, so the REGISTERED test " +
-			"count is unknown; core:testing scores 0 tests as a pass and this gate " +
-			"refuses to guess")
+		add_problem(&v, fmt.tprintf("no JSON test report at {} — the REGISTERED test "+
+			"count is unknown; core:testing scores 0 tests as a pass and this gate "+
+			"refuses to guess. If the suite binary was NOT built with "+
+			"-define:ODIN_TEST_JSON_REPORT=<this exact path>, it wrote nowhere, or wrote "+
+			"somewhere else: the path is baked in at BUILD time and cannot be redirected "+
+			"by an env var or by --report-dir. See tests/tools/hscheck/HOWTO.md for the "+
+			"one sanctioned invocation", ev.report_path))
 	} else if ev.registered == 0 {
 		add_problem(&v, "0 tests REGISTERED — the binary built, but nothing was " +
 			"registered with core:testing. core:testing exits 0 for this. This is " +
