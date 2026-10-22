@@ -63,7 +63,7 @@ flood_rep :: proc(t: ^testing.T, rep: int) {
 	// poll cycle and the ratio collapses (observed: 22 events / 7 passes with no
 	// settle, 1 event / 1 pass after it).
 	quiet_pre := 0
-	for i in 0 ..< 6 {
+	for _ in 0 ..< 6 {
 		quiet_pre = rh_silence_window(a.d, 200)
 		if quiet_pre == 0 { break }
 	}

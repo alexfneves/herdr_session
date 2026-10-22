@@ -97,7 +97,7 @@ eintr_rep :: proc(t: ^testing.T, rep: int) {
 	// (1) SILENCE BASELINE. If the app is still talking on its own, a later
 	// reply proves nothing, so settle until a window comes back quiet.
 	quiet := 0
-	for i in 0 ..< 6 {
+	for _ in 0 ..< 6 {
 		quiet = rh_silence_window(a.d, 500)
 		if quiet == 0 { break }
 	}

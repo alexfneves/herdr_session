@@ -33,7 +33,6 @@ package it
 // split on whitespace, read `key=<int>`. No regex.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import "core:c"
 import "core:fmt"
 import "core:os"
 import "core:strings"
