@@ -957,28 +957,48 @@ tui_host_line :: proc() -> string {
 	return out
 }
 
+// tui_state_text is the HEADER's second line: the current state, in words.
+// It is deliberately ONLY the label. The notice, the host verdicts and the
+// provenance live in the footer (see tui_footer_text), so the line under the
+// title always answers exactly one question — which state am I in? — and never
+// lets a long notice scroll the state off the centred line it belongs to.
 tui_state_text :: proc() -> string {
+	return app.state_label(tui.machine.state)
+}
+
+// tui_footer_text is the footer's leading cell: everything the machine reports
+// that is not the state (which moved to the header).
+//
+// A notice leads the slot, exactly as it led the old state text — the user must
+// see what they just earned, and the accent colour is what says "this, right
+// now". Superseding the warning is fine: the warning is re-derived from the
+// config every frame, so it returns as soon as the notice expires.
+//
+// ISC-19: a config problem has to be visible without being fatal, so the
+// warning carries the same slot when no notice is up.
+//
+// The provenance segment goes LAST on the right: when the row is short it is the
+// first thing to be cut, and when the user needs it (an unexpected host set) it
+// is still there.
+//
+// There is NO list-age token here. `tui_list_age` is still true and still used,
+// but it belongs in the refresh notice the user asked for with Ctrl+L, not in a
+// permanent status cell nobody reads.
+tui_footer_text :: proc() -> string {
 	if tui.notice != "" { return tui.notice }
-	// ISC-19: a config problem has to be visible without being fatal. The
-	// warning sits in the state slot (the first thing the eye lands on after
-	// the header) and is superseded by any notice, so it never hides a verdict
-	// the user just earned.
 	warn := app.config_warning_text(tui.cfg)
-	if warn != "" {
-		return fmt.tprintf("\u26a0 {}  ·  {}  ·  {}", warn,
-			app.state_label(tui.machine.state), tui_host_line())
-	}
-	// The provenance segment goes LAST on the right, after the per-host verdict and
-	// the age token: when the row is short it is the first thing to be cut, and
-	// when the user needs it (an unexpected host set) it is still there. Putting it
-	// first would let a long host list hide the state word, which is worse.
 	src := tui_source_line()
-	if src != "" {
-		return fmt.tprintf("{}  ·  {}  ·  {}  ·  {}", app.state_label(tui.machine.state),
-			tui_host_line(), tui_list_age(), src)
+	host := tui_host_line()
+	if warn != "" {
+		if src != "" {
+			return fmt.tprintf("\u26a0 {}  ·  {}  ·  {}", warn, host, src)
+		}
+		return fmt.tprintf("\u26a0 {}  ·  {}", warn, host)
 	}
-	return fmt.tprintf("{}  ·  {}  ·  {}", app.state_label(tui.machine.state),
-		tui_host_line(), tui_list_age())
+	if src != "" {
+		return fmt.tprintf("{}  ·  {}", host, src)
+	}
+	return host
 }
 
 // tui_source_line names the provenance of the remote set in the footer, using the
@@ -1028,6 +1048,7 @@ tui_paint :: proc() {
 	f.rows = rows
 	f.title = "herdr-session"
 	f.state = tui_state_text()
+	f.rest = tui_footer_text()
 	f.keys = tui_keys()
 	f.pal = &tui.pal
 
@@ -1539,7 +1560,14 @@ main :: proc() {
 		os.exit(2)
 	}
 
-	print_report()
+	// The verdict belongs to the smoke driver, not to the product. `tui` is what
+	// a user gets from a bare `nix run`, and a `=== RESULT: PASS ===` line after
+	// they quit is a test harness talking to itself where a human was trying to
+	// work — so the report is printed for every OTHER subcommand (the smoke and
+	// evidence cases depend on it) and never for the application path.
+	if name != "tui" {
+		print_report()
+	}
 	code := 0
 	if !ok { code = 1 }
 	os.exit(code)

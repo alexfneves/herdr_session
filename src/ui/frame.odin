@@ -3,8 +3,8 @@ package ui
 // ============================================================================
 // ui.frame — the outer layout, owned by Clay (T5.1)
 //
-// The frame is the top-to-bottom spine: Header (1 row) / Main (grows) / Footer
-// (1 row), inside a root element sized to exactly the terminal.
+// The frame is the top-to-bottom spine: Header (2 rows: title + state) / Main
+// (grows) / Footer (1 row), inside a root element sized to exactly the terminal.
 //
 // ONE Clay feature draws every line the user sees, so nothing is hand-painted:
 // the root carries `border.width.betweenChildren = 1` and NOTHING else —
@@ -65,7 +65,12 @@ FRAME_PAD :: 0 // RCH-1: there is no outer border to keep content clear of.
 	           // This used to be 1 as the border allowance; with the box gone the
 	           // freed 2x2 belongs to the content. Rules span the full width.
 FRAME_GAP :: 2 // childGap — see the >= 2 invariant above. DO NOT LOWER.
-HEADER_ROWS :: 1
+// HEADER_ROWS is 2 since the state moved up out of the footer: row 1 is the
+// title, row 2 the current state, both centred. Everything downstream of this
+// constant (frame_layout's rule_top / main_y / main_rows / footer_y) follows it,
+// which is why the smallest supported terminal (MIN_ROWS = 10, terminal/resize) leaves
+// main_rows = 10 - (0 + 2 + 2 + 2 + 1 + 0) = 3 > 0 rather than underflowing.
+HEADER_ROWS :: 2
 FOOTER_ROWS :: 1
 RULE_ROWS :: 1 // a betweenChildren rule occupies exactly one cell row
 
@@ -202,11 +207,18 @@ Key_Hint :: struct {
 
 // Frame is everything the spine needs to draw itself. The state machine (T5.4)
 // fills it in per frame; the view never invents content.
+//
+// The state moved OUT of the footer and INTO the header, so `state` now feeds
+// the header's second (centred) line and `rest` feeds the footer's leading
+// cell. `rest` is deliberately a new field rather than a widening of `state`:
+// the header says WHERE you are, the footer says WHAT the machine sees, and one
+// string cannot be both.
 Frame :: struct {
 	cols : i32,
 	rows : i32,
-	title : string, // header: program title
-	state : string, // footer: the current state, in words
+	title : string, // header line 1: program title, centred
+	state : string, // header line 2: the current state, in words, centred
+	rest : string, // footer: the notice / per-host verdict / provenance
 	keys : []Key_Hint, // footer: every key the user can press right now
 	pal : ^Palette,
 }
@@ -478,7 +490,17 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 		},
 	})
 
-	// ── HEADER: the program title, 1 row ──
+	// ── HEADER: the title on row 1, the state on row 2, both centred ──────
+	// TopToBottom (not LeftToRight) because the two lines are stacked, and
+	// `childAlignment.x = .Center` is the CROSS-axis alignment for a vertical
+	// container — clay.h aligns each child on the axis perpendicular to the
+	// layout direction with childAlignment.x, so every line here is centred
+	// without a hand-computed column. childGap stays 0 inside the header: the
+	// two lines are adjacent rows, and the >= 2 rule that FRAME_GAP exists for
+	// is about the ROOT's children, where a betweenChildren rule is drawn.
+	// Both strings are ellipsised to the inner width so a long state line can
+	// never push a glyph past the terminal edge.
+	inner := frame_layout(f.cols, f.rows).cols
 	clay._OpenElementWithId(clay.ID(HEADER_ID))
 	clay.ConfigureOpenElement(clay.ElementDeclaration{
 		layout = clay.LayoutConfig{
@@ -486,11 +508,12 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 				width  = clay.SizingGrow(),
 				height = clay.SizingFixed(HEADER_ROWS),
 			},
-			layoutDirection = clay.LayoutDirection.LeftToRight,
+			layoutDirection = clay.LayoutDirection.TopToBottom,
 			childAlignment = clay.ChildAlignment{x = .Center},
 		},
 	})
-	clay.Text(f.title, clay.TextElementConfig{textColor = pal.header_fg})
+	clay.Text(ellipsize(f.title, inner), clay.TextElementConfig{textColor = pal.header_fg})
+	clay.Text(ellipsize(f.state, inner), clay.TextElementConfig{textColor = pal.header_fg})
 	clay._CloseElement()
 
 	// ── MAIN: left OPEN for the caller ──
@@ -520,6 +543,11 @@ frame_close :: proc(p: ^Painter, f: ^Frame) -> render.Stats {
 	return render.render_frame(&p.rend, cmds)
 }
 
+// frame_footer paints the footer row: the machine's own report (`f.rest`) first,
+// then the key hints. The STATE is not here — it moved to the header, and the
+// list-age token is gone from this line entirely. What is left in `rest` is the
+// notice, the config warning, the per-host verdict and the provenance of the
+// remote set, composed by the driver.
 frame_footer :: proc(f: ^Frame, pal: ^Palette) {
 	inner := frame_layout(f.cols, f.rows).cols
 	if clay.UI(clay.ID(FOOTER_ID))({
@@ -532,14 +560,14 @@ frame_footer :: proc(f: ^Frame, pal: ^Palette) {
 			childGap = 1,
 		},
 	}) {
-		state_w := text_cols(f.state)
-		if state_w > inner {
-			state_w = inner
+		rest_w := text_cols(f.rest)
+		if rest_w > inner {
+			rest_w = inner
 		}
-		clay.Text(ellipsize(f.state, state_w), clay.TextElementConfig{textColor = pal.accent})
-		rest := inner - state_w - 1
-		if rest > 0 {
-			clay.Text(keys_line(f.keys, rest), clay.TextElementConfig{textColor = pal.dim})
+		clay.Text(ellipsize(f.rest, rest_w), clay.TextElementConfig{textColor = pal.accent})
+		room := inner - rest_w - 1
+		if room > 0 {
+			clay.Text(keys_line(f.keys, room), clay.TextElementConfig{textColor = pal.dim})
 		}
 	}
 }

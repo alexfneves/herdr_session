@@ -111,16 +111,22 @@ state_needs_refresh :: proc(s: State) -> bool {
 	return s == .attach || s == .delete_session
 }
 
+// state_label is the DISPLAY name of a state: a human phrase, not the enum's
+// snake_case identifier. It exists so the header can say "Attach session"
+// instead of "attach", and the two are deliberately decoupled — nothing on a
+// wire, in a config file or in a comparison keys off this string. Anything that
+// needs the identity of a state must switch on the enum itself, because a phrase
+// is free to be reworded and an enum name is not.
 state_label :: proc(s: State) -> string {
 	switch s {
-	case .mode_selection:    return "mode_selection"
-	case .name_local:        return "name_local"
-	case .remote_server:     return "remote_server"
-	case .name_remote_named: return "name_remote_named"
-	case .attach:            return "attach"
-	case .delete_session:    return "delete_session"
-	case .theme:             return "theme"
-	case .error:             return "error"
+	case .mode_selection:    return "Mode selection"
+	case .name_local:        return "Name local session"
+	case .remote_server:     return "Select remote server"
+	case .name_remote_named: return "Name remote session"
+	case .attach:            return "Attach session"
+	case .delete_session:    return "Delete session"
+	case .theme:             return "Theme"
+	case .error:             return "Error"
 	}
 	return "?"
 }
@@ -131,15 +137,19 @@ state_is_session_view :: proc(s: State) -> bool {
 	return s == .mode_selection || s == .attach || s == .delete_session
 }
 
-// state_is_filter_view: the states whose layout DISPLAYS a filter line. The
-// Sessions view is one of them even in {Mode selection}, because the spec's
-// Sessions content is "a line for the filter, and below it the table".
+// state_is_filter_view: the states whose layout DISPLAYS a filter line.
+// {Mode selection} is NOT one of them: the landing screen is the mode menu, and
+// a filter input sitting above its table invited typing into a state that does
+// not accept it. Every other state that shows the Sessions table or a picker —
+// {Select remote server}, {Attach session}, {Delete session}, {Select theme} —
+// still draws the line, which is where the filter is actually used.
 //
 // Do NOT read this as "typing here edits the filter" — it is not. See
 // `state_filter_is_editable`, which is the narrower set the spec actually names.
+// The two predicates answer different questions (is the line drawn / does typing
+// go into it) and are deliberately not merged.
 state_is_filter_view :: proc(s: State) -> bool {
-	return s == .mode_selection || s == .remote_server ||
-		s == .attach || s == .delete_session || s == .theme
+	return s == .remote_server || s == .attach || s == .delete_session || s == .theme
 }
 
 // state_filter_is_editable: THE FOUR STATES that own the "[Other keys] type in the
