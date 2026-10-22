@@ -424,3 +424,58 @@ the entire migration cold.
 **Approved for Agent S to apply directly** (S verified it on a worktree copy: product builds; a test
 binary importing `app` passes; importing `ui` passes), with a temporary lane extension to
 `src/terminal/**` and `src/app/{exec,herdr,fetch}.odin`. No other agent is concurrently writing there.
+
+---
+
+# RCH-9 — Copy and the state's home (user, 2026-10-22) — ✅ APPLIED
+
+Five changes, all display-layer. None of them touches an enum name, a wire value
+or a config key.
+
+| # | Change | Where |
+|---|---|---|
+| 1 | `{Mode selection}` **no longer displays the filter line**. Every other filter state still does. | `app.state_is_filter_view` drops `.mode_selection` |
+| 2 | The state is **a human phrase**, not snake_case: `Mode selection`, `Name local session`, `Select remote server`, `Name remote session`, `Attach session`, `Delete session`, `Theme`, `Error`. | `app.state_label` |
+| 3 | **The state moved from the FOOTER to the HEADER.** Header = title centred (row 1) + state centred (row 2); `HEADER_ROWS 1 -> 2`. Footer keeps the rest. | `ui.frame_layout`, `frame_open`, `frame_footer` |
+| 4 | **The list-age token is out of the footer.** `tui_list_age` stays — the `Ctrl-L` notice still reports the age where the user actually asked for it. | `main.tui_footer_text` |
+| 5 | **The product never prints a test verdict.** `print_report` is skipped on the `tui` path; every smoke/evidence subcommand keeps it. | `main.main` |
+
+## What 1 means for the two predicates (do not merge them)
+
+`state_is_filter_view` answers **"is the filter line DRAWN here?"**.
+`state_filter_is_editable` answers **"does typing go INTO the filter here?"** — and
+it is **unchanged**: still exactly `{Select remote server}`, `{Attach session}`,
+`{Select session to delete}`, `{Select theme}`. RCH-3/R2's typing rule is
+untouched; only the picture changed.
+
+The landing screen loses the line because it was an input the state could not
+edit: a filter you cannot type into is decoration that costs a row. Losing the
+row is a **gain** — `session_body` derives its body height from the same
+predicate, so the table expands into the space instead of reserving it for a
+line it never painted.
+
+## The underflow risk in 3 (the real one)
+
+`frame_layout` derives `rule_top`, `main_y`, `main_rows` and `footer_y` from
+`HEADER_ROWS`, so a second header row eats one row of MAIN everywhere. At the
+smallest terminal the app renders — `MIN_COLS=40`, `MIN_ROWS=10`
+(`terminal/resize.odin`; smaller is replaced by the too-small notice):
+
+    main_rows = 10 - (FRAME_PAD 0 + HEADER_ROWS 2 + GAP 2 + GAP 2 + FOOTER_ROWS 1 + FRAME_PAD 0) = 3
+
+Positive, and `frame_layout` clamps to 0 regardless, so no computation
+underflows. The two consumers floor their own body at 1 row. Verified at
+40x10 (renders: 2 header rows, rule, table, rule, footer) and at 40x9 (the
+too-small notice replaces the spine, exactly as designed).
+
+## Known churn caused by 2 and 3 (left failing, on purpose)
+
+- `ui-frame`: **"footer shows the current state"** — the assertion encodes the
+  footer being the state's home. That is now the header's job.
+- `dev/tui_drive.py`: every scenario that greps the **footer** for a state
+  marker (`mode_selection  ·  `, `name_local  ·  `, …) now fails, both because
+  the phrase moved and because it is no longer snake_case. The scenarios are
+  still meaningful; they are looking in the wrong place.
+- `dev/tui_drive.py refresh-key`: the three list-age assertions
+  (`"list " in footer`, `"list now" in footer`) fail by construction — the
+  token is off the footer. The `Ctrl-L` notice assertion itself still passes.
