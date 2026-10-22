@@ -153,20 +153,22 @@ rh_spawn :: proc(scenario: string, rep: int, rows, cols: i32) -> (a: ^Rh_App, er
 	return a, ""
 }
 
-// rh_stop asks the app to leave the way a user would end it (SIGTERM → the loop
-// sets `quitting` → tui_dump_trace runs on the normal exit path) and then reads
-// the trace the app wrote. The trace is only ever available AFTER the exit,
-// which is why every scenario ends here rather than sampling mid-run.
+// rh_stop asks the app to leave the way a user would end it and then reads the
+// trace it wrote. Ctrl+C (\x03 written to the master → SIGINT to the foreground
+// group), NOT SIGTERM: SIGINT is the app's "the user asked to quit" path, which
+// walks out through tui_dump_trace; SIGTERM was observed dying before the dump
+// (exit=143, trace file never created). The trace only ever exists AFTER the
+// exit, which is why every scenario ends here rather than sampling mid-run.
 rh_stop :: proc(a: ^Rh_App) -> bool {
 	if a == nil || a.stopped { return len(a.trace) > 0 }
 	a.stopped = true
-	pty.pty_kill(a.d, posix_sigterm())
-	for _ in 0 ..< 100 {
-		if !pty.pty_alive(a.d) { break }
-		time.sleep(50 * time.Millisecond)
+	pty.pty_send(a.d, "\x03")
+	for _ in 0 ..< 50 {
+		a.trace = rh_slurp(a.trace_path)
+		if len(a.trace) > 0 { break }
+		time.sleep(100 * time.Millisecond)
 	}
 	rh_read_pipe(a)
-	a.trace = rh_slurp(a.trace_path)
 	rh_log(a.log, fmt.tprintf("exit: {} trace_bytes={}", pty.pty_exit_info(a.d), len(a.trace)))
 	for ln in rh_split_lines(a.trace) { rh_log(a.log, fmt.tprintf("  {}", ln)) }
 	return len(a.trace) > 0
@@ -284,8 +286,14 @@ rh_has_resize_line :: proc(trace: string) -> bool {
 rh_row_text :: proc(s: ^pty.Screen, r: int) -> string {
 	buf: [dynamic]u8
 	if !pty.screen_row_text(s, r, &buf) { return "" }
-	if len(buf) == 0 { return "" }
-	return string(buf[:])
+	if len(buf) == 0 { delete(buf); return "" }
+	// Clone out before the dynamic buffer goes away: the returned string is
+	// handed to callers that outlive this frame, and the grid scanner runs
+	// once per row per measurement, so an unfreed buffer here is not a leak
+	// you can ignore at 40 rows a pop.
+	out := strings.clone(string(buf[:]), context.allocator)
+	delete(buf)
+	return out
 }
 
 // rh_strip removes leading/trailing blanks. Hand-rolled because the trim
