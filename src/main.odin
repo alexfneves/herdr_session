@@ -1080,7 +1080,16 @@ session_body :: proc(l: ui.Frame_Layout) {
 	rows := tui_project_shown()
 	tui_sync_text(&tui.sess.filter, app.text_of(&tui.machine.filter))
 	tui.sess.sel = tui.machine.held
-	body := l.main_rows - 2          // filter line + column header
+	// The filter LINE is drawn only where the machine says this state displays
+	// one. {Mode selection} does not, so it gets the row back rather than an
+	// empty, uneditable input — and the row count below follows the same
+	// predicate, because a table that assumes a filter line it never painted
+	// loses a row to a phantom.
+	show_filter := app.state_is_filter_view(tui.machine.state)
+	tui.sess.show_filter = show_filter
+	chrome: i32 = 1 // the column header
+	if show_filter { chrome += 1 }
+	body := l.main_rows - chrome
 	if body < 1 { body = 1 }
 	ui.sessions_clamp(&tui.sess, rows, body)
 	ui.sessions_paint(&tui.sess, rows, l.cols, body, &tui.pal)
