@@ -52,6 +52,48 @@ package unit
 // Every test that touches the terminal takes RENDER_TERM_LOCK for its whole
 // body, so exactly one holds it regardless of how the runner is threaded.
 // ─────────────────────────────────────────────────────────────────────────────
+// THE 43-BYTE LEDGER — an openpty argument-order inversion, measured
+// ─────────────────────────────────────────────────────────────────────────────
+// This suite's wire test spent a long time capturing EXACTLY 43 bytes — termbox's
+// init escapes and nothing else — while the cell-level tests over the same frame
+// passed. Every theory pointed at the renderer (frame never presented, drain
+// sampled too early, layout given no size). All three were false. The measurement
+// that closed it, with strace on a failing run:
+//
+//   write(3, "\e[?1049h\e[22;0;0t\e[?1h\e=\e[?25l\e(B\e[m\e[H\e[2J", 43) = 43
+//   write(3, "\e(B\e[m\e[38;2;255;60;60;48;2;16;20;28m\e[1;1H\342\224\214...", 1657) = 1657   ← the FRAME, painted
+//   write(3, "\e[?12l\e[?25h...\e[?1049l...", 81) = 81                            ← termbox's exit codes
+//   ioctl(4, FIONREAD, [0]) = 0                                                     ← NONE of it queued
+//   close(3) → read(4) = -1 EIO                                                    ← drain ends with 43
+//
+// The frame WAS painted and DID reach the fd — `write` returned 1657 — and yet
+// none of it was ever readable, and the drain sat blocked in read() the whole
+// time without waking. Bytes going in one end and not coming out the other means
+// the two ends are not the ends anyone thinks they are.
+//
+// They were swapped. `openpty`'s prototype is
+//     int openpty(int *master, int *slave, ...)
+// — MASTER FIRST. This file declared it as `(slave, master)`. Same arity, same
+// types (`^FD`, `^FD`), so the compiler and the linker both said nothing. The
+// result: `pw.slave` held the ptmx MASTER (termbox bound to it) and `pw.master`
+// held the real SLAVE (the drain reading it). termbox's output was therefore
+// injected into the slave's INPUT line discipline — which is canonical, line-
+// buffered, 4 KiB-per-line, and echoing — instead of being read off the master's
+// OUTPUT queue. The 43 init bytes squeezed through as one short line; the 1738
+// bytes of frame sat behind a canonical read that never completed. That is the
+// whole bug: not a race in the capture, and nothing to do with the renderer.
+//
+// Two consequences for anyone editing this file:
+//
+//   * An FFI declaration is a comment the compiler cannot check. Two arguments
+//     of the same type in the wrong order is invisible here and fatal downstream.
+//     Verify the prototype against the header, not against the variable names.
+//
+//   * The failure was FLAKY (43 / 1700 / 1781 bytes across runs), which made it
+//     look like a timing bug. Line-discipline buffering can look like timing
+//     through a pipe. Count the bytes, name them, and check what the queue says
+//     at the moment of loss (`HS_WIRE_DUMP=1` prints the whole stream escaped).
+// ─────────────────────────────────────────────────────────────────────────────
 
 import "core:c"
 import "core:fmt"
@@ -104,10 +146,28 @@ foreign import odin_c "system:c"
 
 @(default_calling_convention = "c")
 foreign odin_c {
-	// openpty(slave, master, name, termios, winsize). NULL name/termios is the
+	// openpty(master, slave, name, termios, winsize). NULL name/termios is the
 	// usual call: unnamed pty, default line discipline, size from winsize.
-	openpty :: proc(slave: ^posix.FD, master: ^posix.FD, name: rawptr, t: rawptr, ws: ^Win_Size) -> c.int ---
+	//
+	// THE ORDER OF THE FIRST TWO ARGUMENTS IS THE WHOLE CONTRACT, and it is not
+	// what a reader might assume. glibc's prototype (pty.h, verified in the
+	// 2.42-84 dev package this build links) is
+	//     int openpty(int *master, int *slave, char *name,
+	//               const struct termios *termios, const struct winsize *winp);
+	// MASTER FIRST, slave second. This declaration previously read
+	// (slave, master) — same arity, same types, compiles and links without a
+	// murmur — and every fd downstream was inverted: termbox bound to the ptmx
+	// MASTER and the capture drained the SLAVE. That inversion is the root
+	// cause of the 43-byte wire recorded in this file's ledger; see the note in
+	// wire_capture for the measurement.
+	openpty :: proc(master: ^posix.FD, slave: ^posix.FD, name: rawptr, t: rawptr, ws: ^Win_Size) -> c.int ---
+	// ioctl(fd, FIONREAD, &n) — bytes sitting in the pty queue, unread.
+	// Named hs_ioctl_ because `ioctl` is already declared foreign by src/ui_cases.odin.
+	@(link_name="ioctl")
+	hs_ioctl_ :: proc(fd: c.int, request: c.ulong, arg: ^c.int) -> c.int ---
 }
+
+FIONREAD :: 0x541B  // TIOCINQ on Linux: bytes queued for the next read
 
 // WIRE_CAPACITY caps the captured stream, and the reason it is a FIXED static
 // buffer rather than a [dynamic]u8 is a use-after-free that was measured here.
@@ -241,7 +301,7 @@ wire_open :: proc(t: ^testing.T, label: string, loc := #caller_location) -> bool
 	master : posix.FD = -1
 	slave : posix.FD = -1
 	ws := Win_Size{rows=RENDER_ROWS, cols=RENDER_COLS}
-	rc := openpty(&slave, &master, nil, nil, &ws)
+	rc := openpty(&master, &slave, nil, nil, &ws)   // master FIRST — see the foreign block
 	if rc != 0 {
 		support.check(t, fmt.tprintf("{}: openpty allocated a pty", label), false,
 			fmt.tprintf("openpty -> {} (errno={})", rc, posix.get_errno()))
@@ -254,6 +314,11 @@ wire_open :: proc(t: ^testing.T, label: string, loc := #caller_location) -> bool
 	pw.up = true
 	sync.atomic_store(&pw.wire_len, 0)
 	sync.atomic_store(&pw.wire_lost, 0)
+	// Reset the drain's "I am parked in read()" flag BEFORE starting it. The
+	// handle is a process global reused across tests; a stale true from the
+	// previous drain would let the spin below pass before this thread had even
+	// reached its read, reopening exactly the lost-bytes window it exists to close.
+	sync.atomic_store(&pw.started, false)
 
 	pw.drain = thread.create(drain_proc, .Normal, "hs-render-wire-drain")
 	pw.drain.data = &pw
@@ -293,14 +358,32 @@ Spin : for _ in 0 ..< 200_000 {
 }
 
 // wire_capture finishes the stream: shut termbox down (so its exit codes are in
-// the capture too), drop the slave so the drain sees EIO, and join it. After
-// this `wire_bytes()` is final. Idempotent.
+// the capture too), wait for the drain to have taken every queued byte, drop
+// the slave so the drain sees EIO, and join it. After this `wire_bytes()` is
+// final. Idempotent.
+//
+// THE WAIT IS NOT OPTIONAL. Closing the last slave fd hangs up the pair, and
+// whatever the kernel still holds in the pty queue at that moment is discarded,
+// not delivered. termbox flushes synchronously, so in the common case there is
+// nothing left to wait for — but "in the common case" is precisely how a
+// capture ends up silently short by a frame while still looking like a stream.
+// Draining to FIONREAD == 0 first makes loss impossible rather than unlikely.
 wire_capture :: proc(t: ^testing.T, label: string, loc := #caller_location) {
 	if !pw.up || pw.captured { return }
 	if pw.tb_live {
 		tb.tb_shutdown()
 		pw.tb_live = false
 	}
+
+	// Spin until the master has nothing queued for the drain. Bounded, so a
+	// wedged drain fails the capture instead of hanging the suite.
+	pending : c.int = -1
+	Drained : for _ in 0 ..< 200_000 {
+		hs_ioctl_(c.int(pw.master), c.ulong(FIONREAD), &pending)
+		if pending <= 0 { break Drained }
+		thread.yield()
+	}
+
 	if pw.slave != -1 {
 		posix.close(pw.slave)
 		pw.slave = -1
@@ -313,9 +396,20 @@ wire_capture :: proc(t: ^testing.T, label: string, loc := #caller_location) {
 	pw.captured = true
 	support.note(t, fmt.tprintf("{} wire captured: {} bytes (capacity {}, dropped {})",
 		label, sync.atomic_load(&pw.wire_len), WIRE_CAPACITY, sync.atomic_load(&pw.wire_lost)))
+	if pending > 0 {
+		support.note(t, fmt.tprintf("{} CAPTURE TRUNCATED: {} byte(s) still queued in the pty when the slave was dropped — the wire asserts below see a PARTIAL stream",
+			label, int(pending)))
+	}
 	if sync.atomic_load(&pw.wire_lost) > 0 {
 		support.note(t, fmt.tprintf("{} CAPTURE TRUNCATED: {} byte(s) exceeded WIRE_CAPACITY — the wire asserts below see a PARTIAL stream",
 			label, sync.atomic_load(&pw.wire_lost)))
+	}
+	// HS_WIRE_DUMP=1 prints the captured stream with every escape spelled out.
+	// Kept on purpose: "what actually left the process" is the one thing about
+	// this harness that cannot be read off any struct, and being able to name
+	// every byte is what turned the 43-byte bug below from a guess into a fact.
+	if posix.getenv("HS_WIRE_DUMP") != nil {
+		support.note_raw(t, fmt.tprintf("  WIRE-DUMP >>>{}<<<", render_escape(wire_bytes())))
 	}
 }
 
@@ -324,6 +418,21 @@ wire_capture :: proc(t: ^testing.T, label: string, loc := #caller_location) {
 // length is whatever the drain has written so far.
 wire_bytes :: proc() -> []u8 {
 	return pw.wire_buf[0:sync.atomic_load(&pw.wire_len)]
+}
+
+// render_escape renders bytes with escapes visible (debug aid for HS_WIRE_DUMP).
+render_escape :: proc(b: []u8) -> string {
+	buf : [dynamic]u8
+	for c in b {
+		if c == 0x1b {
+			render_push_str(&buf, `\e`)
+		} else if c >= 0x20 && c < 0x7f {
+			append(&buf, byte(c))
+		} else {
+			render_push_str(&buf, fmt.tprintf("<{:02x}>", c))
+		}
+	}
+	return string(buf[:])
 }
 
 //-----------------------------------------------------------------------------
