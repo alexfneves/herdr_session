@@ -11,15 +11,22 @@ CLI you already have.
 
 ```
                                  herdr-session
+                                Mode selection
 ──────────────────────────────────────────────────────────────────────────
-filter: ▏
 device      timestamp               state    name
 local       2026-10-20 08:42:00.459 running  api
 build-box   2026-10-19 21:14:07.221 running  worker
 deploy     2026-10-18 09:03:55.104 stopped  bench
 ──────────────────────────────────────────────────────────────────────────
-mode_selection  ·  local ok 1  build-box ok 1  deploy timeout 0
+local ok 1  build-box ok 1  deploy timeout 0  …  esc quit
 ```
+
+The header carries the program title and, on the line below it, the state you are
+in — `Mode selection`, `Attach session`, `Delete session`. The footer is for
+what the machine *sees*: the per-host verdict and where the host list came from,
+followed by the keys that work right now. {Mode selection} shows no filter line;
+the states that actually filter (Attach, Delete, the remote picker, the theme
+picker) do.
 
 `default` never appears in the list. It is herdr's own persistent workspace, not a
 session you created, and D12 forbids the app from touching it — the filter is applied
@@ -423,9 +430,12 @@ creates or deletes a session. Three things keep that visible instead of hidden:
   free (~3 ms locally; remote rows keep the freshest fetch that landed rather
   than blocking on an ssh round-trip).
 - **`Ctrl-L` refreshes from any state**, and says so: `list re-read — list now`.
-- **The footer shows the age of what you are looking at** — `local ok 2 … · 4s`.
-  If the age is large, the picture is old; press `Ctrl-L`. The loop never wakes
-  on a timer, so the number is the age as of the frame you are reading.
+  The age token lives in that notice, not in a permanent status cell: you see
+  how old the rows were at the moment you asked, and nothing else.
+- **The footer shows what each host is doing** — `local ok 2  build-box down 1`.
+  The list itself is a snapshot, so the loop never wakes on a timer and no number
+  quietly goes stale: the freshness you can act on is the one `Ctrl-L` prints and
+  the one every Attach/Delete entry re-earns by re-reading before it lets you act.
 
 One deliberate non-rule: a session herdr reports as **stopped** is still
 attachable. `herdr session attach` *resumes* a stopped session, and forbidding

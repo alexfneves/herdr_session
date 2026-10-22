@@ -43,8 +43,9 @@ package ui
 //
 // ── WHAT THE FRAME DOES NOT DO ──────────────────────────────────────────────
 // * No background-identity tags. Nothing reads or writes backgroundColor to MEAN
-//   "this is the header"; the footer text says the state, the border says the
-//   boundary. `alpha` has exactly one meaning here: 0 == do not paint.
+//   "this is the header"; the header text says the title and the state, the
+//   border says the boundary. `alpha` has exactly one meaning here: 0 == do not
+//   paint.
 // * No hand-painted glyphs outside Clay: every cell travels Clay -> render.paint.
 //
 // Colour is a value the caller supplies, never a constant baked into a widget:
