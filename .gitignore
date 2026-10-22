@@ -17,3 +17,6 @@ dev/__pycache__/
 
 # default output name of script(1) — captured pty junk
 typescript
+
+# Generated gate/hscheck report output — never committed.
+hs-reports/
