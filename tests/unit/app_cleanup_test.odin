@@ -21,35 +21,39 @@ import "core:testing"
 import app "../../src/app"
 import support "../support"
 
-@(test)
-app_cleanup_default_policy :: proc(t: ^testing.T) {
-	c := au_live(t)
-	au_eq(&c, "default policy is 'only_created' (R1)",
+app_cleanup_battery_app_cleanup_default_policy :: proc(c: ^AU_Ctx) {
+	au_eq(c, "default policy is 'only_created' (R1)",
 		au_policy_text(app.DEFAULT_CLEANUP_POLICY), "only_created")
-	au_eq(&c, "current policy is the default",
+	au_eq(c, "current policy is the default",
 		au_policy_text(app.cleanup_policy()), "only_created")
 }
-
 @(test)
-app_cleanup_should_run_table :: proc(t: ^testing.T) {
-	c := au_live(t)
-	au_check(&c, "never → nothing destroyed, even for a session we created",
+app_cleanup_default_policy :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_cleanup_battery_app_cleanup_default_policy(&__c)
+}
+
+app_cleanup_battery_app_cleanup_should_run_table :: proc(c: ^AU_Ctx) {
+	au_check(c, "never → nothing destroyed, even for a session we created",
 		!app.cleanup_should_run(.never, "hs-t-x", true), "")
-	au_check(&c, "never → nothing destroyed, even for the user's own session",
+	au_check(c, "never → nothing destroyed, even for the user's own session",
 		!app.cleanup_should_run(.never, "user-session", false), "")
-	au_check(&c, "only_created → destroys only what we created",
+	au_check(c, "only_created → destroys only what we created",
 		app.cleanup_should_run(.only_created, "hs-t-x", true) &&
 			!app.cleanup_should_run(.only_created, "user-session", false), "")
-	au_check(&c, "always → destroys (available but not the default)",
+	au_check(c, "always → destroys (available but not the default)",
 		app.cleanup_should_run(.always, "anything", false), "")
-	au_check(&c, "D12 outranks EVERY policy: default is never destroyed",
+	au_check(c, "D12 outranks EVERY policy: default is never destroyed",
 		!app.cleanup_should_run(.always, "default", true) &&
 			!app.cleanup_should_run(.only_created, "default", true), "")
 }
-
 @(test)
-app_cleanup_policy_seam_is_reversible :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_cleanup_should_run_table :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_cleanup_battery_app_cleanup_should_run_table(&__c)
+}
+
+app_cleanup_battery_app_cleanup_policy_seam_is_reversible :: proc(c: ^AU_Ctx) {
 	// The seam is settable, so un-parking D2 is one assignment and nothing
 	// else. Restored in the same proc whether or not the assertions passed:
 	// a leaked policy would change what every later test in this binary sees.
@@ -58,8 +62,14 @@ app_cleanup_policy_seam_is_reversible :: proc(t: ^testing.T) {
 	app.set_cleanup_policy(app.DEFAULT_CLEANUP_POLICY)
 	restored_ok := au_policy_text(app.cleanup_policy()) == "only_created"
 
-	au_check(&c, "policy is settable at runtime (the seam works)", set_ok,
+	au_check(c, "policy is settable at runtime (the seam works)", set_ok,
 		fmt.tprintf("after set: {}", au_policy_text(app.cleanup_policy())))
-	au_check(&c, "policy restored to the shipped default", restored_ok,
+	au_check(c, "policy restored to the shipped default", restored_ok,
 		fmt.tprintf("after restore: {}", au_policy_text(app.cleanup_policy())))
 }
+@(test)
+app_cleanup_policy_seam_is_reversible :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_cleanup_battery_app_cleanup_policy_seam_is_reversible(&__c)
+}
+

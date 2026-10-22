@@ -25,13 +25,11 @@ import "core:testing"
 import app "../../src/app"
 import support "../support"
 
-@(test)
-app_scrub_live_env_has_no_herdr_keys :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_env_battery_app_scrub_live_env_has_no_herdr_keys :: proc(c: ^AU_Ctx) {
 
 	env, err := app.env_snapshot()
 	if err != nil {
-		au_check(&c, "env_snapshot", false, fmt.tprintf("{}", err))
+		au_check(c, "env_snapshot", false, fmt.tprintf("{}", err))
 		return
 	}
 
@@ -39,7 +37,7 @@ app_scrub_live_env_has_no_herdr_keys :: proc(t: ^testing.T) {
 	for k, _ in env {
 		if app.env_is_herdr_namespace(k) { append(&leaked, k) }
 	}
-	au_say(&c, fmt.tprintf("  live env carries {} HERDR_* key(s): {}",
+	au_say(c, fmt.tprintf("  live env carries {} HERDR_* key(s): {}",
 		len(leaked[:]), leaked[:]))
 
 	clean := app.scrub_env(env)
@@ -47,15 +45,18 @@ app_scrub_live_env_has_no_herdr_keys :: proc(t: ^testing.T) {
 	for k, _ in clean {
 		if app.env_is_herdr_namespace(k) { append(&still, k) }
 	}
-	au_check(&c, "scrub_env removes every HERDR_* key", len(still) == 0,
+	au_check(c, "scrub_env removes every HERDR_* key", len(still) == 0,
 		fmt.tprintf("{} leaked: {}", len(still[:]), still[:]))
-	au_check(&c, "scrub_env keeps TERM", "TERM" in clean,
+	au_check(c, "scrub_env keeps TERM", "TERM" in clean,
 		fmt.tprintf("TERM={}", clean["TERM"]))
 }
-
 @(test)
-app_scrub_synthetic_namespace_boundary :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_scrub_live_env_has_no_herdr_keys :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_env_battery_app_scrub_live_env_has_no_herdr_keys(&__c)
+}
+
+app_env_battery_app_scrub_synthetic_namespace_boundary :: proc(c: ^AU_Ctx) {
 
 	synthetic := make(map[string]string)
 	synthetic["HERDR_ENV"] = "1"
@@ -73,11 +74,17 @@ app_scrub_synthetic_namespace_boundary :: proc(t: ^testing.T) {
 	for k, _ in cc {
 		kept += 1
 		if app.env_is_herdr_namespace(k) {
-			au_check(&c, fmt.tprintf("synthetic scrub drops {}", k), false, "still present")
+			au_check(c, fmt.tprintf("synthetic scrub drops {}", k), false, "still present")
 		}
 	}
-	au_check(&c, "synthetic scrub keeps exactly TERM + COLORTERM", kept == 2,
+	au_check(c, "synthetic scrub keeps exactly TERM + COLORTERM", kept == 2,
 		fmt.tprintf("kept {} keys", kept))
-	au_eq(&c, "TERM survives verbatim", cc["TERM"], "xterm-256color")
-	au_eq(&c, "COLORTERM survives verbatim", cc["COLORTERM"], "truecolor")
+	au_eq(c, "TERM survives verbatim", cc["TERM"], "xterm-256color")
+	au_eq(c, "COLORTERM survives verbatim", cc["COLORTERM"], "truecolor")
 }
+@(test)
+app_scrub_synthetic_namespace_boundary :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_env_battery_app_scrub_synthetic_namespace_boundary(&__c)
+}
+

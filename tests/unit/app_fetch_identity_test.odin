@@ -105,9 +105,7 @@ afu_argv_join :: proc(argv: []string) -> string {
 
 // ── identity is (device, name) ──────────────────────────────────────────────
 
-@(test)
-afu_merge_identity_is_the_pair :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_fetch_identity_battery_afu_merge_identity_is_the_pair :: proc(c: ^AU_Ctx) {
 	tb := afu_table_with({AFU_HOST_A, AFU_HOST_B})
 
 	// The same session name under two devices. herdr scopes names per
@@ -119,16 +117,16 @@ afu_merge_identity_is_the_pair :: proc(t: ^testing.T) {
 	ra := app.merge(tb, AFU_HOST_A, a)
 	rb := app.merge(tb, AFU_HOST_B, b)
 
-	au_eq_int(&c, "same name under two devices -> two rows", len(tb.rows), 2)
-	au_check(&c, "neither row was collapsed onto the name",
+	au_eq_int(c, "same name under two devices -> two rows", len(tb.rows), 2)
+	au_check(c, "neither row was collapsed onto the name",
 		app.index_of_identity(tb.rows[:], AFU_HOST_A, AFU_SHARED) >= 0 &&
 			app.index_of_identity(tb.rows[:], AFU_HOST_B, AFU_SHARED) >= 0,
 		fmt.tprintf("A@{} B@{}",
 			app.index_of_identity(tb.rows[:], AFU_HOST_A, AFU_SHARED),
 			app.index_of_identity(tb.rows[:], AFU_HOST_B, AFU_SHARED)))
-	au_eq_int(&c, "host A reported 1 added", ra.added, 1)
-	au_eq_int(&c, "host B reported 1 added", rb.added, 1)
-	au_say(&c, fmt.tprintf("    %s", afu_fingerprint(tb.rows[:])))
+	au_eq_int(c, "host A reported 1 added", ra.added, 1)
+	au_eq_int(c, "host B reported 1 added", rb.added, 1)
+	au_say(c, fmt.tprintf("    %s", afu_fingerprint(tb.rows[:])))
 
 	// Both groups are still individually addressable after the second merge —
 	// which is what attach/delete actually need.
@@ -136,10 +134,10 @@ afu_merge_identity_is_the_pair :: proc(t: ^testing.T) {
 		app.Selection{device = AFU_HOST_A, name = AFU_SHARED, valid = true})
 	sb, ok_b := app.selection_session(tb.rows[:],
 		app.Selection{device = AFU_HOST_B, name = AFU_SHARED, valid = true})
-	au_check(&c, "each identity resolves to its OWN row",
+	au_check(c, "each identity resolves to its OWN row",
 		ok_a && ok_b && sa.device == AFU_HOST_A && sb.device == AFU_HOST_B,
 		fmt.tprintf("a.device={} b.device={}", sa.device, sb.device))
-	au_check(&c, "the two rows are NOT the same row", sa != sb,
+	au_check(c, "the two rows are NOT the same row", sa != sb,
 		fmt.tprintf("a_ptr={} b_ptr={}", sa, sb))
 
 	app.table_destroy(tb)
@@ -157,10 +155,13 @@ afu_snapshot_b :: proc(tbl: ^app.Table) -> string {
 	delete(parts)
 	return j
 }
-
 @(test)
-afu_merge_isolation_refreshing_a_leaves_b :: proc(t: ^testing.T) {
-	c := au_live(t)
+afu_merge_identity_is_the_pair :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_fetch_identity_battery_afu_merge_identity_is_the_pair(&__c)
+}
+
+app_fetch_identity_battery_afu_merge_isolation_refreshing_a_leaves_b :: proc(c: ^AU_Ctx) {
 	tb := afu_table_with({AFU_HOST_A, AFU_HOST_B})
 
 	app.merge(tb, AFU_HOST_A, {
@@ -179,62 +180,64 @@ afu_merge_isolation_refreshing_a_leaves_b :: proc(t: ^testing.T) {
 		afu_session(AFU_HOST_A, "a-new-2026-10-18-09-00-00-000", true),   // added
 																	   // a-two dropped
 	})
-	au_eq_int(&c, "refresh added 1", rep.added, 1)
-	au_eq_int(&c, "refresh updated 1", rep.updated, 1)
-	au_eq_int(&c, "refresh removed 1", rep.removed, 1)
-	au_eq_int(&c, "carried through 2 foreign rows", rep.carried, 2)
+	au_eq_int(c, "refresh added 1", rep.added, 1)
+	au_eq_int(c, "refresh updated 1", rep.updated, 1)
+	au_eq_int(c, "refresh removed 1", rep.removed, 1)
+	au_eq_int(c, "carried through 2 foreign rows", rep.carried, 2)
 
 	b_after := afu_snapshot_b(tb)
-	au_eq(&c, "host B's rows are byte-identical after A's refresh", b_after, b_before)
-	au_say(&c, fmt.tprintf("    B unchanged: %s", b_after))
-	au_say(&c, fmt.tprintf("    table now:   %s", afu_fingerprint(tb.rows[:])))
+	au_eq(c, "host B's rows are byte-identical after A's refresh", b_after, b_before)
+	au_say(c, fmt.tprintf("    B unchanged: %s", b_after))
+	au_say(c, fmt.tprintf("    table now:   %s", afu_fingerprint(tb.rows[:])))
 
 	// `carried` is "rows of OTHER devices preserved", not "rows returned".
-	au_check(&c, "carried counts only OTHER devices' rows",
+	au_check(c, "carried counts only OTHER devices' rows",
 		rep.carried == 2 && rep.total == 4,
 		fmt.tprintf("carried={} total={}", rep.carried, rep.total))
 
 	app.table_destroy(tb)
 }
-
-// ── delete / re-add is identity-correct ────────────────────────────────────
-
 @(test)
-afu_merge_reinsert_keeps_identity :: proc(t: ^testing.T) {
-	c := au_live(t)
+afu_merge_isolation_refreshing_a_leaves_b :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_fetch_identity_battery_afu_merge_isolation_refreshing_a_leaves_b(&__c)
+}
+
+app_fetch_identity_battery_afu_merge_reinsert_keeps_identity :: proc(c: ^AU_Ctx) {
 	tb := afu_table_with({AFU_HOST_A})
 	name := "db-2026-10-18-11-00-00-000"
 
 	app.merge(tb, AFU_HOST_A, {afu_session(AFU_HOST_A, name, true)})
-	au_check(&c, "present after add",
+	au_check(c, "present after add",
 		app.is_known_session(tb.rows[:], AFU_HOST_A, name), "1 row")
 
 	// Empty list = the session is gone on the host.
 	rep := app.merge(tb, AFU_HOST_A, {})
-	au_eq_int(&c, "empty refresh removes the row", rep.removed, 1)
-	au_check(&c, "gone after delete",
+	au_eq_int(c, "empty refresh removes the row", rep.removed, 1)
+	au_check(c, "gone after delete",
 		!app.is_known_session(tb.rows[:], AFU_HOST_A, name), "0 rows")
 
 	app.merge(tb, AFU_HOST_A, {afu_session(AFU_HOST_A, name, false)})
-	au_eq_int(&c, "re-add yields exactly one row", len(tb.rows), 1)
-	au_check(&c, "re-added row is found by the SAME identity",
+	au_eq_int(c, "re-add yields exactly one row", len(tb.rows), 1)
+	au_check(c, "re-added row is found by the SAME identity",
 		app.is_known_session(tb.rows[:], AFU_HOST_A, name),
 		"identity stable across delete/re-add")
 
 	// The STATE came back fresh (was running=true, now false), so the table is
 	// not serving a stale row from the first add.
 	idx := app.index_of_identity(tb.rows[:], AFU_HOST_A, name)
-	au_check(&c, "re-added row carries the NEW state, not the old one",
+	au_check(c, "re-added row carries the NEW state, not the old one",
 		idx >= 0 && !tb.rows[idx].running, fmt.tprintf("running={}", tb.rows[idx].running))
 
 	app.table_destroy(tb)
 }
-
-// ── ordering survives a merge ──────────────────────────────────────────────
-
 @(test)
-afu_merge_order_local_first_then_device_then_ts :: proc(t: ^testing.T) {
-	c := au_live(t)
+afu_merge_reinsert_keeps_identity :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_fetch_identity_battery_afu_merge_reinsert_keeps_identity(&__c)
+}
+
+app_fetch_identity_battery_afu_merge_order_local_first_then_device_then_ts :: proc(c: ^AU_Ctx) {
 	tb := afu_table_with({app.DEVICE_LOCAL, AFU_HOST_A, "aaa-host"})
 
 	// Deliberately merged out of order: remote first, local last.
@@ -250,25 +253,26 @@ afu_merge_order_local_first_then_device_then_ts :: proc(t: ^testing.T) {
 	})
 
 	order := afu_device_order(tb.rows[:])
-	au_say(&c, fmt.tprintf("    device order: {}", order))
-	au_eq(&c, "local group first, then alphabetical host, then unit-host-a", order,
+	au_say(c, fmt.tprintf("    device order: {}", order))
+	au_eq(c, "local group first, then alphabetical host, then unit-host-a", order,
 		fmt.tprintf("{},aaa-host,{}", app.DEVICE_LOCAL, AFU_HOST_A))
-	au_check(&c, "local rows contiguous (never interleaved)",
+	au_check(c, "local rows contiguous (never interleaved)",
 		afu_groups_contiguous(tb.rows[:]), fmt.tprintf("order={}", order))
 
 	// Inside one device: ts ascending, unknown LAST (the I64_MAX sentinel).
 	inside := afu_names_of_device(tb.rows[:], AFU_HOST_A)
-	au_say(&c, fmt.tprintf("    inside {}: {}", AFU_HOST_A, inside))
-	au_eq(&c, "timestamps ascending, 'no ts' last", inside,
+	au_say(c, fmt.tprintf("    inside {}: {}", AFU_HOST_A, inside))
+	au_eq(c, "timestamps ascending, 'no ts' last", inside,
 		"early-2026-10-18-01-00-00-000,late-2026-10-18-23-00-00-000,no-ts")
 	app.table_destroy(tb)
 }
-
-// ── selection is identity, never index ─────────────────────────────────────
-
 @(test)
-afu_selection_tracks_identity_not_index :: proc(t: ^testing.T) {
-	c := au_live(t)
+afu_merge_order_local_first_then_device_then_ts :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_fetch_identity_battery_afu_merge_order_local_first_then_device_then_ts(&__c)
+}
+
+app_fetch_identity_battery_afu_selection_tracks_identity_not_index :: proc(c: ^AU_Ctx) {
 	tb := afu_table_with({AFU_HOST_A, "aaa-host"})
 	app.merge(tb, AFU_HOST_A, {
 		afu_session(AFU_HOST_A, "pick-2026-10-18-10-00-00-000", true),
@@ -276,11 +280,11 @@ afu_selection_tracks_identity_not_index :: proc(t: ^testing.T) {
 
 	// The user highlights row 0.
 	held := app.selection_from_index(tb.rows[:], 0)
-	au_check(&c, "held identity is the picked session",
+	au_check(c, "held identity is the picked session",
 		held.valid && held.name == "pick-2026-10-18-10-00-00-000",
 		fmt.tprintf("held={}@{}", held.name, held.device))
 	idx_before := app.selection_index(tb.rows[:], held)
-	au_eq_int(&c, "resolves to index 0 before the merge", idx_before, 0)
+	au_eq_int(c, "resolves to index 0 before the merge", idx_before, 0)
 
 	// A remote fetch lands THREE rows. `aaa-host` sorts before unit-host-a, so
 	// every one of them is inserted ABOVE the highlighted row.
@@ -290,13 +294,13 @@ afu_selection_tracks_identity_not_index :: proc(t: ^testing.T) {
 		afu_session("aaa-host", "n3-2026-10-18-08-00-00-000", true),
 	})
 	idx_after := app.selection_index(tb.rows[:], held)
-	au_say(&c, fmt.tprintf("    index moved {} -> {} while the identity stayed put",
+	au_say(c, fmt.tprintf("    index moved {} -> {} while the identity stayed put",
 		idx_before, idx_after))
-	au_check(&c, "the index MOVED (3 rows inserted above)", idx_after > idx_before,
+	au_check(c, "the index MOVED (3 rows inserted above)", idx_after > idx_before,
 		fmt.tprintf("{} -> {}", idx_before, idx_after))
 
 	sess, ok := app.selection_session(tb.rows[:], held)
-	au_check(&c, "…and it is STILL the session the user picked",
+	au_check(c, "…and it is STILL the session the user picked",
 		ok && sess.name == "pick-2026-10-18-10-00-00-000" && sess.device == AFU_HOST_A,
 		fmt.tprintf("resolved={}@{}", sess.name, sess.device))
 
@@ -305,17 +309,23 @@ afu_selection_tracks_identity_not_index :: proc(t: ^testing.T) {
 	// aaa-host's n1, a different session on a different machine. Enter
 	// would attach THAT.
 	would_be := tb.rows[0]
-	au_check(&c, "an index-based selection WOULD have landed on a different session",
+	au_check(c, "an index-based selection WOULD have landed on a different session",
 		would_be.device == "aaa-host" && would_be.name != held.name,
 		fmt.tprintf("index-0 would be {}@{}", would_be.name, would_be.device))
 
 	// Gone session: -1, not a fallback to some index.
 	app.merge(tb, AFU_HOST_A, {})
-	au_eq_int(&c, "a vanished identity resolves to -1 (never to a stand-in index)",
+	au_eq_int(c, "a vanished identity resolves to -1 (never to a stand-in index)",
 		app.selection_index(tb.rows[:], held), -1)
 	_, ok2 := app.selection_session(tb.rows[:], held)
-	au_check(&c, "resolving a vanished identity yields no session, not a wrong one",
+	au_check(c, "resolving a vanished identity yields no session, not a wrong one",
 		!ok2, "caller must handle the absence")
 
 	app.table_destroy(tb)
 }
+@(test)
+afu_selection_tracks_identity_not_index :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_fetch_identity_battery_afu_selection_tracks_identity_not_index(&__c)
+}
+

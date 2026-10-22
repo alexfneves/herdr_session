@@ -44,26 +44,33 @@ AU_NAME_CASES : []AU_Name_Case = {
 	{"bad\u00e9name", false, "non-ASCII"},
 }
 
-@(test)
-app_names_charset_table :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_names_battery_app_names_charset_table :: proc(c: ^AU_Ctx) {
 	for cs in AU_NAME_CASES {
 		name, want, why := cs.name, cs.want, cs.why
 		got := app.validate_name(name)
 		want_reason := ""
 		if !want { want_reason = got.reason }
-		au_check(&c, fmt.tprintf("name '{}' -> ok={}", name, got.ok), got.ok == want,
+		au_check(c, fmt.tprintf("name '{}' -> ok={}", name, got.ok), got.ok == want,
 			fmt.tprintf("{} ({}); reason={}", want, why, want_reason))
 	}
 }
-
 @(test)
-app_names_length_boundary :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_names_charset_table :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_names_battery_app_names_charset_table(&__c)
+}
+
+app_names_battery_app_names_length_boundary :: proc(c: ^AU_Ctx) {
 	edge_ok, _ := strings.repeat("a", app.NAME_MAX_LEN)
 	edge_big, _ := strings.repeat("a", app.NAME_MAX_LEN + 1)
-	au_check(&c, "name of exactly NAME_MAX_LEN is accepted", app.name_is_ok(edge_ok),
+	au_check(c, "name of exactly NAME_MAX_LEN is accepted", app.name_is_ok(edge_ok),
 		fmt.tprintf("len={}", len(edge_ok)))
-	au_check(&c, "name of NAME_MAX_LEN+1 is refused", !app.name_is_ok(edge_big),
+	au_check(c, "name of NAME_MAX_LEN+1 is refused", !app.name_is_ok(edge_big),
 		fmt.tprintf("len={}", len(edge_big)))
 }
+@(test)
+app_names_length_boundary :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_names_battery_app_names_length_boundary(&__c)
+}
+

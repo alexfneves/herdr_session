@@ -17,9 +17,7 @@ import "core:testing"
 import app "../../src/app"
 import support "../support"
 
-@(test)
-app_identity_pair_not_name :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_identity_battery_app_identity_pair_not_name :: proc(c: ^AU_Ctx) {
 	sessions: [dynamic]app.Session = {}
 	append(&sessions,
 		// The SAME session name on two DIFFERENT devices. These are two sessions.
@@ -27,38 +25,44 @@ app_identity_pair_not_name :: proc(t: ^testing.T) {
 		au_mk("homebox", "api", false),
 		au_mk(app.DEVICE_LOCAL, "api", true),
 	)
-	au_eq(&c, "three rows survive because device differs",
+	au_eq(c, "three rows survive because device differs",
 		au_names_of(sessions[:]), "api,api,api")
-	au_eq_int(&c, "local/api is found by (device,name)",
+	au_eq_int(c, "local/api is found by (device,name)",
 		app.index_of_identity(sessions[:], app.DEVICE_LOCAL, "api"), 2)
-	au_eq_int(&c, "workbox/api is found by (device,name)",
+	au_eq_int(c, "workbox/api is found by (device,name)",
 		app.index_of_identity(sessions[:], "workbox", "api"), 0)
-	au_eq_int(&c, "homebox/api is found by (device,name)",
+	au_eq_int(c, "homebox/api is found by (device,name)",
 		app.index_of_identity(sessions[:], "homebox", "api"), 1)
-	au_check(&c, "a device the model does not know is NOT found",
+	au_check(c, "a device the model does not know is NOT found",
 		!app.is_known_session(sessions[:], "otherbox", "api"),
 		"identity is the pair, not the name")
 }
-
 @(test)
-app_identity_key_accessors :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_identity_pair_not_name :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_identity_battery_app_identity_pair_not_name(&__c)
+}
+
+app_identity_battery_app_identity_key_accessors :: proc(c: ^AU_Ctx) {
 	sessions: [dynamic]app.Session = {}
 	append(&sessions, au_mk("workbox", "api", true), au_mk("homebox", "api", false))
 
 	// Key() is the identity accessor, not a display field.
 	kd, kn := app.Key(&sessions[0])
-	au_eq(&c, "Key().device", kd, "workbox")
-	au_eq(&c, "Key().name", kn, "api")
-	au_check(&c, "same_identity distinguishes devices with equal names",
+	au_eq(c, "Key().device", kd, "workbox")
+	au_eq(c, "Key().name", kn, "api")
+	au_check(c, "same_identity distinguishes devices with equal names",
 		!app.same_identity(&sessions[0], &sessions[1]), "workbox/api != homebox/api")
-	au_check(&c, "same_identity matches an exact pair",
+	au_check(c, "same_identity matches an exact pair",
 		app.same_identity(&sessions[0], &sessions[0]), "same row")
 }
-
 @(test)
-app_identity_sort_groups_are_contiguous :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_identity_key_accessors :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_identity_battery_app_identity_key_accessors(&__c)
+}
+
+app_identity_battery_app_identity_sort_groups_are_contiguous :: proc(c: ^AU_Ctx) {
 	mixed: [dynamic]app.Session = {}
 	append(&mixed,
 		au_mk("zeta", "x-2026-10-19-00-00-00-000", true),
@@ -69,13 +73,16 @@ app_identity_sort_groups_are_contiguous :: proc(t: ^testing.T) {
 	app.sort_sessions(mixed[:])
 	groups := ""
 	for s in mixed { groups = fmt.tprintf("{}{}/", groups, s.device) }
-	au_eq(&c, "local first, groups contiguous, ts ascending inside each", groups,
+	au_eq(c, "local first, groups contiguous, ts ascending inside each", groups,
 		"local/alpha/zeta/zeta/")
 }
-
 @(test)
-app_identity_names_for_device_is_scoped :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_identity_sort_groups_are_contiguous :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_identity_battery_app_identity_sort_groups_are_contiguous(&__c)
+}
+
+app_identity_battery_app_identity_names_for_device_is_scoped :: proc(c: ^AU_Ctx) {
 	mixed: [dynamic]app.Session = {}
 	append(&mixed,
 		au_mk("zeta", "x-2026-10-19-00-00-00-000", true),
@@ -92,8 +99,14 @@ app_identity_names_for_device_is_scoped :: proc(t: ^testing.T) {
 	// include ONLY that device's names.
 	nz := app.names_for_device(mixed[:], "zeta")
 	joined_nz, _ := strings.join(nz, "+")
-	au_eq(&c, "names_for_device is scoped to one device", joined_nz,
+	au_eq(c, "names_for_device is scoped to one device", joined_nz,
 		"a-2026-10-17-00-00-00-000+x-2026-10-19-00-00-00-000")
-	au_eq_int(&c, "names_for_device excludes every other device",
+	au_eq_int(c, "names_for_device excludes every other device",
 		len(app.names_for_device(mixed[:], "nosuchhost")), 0)
 }
+@(test)
+app_identity_names_for_device_is_scoped :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_identity_battery_app_identity_names_for_device_is_scoped(&__c)
+}
+

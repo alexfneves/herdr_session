@@ -33,50 +33,57 @@ au_diag :: proc(s: string, max: int) -> string {
 	return ui.diag_head(s, max)
 }
 
-@(test)
-app_diag_trunc_first_line_only :: proc(t: ^testing.T) {
-	c := au_live(t)
-	au_eq(&c, "single short line passes through", au_diag("connection refused", 44),
+app_diag_trunc_battery_app_diag_trunc_first_line_only :: proc(c: ^AU_Ctx) {
+	au_eq(c, "single short line passes through", au_diag("connection refused", 44),
 		"connection refused")
-	au_eq(&c, "only the first line of a multi-line trace is used",
+	au_eq(c, "only the first line of a multi-line trace is used",
 		au_diag("banner: ssh refused\nsecond line\nthird", 44), "banner: ssh refused")
-	au_eq(&c, "CRLF is handled the same as LF", au_diag("refused\r\nnoise", 44),
+	au_eq(c, "CRLF is handled the same as LF", au_diag("refused\r\nnoise", 44),
 		"refused")
 }
-
 @(test)
-app_diag_trunc_cap_is_marked_not_silent :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_diag_trunc_first_line_only :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_diag_trunc_battery_app_diag_trunc_first_line_only(&__c)
+}
+
+app_diag_trunc_battery_app_diag_trunc_cap_is_marked_not_silent :: proc(c: ^AU_Ctx) {
 	long, _ := strings.repeat("x", 90)
 	big := au_diag(long, 44)
 	// The contract: at most `max` bytes of the REASON, then the mark. `…` is
 	// 3 bytes in UTF-8, so a 44-byte cap yields 47 bytes of string — the cap
 	// is on the CONTENT, and the mark is what tells you it was applied.
-	au_check(&c, "a 90-char reason is capped to max content bytes",
+	au_check(c, "a 90-char reason is capped to max content bytes",
 		len(big) == 44 + len(AU_ELL), fmt.tprintf("len={}", len(big)))
-	au_check(&c, "…and the cap is marked, not silent", strings.has_suffix(big, AU_ELL),
+	au_check(c, "…and the cap is marked, not silent", strings.has_suffix(big, AU_ELL),
 		fmt.tprintf("tail={}", big[44:]))
 }
-
 @(test)
-app_diag_trunc_never_splits_a_rune :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_diag_trunc_cap_is_marked_not_silent :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_diag_trunc_battery_app_diag_trunc_cap_is_marked_not_silent(&__c)
+}
+
+app_diag_trunc_battery_app_diag_trunc_never_splits_a_rune :: proc(c: ^AU_Ctx) {
 	prefix44, _ := strings.repeat("a", 43)
 	tail20, _ := strings.repeat("b", 20)
 	accented := fmt.tprintf("{}{}{}", prefix44, "é", tail20)
 	cut := au_diag(accented, 44)
 	body := cut[:len(cut)-len(AU_ELL)]  // everything before the truncation mark
-	au_check(&c, "the 44-byte cap backed off the middle of a 2-byte rune",
+	au_check(c, "the 44-byte cap backed off the middle of a 2-byte rune",
 		len(body) == 43, fmt.tprintf("body len={} (44 would split é)", len(body)))
-	au_check(&c, "…and the truncated part is valid UTF-8 on its own",
+	au_check(c, "…and the truncated part is valid UTF-8 on its own",
 		au_utf8_valid(body), fmt.tprintf("body={}", body))
-	au_check(&c, "…and the cut is still marked as truncated",
+	au_check(c, "…and the cut is still marked as truncated",
 		strings.has_suffix(cut, AU_ELL), fmt.tprintf("cut='{}'", cut))
 }
-
 @(test)
-app_diag_trunc_no_width_breaks_utf8 :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_diag_trunc_never_splits_a_rune :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_diag_trunc_battery_app_diag_trunc_never_splits_a_rune(&__c)
+}
+
+app_diag_trunc_battery_app_diag_trunc_no_width_breaks_utf8 :: proc(c: ^AU_Ctx) {
 	// A general sweep: for every cap across a mixed-ASCII/multi-byte reason,
 	// the result must never be broken UTF-8. One bad width on a host's error
 	// message is enough to corrupt the row.
@@ -88,14 +95,23 @@ app_diag_trunc_no_width_breaks_utf8 :: proc(t: ^testing.T) {
 		rb := r[:len(r)-len(AU_ELL)]
 		if !au_utf8_valid(rb) { broke += 1 }
 	}
-	au_check(&c, "no width in 1..60 produces broken UTF-8", broke == 0,
+	au_check(c, "no width in 1..60 produces broken UTF-8", broke == 0,
 		fmt.tprintf("{} widths broke across 60", broke))
 }
-
 @(test)
-app_diag_trunc_empty_stays_empty :: proc(t: ^testing.T) {
-	c := au_live(t)
+app_diag_trunc_no_width_breaks_utf8 :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_diag_trunc_battery_app_diag_trunc_no_width_breaks_utf8(&__c)
+}
+
+app_diag_trunc_battery_app_diag_trunc_empty_stays_empty :: proc(c: ^AU_Ctx) {
 	// The caller checks for "" before calling; this pins that empty stays
 	// empty rather than becoming a bare ellipsis in the footer.
-	au_eq(&c, "empty detail stays empty", au_diag("", 44), "")
+	au_eq(c, "empty detail stays empty", au_diag("", 44), "")
 }
+@(test)
+app_diag_trunc_empty_stays_empty :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	app_diag_trunc_battery_app_diag_trunc_empty_stays_empty(&__c)
+}
+

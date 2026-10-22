@@ -29,6 +29,7 @@ package unit
 
 import "core:fmt"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:unicode/utf8"
 import "base:runtime"
@@ -74,13 +75,22 @@ au_raw :: proc(c: ^AU_Ctx, label: string, data: []byte) {
 
 // au_check is the old `check()`: one counted assertion, and the same line in
 // the transcript so the printf guard sees the text the rule actually produced.
+//
+// The transcript is GLOBAL and cumulative (guarded by a mutex) rather than
+// per-context for the live path, because the printf guard needs to scan the
+// lines the whole suite produced and the sections are spread across files.
+// Render mode still writes to its own builder so a render pass does not
+// pollute the live transcript.
 au_check :: proc(c: ^AU_Ctx, name: string, cond: bool, detail: string) {
+	verdict := "FAIL"
+	if cond { verdict = "PASS" }
 	if c.t != nil {
+		label := au_group_of(c)
+		line := fmt.tprintf("[{}] {}.{} — {}", verdict, label, name, detail)
+		au_transcript_append(line)
 		support.check(c.t, name, cond, detail, loc = c.loc)
 	}
 	if c.tr != nil {
-		verdict := "FAIL"
-		if cond { verdict = "PASS" }
 		if len(detail) == 0 {
 			strings.write_string(c.tr, fmt.tprintf("[{}] {}", verdict, name))
 		} else {
@@ -89,6 +99,48 @@ au_check :: proc(c: ^AU_Ctx, name: string, cond: bool, detail: string) {
 		strings.write_byte(c.tr, '\n')
 	}
 }
+
+// au_group_of is the ledger group this context reports under, so the global
+// transcript lines can be attributed the same way the gate attributes them.
+au_group_of :: proc(c: ^AU_Ctx) -> string {
+	fp := string(c.loc.file_path)
+	i := afu_last_slash(fp)
+	if i < 0 { return fp }
+	nm := fp[i+1:]
+	if strings.has_suffix(nm, ".odin") { nm = nm[:len(nm)-5] }
+	return nm
+}
+
+afu_last_slash :: proc(s: string) -> int {
+	found := -1
+	for i := 0; i < len(s); i += 1 { if s[i] == '/' { found = i } }
+	return found
+}
+
+// The cumulative live transcript. A fixed static buffer: the whole app suite
+// produces well under it, and a fixed buffer cannot fail to allocate at the
+// worst possible moment (mid-suite, after a failure).
+AU_TR_CAP :: 1 << 20
+au_tr_buf : [AU_TR_CAP]u8
+au_tr_len : int = 0
+au_tr_mu : sync.Mutex = {}
+
+au_transcript_append :: proc(line: string) {
+	sync.mutex_lock(&au_tr_mu)
+	defer sync.mutex_unlock(&au_tr_mu)
+	need := len(line) + 1
+	if au_tr_len + need > AU_TR_CAP { return }  // truncated; the guard reports it
+	for i := 0; i < len(line); i += 1 { au_tr_buf[au_tr_len+i] = line[i] }
+	au_tr_buf[au_tr_len + len(line)] = '\n'
+	au_tr_len += need
+}
+
+au_transcript_text :: proc() -> string {
+	sync.mutex_lock(&au_tr_mu)
+	defer sync.mutex_unlock(&au_tr_mu)
+	return string(au_tr_buf[:au_tr_len])
+}
+
 
 // The old local helpers (src/app_cases.odin:45-59), ported unchanged apart
 // from taking the context. The exact quoting is kept because a one-character
@@ -125,9 +177,14 @@ au_guard :: proc(t: ^testing.T, label: string,
 	c := au_render(&b, loc)
 	run(&c)
 	text := strings.to_string(b)
+	// loc is forwarded so the guard lands on the CALLER's group (app_fmt_test),
+	// not on this harness file. Without it the three format guards would be
+	// attributed to app_harness and the per-group shortfall report would be a
+	// lie by one group.
 	support.check(t, fmt.tprintf("{} transcript — no printf fallout", label),
 		!support.has_fallout(text),
-		fmt.tprintf("scanned {} bytes of rendered output", len(text)))
+		fmt.tprintf("scanned {} bytes of rendered output", len(text)),
+		loc = loc)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
