@@ -141,6 +141,13 @@ adt_p1_detach_routes_cleanup_to_the_rows_device :: proc(t: ^testing.T) {
 	au_say(&c, fmt.tprintf("    local sessions AFTER : {}", adt_names_of(after)))
 	au_check(&c, "THE LOCAL SAME-NAMED SESSION SURVIVED the remote cleanup (P1)",
 		adt_contains_name(after, victim), fmt.tprintf("local names={}", adt_names_of(after)))
+
+	// Explicit teardown, asserted (same reason as R1: a leak should name the
+	// section that made it).
+	adt_teardown(&c, victim, "end of the P1 live case")
+	au_check(&c, "teardown removed the scratch session",
+		!adt_contains_name(adt_list_now(), victim),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
 }
 
 // ── R1 LIVE: the shipped default, both halves ─────────────────────────────
@@ -209,6 +216,41 @@ adt_r1_only_created_destroys_ours_spares_theirs :: proc(t: ^testing.T) {
 	au_check(&c, "…and the two notices are NOT the same sentence",
 		n_own != n_guest,
 		fmt.tprintf("own={} guest={}", n_own, n_guest))
+
+	// half 3 — already deleted out-of-band → NO ERROR surfaced. Stop THEN
+	// delete: herdr will not delete a running session, and a half-performed
+	// teardown would be this test's own bug pretending to be a race.
+	// herdr answers a delete of a gone name with {"deleted":true} / exit 0,
+	// so the notice stays a success sentence and never grows a NOT-cleaned
+	// clause. The opposite failure mode — a scary error for a harmless race —
+	// is exactly what the requirement called out.
+	app.run_capture(app.stop_argv(guest), app.CONTROL_TIMEOUT)
+	app.run_capture(app.delete_argv(guest), app.CONTROL_TIMEOUT)
+	au_check(&c, "the attached session was deleted out-of-band first",
+		!adt_contains_name(adt_list_now(), guest),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
+	n_raced := app.post_detach(app.DEVICE_LOCAL, guest, true)
+	au_say(&c, fmt.tprintf("    detach notice (already gone): {}", n_raced))
+	au_check(&c, "already-deleted surfaces NO ERROR — no NOT-cleaned, no failure text",
+		!strings.contains(n_raced, "NOT cleaned") &&
+			!strings.contains(n_raced, "failed") &&
+			!strings.contains(n_raced, "error"),
+		fmt.tprintf("notice={}", n_raced))
+	au_check(&c, "…and the list is unchanged by deleting something already gone",
+		!adt_contains_name(adt_list_now(), guest) &&
+			!adt_contains_name(adt_list_now(), created),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
+
+	// Explicit teardown, asserted — not left to the deferred sweep. If the
+	// stop-then-delete ordering ever stops working the failure lands here, on
+	// the R1 section that created the sessions, rather than on a generic
+	// end-of-file sweep that cannot say which section leaked.
+	adt_teardown(&c, created, "end of R1 live")
+	adt_teardown(&c, guest, "end of R1 live")
+	au_check(&c, "teardown leaves no R1 scratch behind",
+		!adt_contains_name(adt_list_now(), created) &&
+			!adt_contains_name(adt_list_now(), guest),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
 }
 
 // ── P2-5 LIVE: a control command against a black-holed host ───────────────
@@ -233,6 +275,14 @@ adt_p25_control_command_is_bounded_by_ssh :: proc(t: ^testing.T) {
 	au_check(&c, "…which is UNDER the old 10 s CAPTURE_TIMEOUT this used to be allowed",
 		elapsed < app.CAPTURE_TIMEOUT,
 		fmt.tprintf("elapsed={}s capture={}s", secs, f64(app.CAPTURE_TIMEOUT / time.Second)))
+
+	// The claim "ssh answers at its own ConnectTimeout" is only honest if the
+	// flag is actually on the argv we built. Timing alone could match for the
+	// wrong reason; this pins the mechanism the timing is attributed to.
+	has_ct := false
+	for a in app.SSH_BASE_ARGS { if strings.contains(a, "ConnectTimeout") { has_ct = true } }
+	au_check(&c, "…and the bound IS ssh's ConnectTimeout: the flag is on the argv",
+		has_ct, fmt.tprintf("SSH_BASE_ARGS carries ConnectTimeout={}", has_ct))
 }
 
 // ── the sweep ─────────────────────────────────────────────────────────────
@@ -263,4 +313,33 @@ adt_no_scratch_session_survives_this_file :: proc(t: ^testing.T) {
 	body, _ := strings.join(parts[:], ", ")
 	au_check(&c, "this file leaves no `hs-t-*` session running",
 		len(left) == 0, fmt.tprintf("after the sweep: [{}]", body))
+}
+
+// ── the real local list, live ────────────────────────────────────────────
+//
+// The model assertions elsewhere run on synthetic payloads. This is the
+// same parser pointed at the machine's actual `herdr session list --json`:
+// the hosted session must be VISIBLE (or nothing else here is meaningful)
+// and `default` must never appear as a deletable row (D12).
+adt_local_list_is_visible_and_default_free :: proc(c: ^AU_Ctx) {
+	cs := app.run_capture(app.list_argv(), app.CAPTURE_TIMEOUT)
+	au_eq_i(c, "list exit 0", i64(cs.code), 0)
+	au_raw(c, "  raw stdout", cs.out)
+	au_raw(c, "  raw stderr", cs.err)
+
+	rows, ok := app.parse_session_list(cs.out, app.DEVICE_LOCAL, app.DEVICE_LOCAL)
+	au_check(c, "list parses", ok, fmt.tprintf("{} rows", len(rows)))
+	au_check(c, "NO row is `default` (D12)",
+		!adt_contains_name(rows, "default"),
+		fmt.tprintf("names={}", adt_names_of(rows)))
+	all_local := true
+	for r in rows { if r.device != app.DEVICE_LOCAL { all_local = false } }
+	au_check(c, "every row carries device=local", all_local,
+		fmt.tprintf("{} row(s) from this box", len(rows)))
+}
+
+@(test)
+adt_local_list_is_visible_and_default_free_test :: proc(t: ^testing.T) {
+	__c := au_live(t)
+	adt_local_list_is_visible_and_default_free(&__c)
 }
