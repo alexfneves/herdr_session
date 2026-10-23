@@ -473,10 +473,39 @@ case_ui_frame :: proc() -> bool {
 	check("header shows the program title", str_contains_ignore_case(hdr, "herdr-session"),
 		fmt.tprintf("row {} = '{}'", l.header_y, hdr))
 
-	// 7. Footer shows the current state AND every usable key.
+	// 6b. THE STATE IS ON HEADER LINE 2 (RCH-9).
+	//
+	// This assertion used to read the FOOTER for the state word — "footer shows
+	// the current state". RCH-9 (.pi/plans/2026-10-18-herdr-session-tui/
+	// 50-requirement-changes.md, item 3) moved the state out of the footer and
+	// into the header, so that check was looking in the wrong place, not
+	// describing a broken product. Deleting it would have lost the coverage;
+	// re-homing it keeps it, and keeps it pointed at the row that now carries
+	// the requirement.
+	//
+	// The frame paints the header as exactly two lines (ui.HEADER_ROWS == 2):
+	// row `header_y` is the title and row `header_y + 1` is the state. Both
+	// come from Frame, both are centred, and the scene's state is "select".
+	state_row := l.header_y + 1
+	stl := line_of(state_row, cols)
+	check("header line 2 shows the current state", str_contains_ignore_case(stl, "select"),
+		fmt.tprintf("row {} = '{}'", state_row, stl))
+	// …and the two header rows are DISTINCT rows: a one-row header would satisfy
+	// both of the checks above with a single line, which is not the contract.
+	check("the title and the state are on two different header rows",
+		state_row > l.header_y && state_row < l.rule_top,
+		fmt.tprintf("title row={} state row={} first rule row={}", l.header_y, state_row, l.rule_top))
+	// The state must NOT have leaked back into the footer. The footer's job is now
+	// `rest` (the notice / host verdict / provenance) and the key hints; if the
+	// state reappeared there, this pair of checks would be asserting the same
+	// string twice and the header assertion would be alone in the suite.
+	ftr_state_leak := line_of(l.footer_y, cols)
+	check("the footer no longer carries the state (it moved to the header — RCH-9)",
+		!str_contains_ignore_case(ftr_state_leak, "select"),
+		fmt.tprintf("footer row {} = '{}' must not contain the state word 'select'", l.footer_y, ftr_state_leak))
+
+	// 7. Footer shows every usable key.
 	ftr := line_of(l.footer_y, cols)
-	check("footer shows the current state", str_contains_ignore_case(ftr, "select"),
-		fmt.tprintf("row {} = '{}'", l.footer_y, ftr))
 	seen := 0
 	for k := 0; k < len(UI_KEYS); k += 1 {
 		if str_contains_ignore_case(ftr, UI_KEYS[k].key) && str_contains_ignore_case(ftr, UI_KEYS[k].action) {

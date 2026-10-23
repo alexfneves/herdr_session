@@ -69,6 +69,22 @@ MIN_ROWS :: 10
 // keeps the "half-drawn" question decidable.
 SPINE_UTF8 :: "─"
 
+// HEADER_STATE_ROW is the row the CURRENT STATE is painted on, and since RCH-9
+// that is the SECOND header row, not the footer: FRAME_PAD is 0 and frame_open
+// paints the title first and the state second, so the state lives on row 1.
+// Every scenario that asks "what state does the user think they are in" reads
+// this row, and reading it is now the only honest way to ask.
+HEADER_STATE_ROW :: 1
+
+// rh_header_state renders the state line, stripped. Compare it to the exact
+// phrase rather than substring-testing the whole screen: "Attach session" as a
+// substring could come from a session named "Attach sessionX"; the header line
+// equal to "Attach session" cannot.
+rh_header_state :: proc(s: ^pty.Screen) -> string {
+	if HEADER_STATE_ROW >= s.rows { return "" }
+	return rh_strip(rh_row_text(s, HEADER_STATE_ROW))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Log — one file per scenario+rep
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,6 +417,83 @@ rh_slurp :: proc(path: string) -> string {
 // to import posix themselves for a kill.
 posix_sigterm :: proc() -> posix.Signal { return posix.Signal.SIGTERM }
 posix_sigkill :: proc() -> posix.Signal { return posix.Signal.SIGKILL }
+
+// posix_sigstop / posix_sigcont are here for the same reason, and they exist for
+// ONE use: the falsification control in resize_eintr_test. Stopping the process
+// is how you make "the app is not reading its input" a fact you can test
+// against rather than a hypothesis; see that file for why it is not a stunt.
+posix_sigstop :: proc() -> posix.Signal { return posix.Signal.SIGSTOP }
+posix_sigcont :: proc() -> posix.Signal { return posix.Signal.SIGCONT }
+
+// rh_freeze / rh_thaw signal the app by pid and report whether the signal was
+// delivered. They deliberately do NOT wait for anything: the caller's timing is
+// the measurement.
+rh_freeze :: proc(a: ^Rh_App) -> bool {
+	if a == nil || a.d == nil { return false }
+	return posix.kill(a.d.child, posix_sigstop()) == {}
+}
+
+rh_thaw :: proc(a: ^Rh_App) -> bool {
+	if a == nil || a.d == nil { return false }
+	return posix.kill(a.d.child, posix_sigcont()) == {}
+}
+
+// rh_screen_snapshot renders the whole grid into one string so a scenario can
+// ask "did ANY cell change?" without re-reading the screen mid-comparison.
+rh_screen_snapshot :: proc(s: ^pty.Screen) -> string {
+	buf : [dynamic]u8
+	pty.screen_text(s, &buf)
+	out := strings.clone(string(buf[:]), context.allocator)
+	delete(buf)
+	return out
+}
+
+// Rh_Spine is one sample of the painted spine.
+Rh_Spine :: struct {
+	rules: int,
+	lo, hi: int,
+}
+
+rh_spine_of :: proc(s: ^pty.Screen) -> Rh_Spine {
+	lo, hi := rh_rule_widths(s)
+	return Rh_Spine{ rh_rule_count(s), lo, hi }
+}
+
+// rh_wait_stable_spine polls until two CONSECUTIVE samples of the spine agree
+// on rule count and spine widths, or the timeout expires. It returns the last
+// (settled) spine plus whether it actually stabilised.
+//
+// WHY THIS EXISTS. A single snapshot of the grid after a resize storm can catch
+// the app between writes: termbox flushes a full-screen frame in more than one
+// write() when the frame is big, and the emulator applies each burst as it
+// arrives, so a mid-frame sample legitimately shows one rule painted and the
+// other not yet. That is not the product's final state, and a test that asserts
+// on one sample is asserting on a transient. This is a real, pre-existing race:
+// `resize_flood` failed ~1 run in 10 on the committed tree with
+// "spine widths lo=118 hi=118 want 118, rows=1" — correct width, one rule
+// short, because the sample landed mid-flush.
+//
+// Requiring two identical consecutive samples is STRICTER than the old
+// sleep-then-peek, not looser: it asserts the picture has STOPPED CHANGING, and
+// a frame that is stuck wrong (stale size, half spine) still fails the
+// assertions that read the returned spine. The timeout is reported so a slow
+// settle is visible rather than silently absorbed.
+rh_wait_stable_spine :: proc(d: ^pty.Pty_Driver, timeout_ms: f64) -> (sp: Rh_Spine, stabilised: bool) {
+	end := pty.ms_until(d, timeout_ms)
+	prev := rh_spine_of(&d.screen)
+	tries := 0
+	for !pty.over_due(d, end) {
+		pty.pty_read(d, 150)
+		cur := rh_spine_of(&d.screen)
+		tries += 1
+		if cur.rules == prev.rules && cur.lo == prev.lo && cur.hi == prev.hi && cur.rules > 0 {
+			return cur, true
+		}
+		prev = cur
+		if !pty.pty_alive(d) { break }
+	}
+	return prev, false
+}
 
 rh_wait_key_reply :: proc(d: ^pty.Pty_Driver, key: string, timeout_ms: f64) -> pty.Resize_Evidence {
 	// The key-input twin of pty_resize_latency, and it needs the same care:

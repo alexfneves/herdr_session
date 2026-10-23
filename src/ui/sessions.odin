@@ -101,16 +101,25 @@ sessions_columns :: proc(avail: i32) -> Sessions_Columns {
 
 // Sessions is the view state. Rows are passed in by the caller (already merged
 // and ordered by fetch); the view owns only filter / selection / scroll.
+//
+// `show_filter` decides whether the filter LINE is drawn at all. It is a field
+// rather than a parameter because the answer comes from
+// `app.state_is_filter_view` — a rule that lives in the machine, not in the
+// view — and `sessions_paint`'s signature belongs to every caller in the tree.
+// `sessions_init` sets it to true, so a view that never says otherwise paints
+// the table it always painted; {Mode selection} is the state that opts out.
 Sessions :: struct {
 	filter : Edit,
 	sel : app.Selection,
 	scroll : i32, // rows scrolled off the top
+	show_filter : bool,
 }
 
 sessions_init :: proc(v: ^Sessions) {
 	edit_init(&v.filter)
 	v.sel = app.NO_SELECTION
 	v.scroll = 0
+	v.show_filter = true
 }
 
 // ── filtering ──────────────────────────────────────────────────────────────
@@ -185,21 +194,23 @@ sessions_reveal :: proc(v: ^Sessions, index: i32, visible: i32) {
 sessions_paint :: proc(v: ^Sessions, rows: []app.Session, avail: i32, body_rows: i32, pal: ^Palette) {
 	cols := sessions_columns(avail)
 
-	// ── the filter line ──
-	if clay.UI(clay.ID(SESS_HEADER_FILTER_ID))({
-		layout = clay.LayoutConfig{
-			sizing = clay.Sizing{
-				width  = clay.SizingGrow(),
-				height = clay.SizingFixed(1),
+	// ── the filter line (only in the states that display one) ──
+	if v.show_filter {
+		if clay.UI(clay.ID(SESS_HEADER_FILTER_ID))({
+			layout = clay.LayoutConfig{
+				sizing = clay.Sizing{
+					width  = clay.SizingGrow(),
+					height = clay.SizingFixed(1),
+				},
+				layoutDirection = clay.LayoutDirection.LeftToRight,
+				childGap = 1,
 			},
-			layoutDirection = clay.LayoutDirection.LeftToRight,
-			childGap = 1,
-		},
-	}) {
-		clay.Text("filter:", clay.TextElementConfig{textColor = pal.dim})
-		// The filter is an editor: live caret, whole-rune backspace, sanitised
-		// paste. It starts empty, which shows every row.
-		edit_paint(&v.filter, "hs.sessions.filter.edit", avail-8, pal)
+		}) {
+			clay.Text("filter:", clay.TextElementConfig{textColor = pal.dim})
+			// The filter is an editor: live caret, whole-rune backspace, sanitised
+			// paste. It starts empty, which shows every row.
+			edit_paint(&v.filter, "hs.sessions.filter.edit", avail-8, pal)
+		}
 	}
 
 	// ── column header ──

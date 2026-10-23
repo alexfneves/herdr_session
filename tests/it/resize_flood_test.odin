@@ -81,11 +81,25 @@ flood_rep :: proc(t: ^testing.T, rep: int) {
 				fmt.tprintf("resize to {}x{} failed", last_rows, last_cols))
 		}
 	}
+	// The frame must match the LAST request, not something from mid-drag — and
+	// it must have STOPPED changing first. The old code slept 1500 ms and took a
+	// single snapshot, which caught the app mid-flush about 1 run in 10 on the
+	// committed tree: correct spine width (118) but one rule short, because a
+	// full-screen frame arrives in more than one write() and the emulator
+	// applies each burst as it lands. Settling on two identical consecutive
+	// samples asserts the picture is FINAL rather than merely observed once.
 	storm_ms = pty.elapsed_ms(a.d) - storm_t0
 	rh_log(a.log, fmt.tprintf("storm: {} TIOCSWINSZ in {} ms (final {}x{})",
 		FLOOD_N, storm_ms, last_rows, last_cols))
 	// Settle so the last repaint has actually landed before we read the grid.
+	// This first drain is left EXACTLY as it was on purpose: the coalescing
+	// counters the app reports depend on how fast we drain its output, so
+	// changing this read changes the thing a later assertion measures. The
+	// stability sample below is therefore additive, on top of the same drain.
 	pty.pty_read(a.d, 1500)
+	spine, stable := rh_wait_stable_spine(a.d, 3000)
+	rh_log(a.log, fmt.tprintf("settled: rules={} spine lo={} hi={} stabilised={}",
+		spine.rules, spine.lo, spine.hi, stable))
 
 	ck_flood(t, rep, "the app survived the storm",
 		pty.pty_alive(a.d), pty.pty_exit_info(a.d))
@@ -95,11 +109,10 @@ flood_rep :: proc(t: ^testing.T, rep: int) {
 		fmt.tprintf("bytes written by us over {} resizes = {}", FLOOD_N, a.d.written))
 
 	// The frame must match the LAST request, not something from mid-drag.
-	lo, hi := rh_rule_widths(&a.d.screen)
 	ck_flood(t, rep, "the surviving frame is the FINAL size, not a stale one",
-		lo == int(last_cols) && hi == int(last_cols) && rh_rule_count(&a.d.screen) >= 2,
-		fmt.tprintf("spine widths lo={} hi={} want {} (last request {}x{}, rows={})",
-			lo, hi, int(last_cols), last_rows, last_cols, rh_rule_count(&a.d.screen)))
+		spine.lo == int(last_cols) && spine.hi == int(last_cols) && spine.rules >= 2 && stable,
+		fmt.tprintf("spine widths lo={} hi={} want {} (last request {}x{}, rules={}, settled={})",
+			spine.lo, spine.hi, int(last_cols), last_rows, last_cols, spine.rules, stable))
 
 	stopped := rh_stop(a)
 	ck_flood(t, rep, "the app reported resize accounting",

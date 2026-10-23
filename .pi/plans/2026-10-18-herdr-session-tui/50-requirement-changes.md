@@ -424,3 +424,67 @@ the entire migration cold.
 **Approved for Agent S to apply directly** (S verified it on a worktree copy: product builds; a test
 binary importing `app` passes; importing `ui` passes), with a temporary lane extension to
 `src/terminal/**` and `src/app/{exec,herdr,fetch}.odin`. No other agent is concurrently writing there.
+
+---
+
+# RCH-9 — Copy and the state's home (user, 2026-10-22) — ✅ APPLIED
+
+Five changes, all display-layer. None of them touches an enum name, a wire value
+or a config key.
+
+| # | Change | Where |
+|---|---|---|
+| 1 | `{Mode selection}` **no longer displays the filter line**. Every other filter state still does. | `app.state_is_filter_view` drops `.mode_selection` |
+| 2 | The state is **a human phrase**, not snake_case: `Mode selection`, `Name local session`, `Select remote server`, `Name remote session`, `Attach session`, `Delete session`, `Theme`, `Error`. | `app.state_label` |
+| 3 | **The state moved from the FOOTER to the HEADER.** Header = title centred (row 1) + state centred (row 2); `HEADER_ROWS 1 -> 2`. Footer keeps the rest. | `ui.frame_layout`, `frame_open`, `frame_footer` |
+| 4 | **The list-age token is out of the footer.** `tui_list_age` stays — the `Ctrl-L` notice still reports the age where the user actually asked for it. | `main.tui_footer_text` |
+| 5 | **The product never prints a test verdict.** `print_report` is skipped on the `tui` path; every smoke/evidence subcommand keeps it. | `main.main` |
+
+## What 1 means for the two predicates (do not merge them)
+
+`state_is_filter_view` answers **"is the filter line DRAWN here?"**.
+`state_filter_is_editable` answers **"does typing go INTO the filter here?"** — and
+it is **unchanged**: still exactly `{Select remote server}`, `{Attach session}`,
+`{Select session to delete}`, `{Select theme}`. RCH-3/R2's typing rule is
+untouched; only the picture changed.
+
+The landing screen loses the line because it was an input the state could not
+edit: a filter you cannot type into is decoration that costs a row. Losing the
+row is a **gain** — `session_body` derives its body height from the same
+predicate, so the table expands into the space instead of reserving it for a
+line it never painted.
+
+## The underflow risk in 3 (the real one)
+
+`frame_layout` derives `rule_top`, `main_y`, `main_rows` and `footer_y` from
+`HEADER_ROWS`, so a second header row eats one row of MAIN everywhere. At the
+smallest terminal the app renders — `MIN_COLS=40`, `MIN_ROWS=10`
+(`terminal/resize.odin`; smaller is replaced by the too-small notice):
+
+    main_rows = 10 - (FRAME_PAD 0 + HEADER_ROWS 2 + GAP 2 + GAP 2 + FOOTER_ROWS 1 + FRAME_PAD 0) = 3
+
+Positive, and `frame_layout` clamps to 0 regardless, so no computation
+underflows. The two consumers floor their own body at 1 row. Verified at
+40x10 (renders: 2 header rows, rule, table, rule, footer) and at 40x9 (the
+too-small notice replaces the spine, exactly as designed).
+
+## Churn caused by 2 and 3 — and where each item now stands
+
+Changes 2 and 3 moved information between rows, which breaks any test that had
+hard-coded the old row. Those tests encoded the **old placement**, not the
+product's behaviour, so they are re-homed rather than deleted — the assertion
+must survive with its strength, pointed at the row that now carries the
+requirement.
+
+| Consumer | What it asserted | Status |
+|---|---|---|
+| `src/ui_cases.odin` | "footer shows the current state" | **RE-HOMED.** Now asserts the state on `header_y + 1`, that the title row and the state row are two distinct rows inside the frame, **and** that the footer no longer contains the state word. The placement is pinned from both sides so it cannot drift back unnoticed. `dev/ui-smoke.sh` `ui-frame` green (94 checks). |
+| `resize_drive.py too-small` → `tests/it/resize_too_small_test.odin` | `"filter:" in screen` as the proxy for "the spine is painted" | **RE-HOMED, and stronger.** The marker is now the three rows only the real spine paints — the title `herdr-session`, the state `Mode selection` **on row 1 specifically**, and the column header carrying all of `device` / `timestamp` / `state` / `name` below it. The too-small notice paints none of them, so recovery is proven by structure, not by one substring. The complement is asserted too: while the notice is up the normal UI must be **absent**. |
+| `resize_drive.py eintr-safe` → `tests/it/resize_eintr_test.odin` | "bytes came out after Down" as the proxy for "still reading" | **RE-HOMED, and falsifiable.** The liveness key is now `a`, which moves header row 2 `Mode selection` → `Attach session`: the assertion is the screen, not the byte total. A permanent negative control SIGSTOPs the app and presses the same key, proving the check goes RED when the app cannot read (live: 1162 bytes, header flips; stopped: 0 bytes, timeout). |
+| `dev/tui_drive.py` footer-marker scenarios | grep the footer for `mode_selection  ·  ` etc. | **GONE.** That driver was deleted in the RCH-5/RCH-6 migration; its scenarios live in `tests/it/*_test.odin` and read the header. No consumer greps the footer for a state any more. |
+
+The rule this leaves behind, now written into `docs/requirements.md`: **read the
+state from header row 2 and compare the whole line.** `"Attach session"` as a
+substring of the entire grid can be satisfied by a session *named*
+`Attach sessionX`; the state line equal to `Attach session` cannot.
+
