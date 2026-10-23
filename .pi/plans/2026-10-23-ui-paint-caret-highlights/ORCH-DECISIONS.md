@@ -1,5 +1,8 @@
 # Orchestrator decisions — RCH-10 + test-migration continuation
 
+> **HARD LIMIT: maximum 3 concurrent agents at any time (halogen is a local LLM).**
+> Count before every spawn. Do not spawn a fourth — wait instead.
+
 Made by the orchestrator. The user is unavailable and explicitly delegated all decisions.
 **These bind the planner and all workers. Do not re-litigate them; if one is actually wrong,
 record the contradiction loudly rather than silently deviating.**
@@ -70,10 +73,13 @@ New semantic roles (key vs description fg, caret, state-under-highlight) must be
 entries with theme-resolution + fallback, so `theme`/`colour_wire`/`hygiene` keep meaning
 something and a theme change still reaches them. No hardcoded RGB in `src/ui/*`.
 
-## D-I — Agent budget
+## D-I — Agent budget: **at most 3 concurrent agents**
 
-At most **4 concurrent agents** (self-hosted LLM budget). Currently zero. Run workers
-**sequentially** against any shared repo; parallel only across disjoint worktrees.
+Halogen is a local LLM; parallelism is a hard resource limit, not a preference.
+- Never exceed **3** concurrently running agents, counting scouts, planners and workers.
+- Workers against a shared repo run **sequentially**; parallelism only across disjoint worktrees.
+- Before spawning, count what is already running. If at the limit, **wait** — do not queue a fourth.
+- (This supersedes the earlier cap of 4.)
 
 ## D-J — Deletion discipline
 
