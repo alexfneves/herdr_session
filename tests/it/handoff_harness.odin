@@ -397,7 +397,10 @@ hh_bits_s4 :: proc(f: posix.CLocal_Flags) -> string {
 hh_bits_lflag :: proc(t: posix.termios) -> string {
 	echo_on := (t.c_lflag & posix.CLocal_Flags{.ECHO}) != {}
 	icanon_on := (t.c_lflag & posix.CLocal_Flags{.ICANON}) != {}
-	return fmt.tprintf("0x{x} (ECHO={} ICANON={})", t.c_lflag, echo_on, icanon_on)
+	// No `{x}` verb here: this fmt does not have one, and `0x%!(MISSING CLOSE
+	// BRACE)}` in a detail line is exactly the fallout the gate's rule 7
+	// sweeps for. The flag SET renders by name, which is more readable anyway.
+	return fmt.tprintf("ECHO={} ICANON={} lflag={}", echo_on, icanon_on, t.c_lflag)
 }
 
 // hh_termios_round_trip is the counted shape: (before, after) in, a verdict and
