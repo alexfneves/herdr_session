@@ -7,6 +7,51 @@ Made by the orchestrator. The user is unavailable and explicitly delegated all d
 **These bind the planner and all workers. Do not re-litigate them; if one is actually wrong,
 record the contradiction loudly rather than silently deviating.**
 
+## ACKS — planner pushed back on three orchestrator assumptions. All three accepted.
+
+### ACK-1 — D-M is WRONG as written. Use `run_hl` + `stop_hl`, not a single `state_hl`. (palette 13 → 19)
+
+A single `state_hl` makes **selected-running and selected-stopped render identically** — which is
+precisely the flattening that change 5 forbids. One colour cannot preserve a distinction it is supposed
+to preserve. `run_hl` + `stop_hl` is the only version the requirement can falsify, at the same
+mechanical cost. **D-M is superseded on this point.**
+
+### ACK-2 — Colour IS machine-testable. My earlier claim was wrong.
+
+I recorded that colour and cursor are "invisible to the pty emulator" and therefore eyeball-only. The
+pty *rune* emulator is indeed blind, but `tb_get_cell(back = 1)` exposes the real back buffer — which
+is exactly what the landed `render` suite already asserts against. So per-cell foreground/background,
+rule spans and caret colours **are** assertable in CI.
+
+Revised split: **eyeball-only** = that it blinks, that the block reads as "fat", subjective contrast,
+key-visual-dominance. Everything else goes through `tb_get_cell`. Do not demote testable properties to
+eyeball checks on the strength of my earlier statement.
+
+### ACK-3 — CONTRADICTION C-3: ACKNOWLEDGED. RCH-11 deliberately reverts landed, live-tested behaviour.
+
+`adt_r1_only_created_destroys_ours_spares_theirs` currently asserts that a **merely attached** session
+survives. The user's amendment makes that assertion **wrong by design**. The user was explicit:
+"This is valid for when we create a session OR when we attach to a session."
+
+Ruling:
+1. **The amendment is authoritative.** `DEFAULT_CLEANUP_POLICY` becomes `.always`.
+2. **Invert the existing test — do not delete it.** It must be rewritten to assert the NEW contract
+   (attached session is destroyed). Deleting it would lose the coverage of the policy mechanism itself.
+3. **Re-derive the landed `app` row (444 → 446) explicitly as an RCH-11 consequence**, in the
+   parity notes, naming the inverted assertion. A silently edited floor is a lost requirement.
+4. Add the `HERDR_SESSION` refusal that **outranks every policy value**, alongside the existing `default`
+   refusal. Without it the destroy path can kill the user's own session and our own process — that
+   guard is non-negotiable regardless of which policy is default.
+
+### ACK-4 — RCH-11 pre-check leak resolved as the planner chose (option a)
+
+`delete_session` refuses identities absent from the model (`herdr.odin:768-775`), so a just-created
+session would leak. **Refresh the device list before deleting.** Workers must **stop and report** rather
+than silently falling back to a raw `delete_argv` if the refresh fails — bypassing `delete_session` to
+force a delete drops the `default` guard and the never-trust-`deleted:true` check with it.
+
+---
+
 ## D-A — Sequencing: product change BEFORE the big test ports
 
 Do the seven UI changes **first**, as **RCH-10**. Then port `ui`/T8 (168) and `tui`/T12 (145).
