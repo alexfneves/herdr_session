@@ -129,11 +129,18 @@ probe_sentinel_in :: proc(captured: string, key: string, val: string) -> bool {
 //-----------------------------------------------------------------------------
 
 // check_probe_armed asserts the premise. Its failure message is written for
-// someone who has never seen this file: it names what must be true and why the
-// rest of the suite is meaningless without it.
-check_probe_armed :: proc(t: ^testing.T, label: string, armed: bool) {
+// someone who has never seen this file: it names what must be true and why
+// the rest of the suite is meaningless without it.
+//
+// `loc` is forwarded from the CALLER on purpose. Without it every premise
+// check tallies under this file's group (`sentinel`) instead of the suite's
+// own — which is precisely the attribution trap the parity gate exists for:
+// the assertion would be counted against nobody while the row that needed it
+// stayed short. Same reason `au_guard` forwards its loc to the caller.
+check_probe_armed :: proc(t: ^testing.T, label: string, armed: bool, loc := #caller_location) {
 	check(t, fmt.tprintf("{} — a HERDR_* sentinel is armed HERE", label), armed,
 		fmt.tprintf("{}={} {}={} must both be readable in this process, or the child-side check has nothing to scrub",
 			SCRATCH_PROBE_ENV, SCRATCH_PROBE_ENV_VALUE,
-			SCRATCH_PROBE_SESSION, SCRATCH_PROBE_SESSION_VALUE))
+			SCRATCH_PROBE_SESSION, SCRATCH_PROBE_SESSION_VALUE),
+		loc = loc)
 }
