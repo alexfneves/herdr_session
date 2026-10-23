@@ -35,12 +35,52 @@ The TUI covers all the available space on the terminal.
 The header shows the title of the program.
 The footer shows what is the current state, then all the keys that can be used.
 
+> **Amended by RCH-9** (`.pi/plans/2026-10-18-herdr-session-tui/50-requirement-changes.md`).
+> The two sentences above no longer describe the shipped screen, and the
+> discrepancy is not incidental — it is the change.
+>
+> - The **header** shows the title of the program **and, on the line below it,
+>   the current state** as a human phrase (`Mode selection`, `Name local
+>   session`, `Select remote server`, `Name remote session`, `Attach session`,
+>   `Delete session`, `Theme`, `Error`) rather than the internal snake_case
+>   identifier. The header is two rows, not one.
+> - The **footer** shows the keys that can be used, plus what the machine
+>   observed: the per-host verdict (`local ok 2  build-box down 1`) and where
+>   the host list came from (`from registry + config` / `from config`). It does
+>   **not** show the state.
+> - The age of the list is **not a permanent footer cell**. It is a notice, at
+>   the two moments it matters: before a create (`existing session: … (Ns)`) and
+>   after a refresh (`list re-read — list now`). A cell that ticks forever is a
+>   clock, not information.
+>
+> Anything that needs to know "which state is the app in" reads header row 2 and
+> compares it to the exact phrase. A test still reading the footer for the state
+> is asserting a placement the product no longer has.
+
 
 Main content:
 - Single text: The main content contains a single text field
 - Single edit: The main content displays a line for edit, and nothing below it
 - Sessions: The main content displays a line for the filter (it starts empty), and below the table of all the sessions and the respective data, but only the tables following the filter. The table can be scrolled. Columns are device (local/remote server name), timestamp of the session, session state (running/stopped), session name (if not empty). The items are organized by server name first, except local is always first, then timestamp.
 - Filtered list: The main content displays a line for the filter (it starts empty), and below the list of items according to the filter
+
+> **Amended by RCH-9 (change 1).** The filter line is drawn only in the states
+> that can actually receive typing — Attach, Delete, the remote picker and the
+> theme picker. `{Mode selection}`'s main content is still Sessions, but it
+> draws **no filter line at all**: it has no filter binding (RCH-3 / R2), and a
+> filter you cannot type into is decoration that costs a row. `session_body`
+> derives its body height from the same predicate that decides whether the line
+> is painted (`app.state_is_filter_view`), so the table expands into the freed
+> row rather than reserving space for a line that was never drawn.
+>
+> The two predicates answer **different questions and must not be merged**:
+> `state_is_filter_view` = "is the filter line DRAWN here?";
+> `state_filter_is_editable` = "does typing go INTO the filter here?" — and the
+> latter is still exactly the four picker states, untouched by RCH-9. So
+> "Sessions" in the bullet above means the table plus a filter line **in the
+> states that filter**, and the table alone in `{Mode selection}`. Everything
+> else is unchanged: full-height scrollable table, those four columns in that
+> order, local first then by timestamp.
 
 
 States:

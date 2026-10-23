@@ -468,26 +468,23 @@ underflows. The two consumers floor their own body at 1 row. Verified at
 40x10 (renders: 2 header rows, rule, table, rule, footer) and at 40x9 (the
 too-small notice replaces the spine, exactly as designed).
 
-## Known churn caused by 2 and 3 (left failing, on purpose)
+## Churn caused by 2 and 3 — and where each item now stands
 
-- `ui-frame`: **"footer shows the current state"** — the assertion encodes the
-  footer being the state's home. That is now the header's job.
-- `dev/tui_drive.py`: every scenario that greps the **footer** for a state
-  marker (`mode_selection  ·  `, `name_local  ·  `, …) now fails, both because
-  the phrase moved and because it is no longer snake_case. The scenarios are
-  still meaningful; they are looking in the wrong place.
-- `dev/tui_drive.py refresh-key`: the three list-age assertions
-  (`"list " in footer`, `"list now" in footer`) fail by construction — the
-  token is off the footer. The `Ctrl-L` notice assertion itself still passes.
-- `dev/resize_drive.py too-small`: both "the normal UI" checks use
-  `"filter:" in screen` as their proxy for "the spine is painted". {Mode
-  selection} no longer paints a filter line, so the proxy reads false while the
-  frame itself is correct — every other assertion in the scenario (notice drawn,
-  no half-drawn spine, spine back after enlarging) still passes.
-- `dev/resize_drive.py eintr-safe`: both "it is still reading keys" checks use
-  "bytes came out after Down" as the proxy for a repaint. With the age token off
-  the footer, a Down that cannot move the selection (one row on screen) changes
-  **no cell at all**, so the app legitimately emits zero bytes. The loop is
-  alive and reading: the same probe with a key that *does* change the screen
-  (`a` -> {Attach session}) emitted 1162 bytes on the new binary. The proxy,
-  not the program, is what the requirement change broke.
+Changes 2 and 3 moved information between rows, which breaks any test that had
+hard-coded the old row. Those tests encoded the **old placement**, not the
+product's behaviour, so they are re-homed rather than deleted — the assertion
+must survive with its strength, pointed at the row that now carries the
+requirement.
+
+| Consumer | What it asserted | Status |
+|---|---|---|
+| `src/ui_cases.odin` | "footer shows the current state" | **RE-HOMED.** Now asserts the state on `header_y + 1`, that the title row and the state row are two distinct rows inside the frame, **and** that the footer no longer contains the state word. The placement is pinned from both sides so it cannot drift back unnoticed. `dev/ui-smoke.sh` `ui-frame` green (94 checks). |
+| `resize_drive.py too-small` → `tests/it/resize_too_small_test.odin` | `"filter:" in screen` as the proxy for "the spine is painted" | **RE-HOMED, and stronger.** The marker is now the three rows only the real spine paints — the title `herdr-session`, the state `Mode selection` **on row 1 specifically**, and the column header carrying all of `device` / `timestamp` / `state` / `name` below it. The too-small notice paints none of them, so recovery is proven by structure, not by one substring. The complement is asserted too: while the notice is up the normal UI must be **absent**. |
+| `resize_drive.py eintr-safe` → `tests/it/resize_eintr_test.odin` | "bytes came out after Down" as the proxy for "still reading" | **RE-HOMED, and falsifiable.** The liveness key is now `a`, which moves header row 2 `Mode selection` → `Attach session`: the assertion is the screen, not the byte total. A permanent negative control SIGSTOPs the app and presses the same key, proving the check goes RED when the app cannot read (live: 1162 bytes, header flips; stopped: 0 bytes, timeout). |
+| `dev/tui_drive.py` footer-marker scenarios | grep the footer for `mode_selection  ·  ` etc. | **GONE.** That driver was deleted in the RCH-5/RCH-6 migration; its scenarios live in `tests/it/*_test.odin` and read the header. No consumer greps the footer for a state any more. |
+
+The rule this leaves behind, now written into `docs/requirements.md`: **read the
+state from header row 2 and compare the whole line.** `"Attach session"` as a
+substring of the entire grid can be satisfied by a session *named*
+`Attach sessionX`; the state line equal to `Attach session` cannot.
+

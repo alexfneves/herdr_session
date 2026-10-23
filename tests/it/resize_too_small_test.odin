@@ -27,9 +27,42 @@ package it
 // frames — the counter is the app's own admission, not our inference.
 //
 // 3 reps, one log per rep (/tmp/hs-it-resize-too-small-repN.log).
+//
+// ── WHY "THE NORMAL UI" IS THREE ROWS AND NOT ONE SUBSTRING (RCH-9) ─────────
+// This scenario used to ask for one string, "filter:", as its proxy for "the
+// spine is painted". RCH-9 (.pi/plans/2026-10-18-herdr-session-tui/
+// 50-requirement-changes.md)
+// took that token away: {Mode selection} no longer displays a filter line at all
+// (app.state_is_filter_view drops .mode_selection), and the state itself moved
+// OUT of the footer and INTO the header. So the old single-token proxy is not
+// merely stale, it is unsatisfiable — the check was reading false while the
+// frame was correct.
+//
+// What the real session-list UI paints, in the order a user reads it, is:
+//
+//   row 0  the title, centred                             "herdr-session"
+//   row 1  the state line, centred                       "Mode selection"
+//   row 4  the table's column header   "device … timestamp … state … name"
+//
+// The too-small notice is ONE centred line and NOTHING else —
+// "terminal too small: 39x40 - enlarge to at least 40x10"
+// (too_small_message, src/terminal/resize.odin), drawn by paint_notice, which
+// deliberately replaces the whole spine instead of joining it
+// (src/ui/frame.odin, "THE 'TOO SMALL' SCREEN"). It therefore contains none
+// of the three markers: no title, no state line, no column header. That is what
+// makes this composite a valid gate — each marker is independently false while
+// the notice is up, so a frame that showed the notice CANNOT satisfy the check.
+//
+// Verified against real captures of this binary rather than guessed: the three
+// markers were read off the painted grid at 30x100 and 40x120 (all present),
+// and the notice frames at 9x120, 40x39 and 5x20 were re-checked for all three
+// (all absent). The scenario re-asserts that last property on its own frames —
+// see the "…and the normal session-list UI is NOT painted at <size>" check,
+// which runs on the notice itself inside the size walk.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "core:fmt"
+import "core:strings"
 import "core:testing"
 
 import pty "../pty"
@@ -51,9 +84,15 @@ TOO_SMALL_SIZES :: []Too_Small{
 RECOVER_ROWS :: 40
 RECOVER_COLS :: 120
 
-// NORMAL_UI_MARK is the prompt the normal session-list UI paints and the
-// too-small notice never contains.
-NORMAL_UI_MARK :: "filter:"
+// NORMAL_UI_TITLE / NORMAL_UI_STATE / NORMAL_UI_COLUMNS are the three rows that
+// identify "the normal session-list UI is painted", and that the too-small
+// notice never paints. Mirrored from the product's copy the same way MIN_COLS /
+// MIN_ROWS are mirrored in the harness: a drift in the product's wording shows
+// up here as a red check, not as a silent green. The row the state lands on
+// (HEADER_STATE_ROW) is defined once, in resize_harness.odin.
+NORMAL_UI_TITLE :: "herdr-session"
+NORMAL_UI_STATE :: "Mode selection"
+NORMAL_UI_COLUMNS :: []string{"device", "timestamp", "state", "name"}
 
 ck_small :: proc(t: ^testing.T, rep: int, name: string, cond: bool, detail: string) {
 	support.check(t, fmt.tprintf("rep{} {}", rep, name), cond, detail)
@@ -80,8 +119,9 @@ too_small_rep :: proc(t: ^testing.T, rep: int) {
 	pty.pty_read(a.d, 400)
 	before := normal_ui(&a.d.screen)
 	ck_small(t, rep, "before the shrink the app shows the normal UI",
-		before.has_mark && !before.has_notice,
-		fmt.tprintf("has 'filter:'={} has notice={}", before.has_mark, before.has_notice))
+		before.painted && !before.has_notice,
+		fmt.tprintf("title row={} state row={} column-header row={} (want 0/1/>=1) notice={}",
+			before.title_row, before.state_row, before.table_row, before.has_notice))
 
 	sizes: []Too_Small = TOO_SMALL_SIZES
 	for i in 0 ..< len(sizes) {
@@ -119,6 +159,24 @@ too_small_rep :: proc(t: ^testing.T, rep: int) {
 		ck_small(t, rep, fmt.tprintf("…and the notice fits inside {} columns", sz.cols),
 			max_len <= int(sz.cols),
 			fmt.tprintf("max line len={} > cols={}", max_len, int(sz.cols)))
+
+		// THE NEGATIVE HALF OF THE NEW MARKER. "filter:" used to be dropped in
+		// here with the implication that its absence proved nothing; here the
+		// absence of all three normal-UI rows IS asserted, on the very frame the
+		// notice replaced. If the app ever painted the title, the state line or
+		// the column header behind the notice, this goes red — which is what
+		// makes the positive check below (RECOVERED) more than "some string came
+		// back".
+		//
+		// At 2x5 the notice phrase itself cannot be rendered, so only the
+		// "normal UI is absent" half is claimed there; the notice's presence is
+		// required only on the sizes where the phrase physically fits, which is
+		// the same split the check above already draws.
+		at_small := normal_ui(&a.d.screen)
+		ck_small(t, rep, fmt.tprintf("…and the normal session-list UI is NOT painted at {}", lbl),
+			!at_small.painted && (!can_show || at_small.has_notice),
+			fmt.tprintf("title row={} state row={} column-header row={} notice={} (all three rows must be absent)",
+				at_small.title_row, at_small.state_row, at_small.table_row, at_small.has_notice))
 	}
 
 	// ── RECOVERY: enlarge, the normal UI must come back by itself ──
@@ -126,9 +184,9 @@ too_small_rep :: proc(t: ^testing.T, rep: int) {
 	pty.pty_read(a.d, 700)
 	after := normal_ui(&a.d.screen)
 	ck_small(t, rep, "RECOVERED after enlarging: the normal UI is back",
-		after.has_mark && !after.has_notice,
-		fmt.tprintf("has 'filter:'={} has notice={} (rows={})",
-			after.has_mark, after.has_notice, a.d.screen.rows))
+		after.painted && !after.has_notice,
+		fmt.tprintf("title row={} state row={} column-header row={} notice={} (rows={})",
+			after.title_row, after.state_row, after.table_row, after.has_notice, a.d.screen.rows))
 
 	rlo, rhi := rh_rule_widths(&a.d.screen)
 	ck_small(t, rep, "…and BOTH spine dividers are back at the new width",
@@ -152,14 +210,54 @@ too_small_rep :: proc(t: ^testing.T, rep: int) {
 		fmt.tprintf("resizes={} want >= 5 (4 too-small + 1 recovery)", resizes))
 }
 
+// Ui_Kind reports WHERE each marker was found, not just whether it was. A row
+// index of -1 means "that row is not on screen at all", which is what a too
+// small frame returns for every one of them — and the detail line says so, so a
+// failure names the marker that went missing instead of shrugging.
 Ui_Kind :: struct {
-	has_mark  : bool,
-	has_notice: bool,
+	title_row  : int,
+	state_row  : int,
+	table_row  : int,
+	painted    : bool,
+	has_notice : bool,
+}
+
+// painted_of is true only when all three structural rows are present AND each is
+// where the frame is supposed to put it. The state must sit on
+// HEADER_STATE_ROW and below the title, because "it is somewhere" is exactly the
+// kind of condition a decorative string can satisfy by accident.
+painted_of :: proc(title_row, state_row, table_row: int) -> bool {
+	if title_row < 0 || state_row != HEADER_STATE_ROW || table_row < 0 { return false }
+	return table_row > state_row
+}
+
+// ui_rows_with returns the first row whose text contains EVERY needle, or -1.
+// "all four column labels on one row" is the column header; any single one of
+// them alone would also match a session's own name or device column.
+ui_rows_with :: proc(s: ^pty.Screen, needles: []string) -> int {
+	for r := 0; r < s.rows; r += 1 {
+		txt := rh_row_text(s, r)
+		all := true
+		for n in needles {
+			if !strings.contains(txt, n) {
+				all = false
+				break
+			}
+		}
+		if all { return r }
+	}
+	return -1
 }
 
 normal_ui :: proc(s: ^pty.Screen) -> Ui_Kind {
+	ti := ui_rows_with(s, []string{NORMAL_UI_TITLE})
+	st := ui_rows_with(s, []string{NORMAL_UI_STATE})
+	tb := ui_rows_with(s, NORMAL_UI_COLUMNS)
 	return Ui_Kind{
-		has_mark   = pty.screen_contains(s, NORMAL_UI_MARK),
+		title_row  = ti,
+		state_row  = st,
+		table_row  = tb,
+		painted    = painted_of(ti, st, tb),
 		has_notice = pty.screen_contains(s, NOTICE),
 	}
 }

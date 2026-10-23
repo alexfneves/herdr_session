@@ -10,16 +10,23 @@ threads, no web frontend, no TOML. A single static binary that talks to the `her
 CLI you already have.
 
 ```
-                                 herdr-session
-                                Mode selection
+                              herdr-session
+                             Mode selection
+
 ──────────────────────────────────────────────────────────────────────────
-device      timestamp               state    name
-local       2026-10-20 08:42:00.459 running  api
-build-box   2026-10-19 21:14:07.221 running  worker
-deploy     2026-10-18 09:03:55.104 stopped  bench
+device       timestamp               state    name
+local        2026-10-20 08:42:00.459 running  api
+build-box    2026-10-19 21:14:07.221 running  worker
+deploy       2026-10-18 09:03:55.104 stopped  bench
 ──────────────────────────────────────────────────────────────────────────
 local ok 1  build-box ok 1  deploy timeout 0  …  esc quit
 ```
+
+Rendered from the real column widths (`device` 12, `timestamp` 23, `state` 8,
+one-column gaps, `name` takes the rest) at 74 columns, so the alignment above is
+what the app actually draws — including the blank row between the header and the
+table's top rule, and the blank rows under a short list. There is **no filter
+line** in this, the landing screen, and no state in the footer.
 
 The header carries the program title and, on the line below it, the state you are
 in — `Mode selection`, `Attach session`, `Delete session`. The footer is for
@@ -85,9 +92,11 @@ That list is **complete**: `Enter n r s a d t Esc Ctrl-C`. There are **no
 `Up`/`Down` bindings here and nothing is highlighted** — this state has no cursor,
 because its `Enter` creates a session rather than acting on a listed row (see
 [The highlighted row *is* the row `Enter` acts on`](#the-highlighted-row-is-the-row-enter-acts-on)).
-Typing does **not** filter here either: the filter line is still drawn above the
-list so the layout matches the states that do filter, but it stays empty and
-uneditable until you enter one of them.
+Typing does **not** filter here either, and there is nothing to type *into*:
+{Mode selection} draws **no filter line at all** (RCH-9). The row it used to
+occupy is given back to the table, which is why the landing screen shows one more
+session row than the filter states do. A filter you cannot edit is decoration
+that costs a row, so it is gone rather than drawn empty.
 
 ### 2. Attach (`a`)
 
@@ -174,9 +183,14 @@ Typing edits the filter in **exactly four states**:
 
 Everywhere else — the landing screen above all — the typed character is not bound
 to the filter and does nothing. The binding list for Mode selection is
-`Enter n r s a d t Esc Ctrl-C`, full stop. The filter line is still *drawn* in
-the Sessions layout so the screen does not jump between states; it simply stays
-empty until you enter one of the four states above.
+`Enter n r s a d t Esc Ctrl-C`, full stop. And on the landing screen there is
+nothing to type into in the first place: {Mode selection} **does not draw a
+filter line** (RCH-9). Only the four states above draw one, because only those
+four accept typing. The layout therefore does differ between the landing screen
+and the filter states — by exactly the height of the line that is drawn only
+where it can be used — and `session_body` derives the table's height from the
+same `app.state_is_filter_view` predicate that decides whether to paint the line,
+so the table never reserves a row for a line that was never drawn.
 
 **`Del` and `Backspace` both remove the last character.** `Delete` (and
 `fn+Delete` on a Mac keyboard) is mapped to the same remove-last-rune action as
