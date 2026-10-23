@@ -41,29 +41,31 @@ Known mapping so far (extend for every shortcut, don't leave any on the old patt
 | `s` | **New named remote** | `name_remote_named` |
 | `a` | Attach | `attach` |
 
-## AD-3 — The collision this creates with a LANDED floor
+## AD-3 — Effect on the LANDED `keyhints` floor 54 (corrected after reading the code)
 
-`keyhints` is **already merged with floor 54** and its tests assert two things this change breaks:
+Read `keys_line` at `src/ui/frame.odin:576-600` before designing against this. Two findings that
+narrow the risk from what I first assumed:
 
-1. **The ORDER contract.** The note at `src/keyhints.odin:22` records that every table's LAST hint
-   is an exit/back/dismiss action, *because `keys_line` fills from the exit side and cuts from the
-   front*. With the description now leading each unit, cutting "from the front" cuts
-   **descriptions**, not keys. The reason the old contract existed no longer holds, so the contract
-   itself must be re-derived rather than preserved verbatim.
+**Already safe — do not "fix" it.** The existing implementation already **drops whole hints and never
+half a hint**, and the retention rule is *table-order based* ("keep the hints nearest the exit, drop
+the ones furthest from it"), not format-based. So inverting each unit's internals does **not** break
+unit-atomicity, and a `Description:` with no key cannot occur. The exit-visibility contract survives
+this change essentially intact.
 
-2. **The 8-width overflow sweep** (`tests/unit/keyhints_test.odin:149-179`): asserts the exit hint
-   survives, `t theme` survives above its own width threshold, nothing overflows, **no hint is cut in
-   half**, and the line is never blank. Under the inverted format "cut in half" now has a new
-   meaning — `New named remote: ` with the key missing is a half-cut that the old test could not
-   express.
+**What genuinely changes:**
+1. **Unit width.** `New remote: r` vs the old `r new remote` adds the colon and shifts every glyph.
+   Total line width changes, so the **8-width overflow sweep** (`tests/unit/keyhints_test.odin:149-179`)
+   thresholds move: which hint survives at 8 cells, and where `t theme` crosses its own threshold,
+   must be re-measured against the new units, not assumed identical.
+2. **Where the eye lands.** The key moves from the leading position to the trailing position of each
+   unit. Combined with AD-1's two-tone colour this is the real user-visible change.
+3. **Separator cost.** ` | ` is 3 cells per join, so N hints cost 3*(N-1) more cells than today.
+   At the narrow end this pushes hints out earlier. Verify the never-blank rule and the exit-hint
+   survival at the narrowest supported width (40 cols), not just at 100.
 
-Required resolution: **a hint unit is kept whole or dropped whole.** A visible `Description:` with no
-key, or a `: k` with no description, is always a bug. The exit/back/dismiss hint must still survive
-to the narrowest supported width, and the never-blank rule still holds.
-
-Do NOT satisfy the old test by keeping the old order. Re-derive the assertions for the new format and
-keep their strength. Per D-D: record the floor delta in `tests/parity.tsv` explicitly as a
-consequence of RCH-10/AD-1 if the count of checkable properties changes — never quietly.
+Keep the assertions' strength; re-derive their numbers. Per D-D: if the count of checkable
+properties changes, record the delta in `tests/parity.tsv` explicitly as a consequence of
+AD-1/RCH-10 — never quietly.
 
 ## AD-4 — Relationship to the other footer change
 
