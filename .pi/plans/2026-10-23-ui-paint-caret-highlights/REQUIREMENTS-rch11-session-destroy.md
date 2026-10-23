@@ -1,18 +1,50 @@
 # RCH-11 — Destroy the session when the program returns
 
-Requirement (user): **"When the herdr program returns, the session must be destroyed."**
+> **AMENDED by the user 2026-10-23. This section supersedes the interpretation below.**
 
-Recorded as its own change group, **separate from RCH-10 (paint)**. A destructive lifecycle change
-must not ride inside a cosmetic branch — it needs its own review, its own tests, and its own revert.
+**Applies to BOTH create AND attach.** When we create or attach to a session we know its name; when
+herdr returns to us, we delete that session by name using the herdr CLI:
 
-## Interpretation (user unavailable; this is the orchestrator's decision)
+```
+herdr session delete <SESSION_NAME>
+```
 
-When `herdr-session` exits, **destroy the session that this run actually CREATED.**
-Sessions that merely existed before we ran, or that we attached to, **survive**.
+**No signal handling is required, and none should be added.** The natural return point — herdetaching
+with `Ctrl+B q`, which hands the terminal back to our program — is the trigger. Do not build signal
+handlers, crash-reconciliation ledgers, or orphan sweeps for this feature.
 
-Rationale, in the code's own terms: this product manages long-lived sessions. Making every touched
-session die on exit would delete other people's work. "Destroyed when we return" is implemented as
-"we clean up what we brought into existence."
+**The user's reasoning, recorded because it is the design rationale:** the user retains both choices.
+
+| what the user does | outcome |
+|---|---|
+| closes the terminal | herdr keeps running — session preserved |
+| `Ctrl+B q` (detach) → returns to our program | our program deletes that session |
+
+**The earlier data-loss objection is explicitly withdrawn.** The user considered it and rejected it:
+because "keep it alive" is served by closing the terminal, destroying the session on the
+return-to-our-program path is not data loss — it is the other half of the choice. It applies to
+attached sessions too, including ones that already existed.
+
+## Still required — the guards that are unrelated to create-vs-attach
+
+The withdrawal of the data-loss objection does **not** remove the wrong-target risks:
+
+1. **Never delete `HERDR_SESSION`** — the session this program runs *inside*. Deleting it kills the
+   user's own session and our own process. Refuse explicitly.
+2. **Never delete `default`** — existing rule D12.
+3. **Correct device.** A remote session must be deleted through its remote device path. Running
+   `herdr session delete <name>` locally against a remote row destroys a *different* local session of
+   the same name (`src/app/herdr.odin:708-712`).
+4. **Go through `app.delete_session`, not a hand-built argv.** This is not a bypass of the user's
+   instruction — `delete_session` **is** `herdr session delete --json <name>` under the hood
+   (`delete_argv`, `herdr.odin:691-696`), plus: stop-before-delete (herdr refuses to delete a running
+   session), name validation, and the model pre-check that stops us logging the `deleted:true` lie for
+   a session that never existed (rule 4). Use it as-is.
+5. **Track the name we handed off**, per `(device, name)`, from the moment `launch_argv` /
+   `attach_argv` is used, so the return path has an unambiguous target rather than re-deriving it
+   from whatever is selected on screen.
+
+## The old interpretation — superseded, kept for provenance
 
 ## THE DATA-LOSS TRAP — read before implementing
 
@@ -57,46 +89,53 @@ session identity.
    `{"deleted": true}`** (rule 4). The model decides, not herdr — so the created-by-us ledger is the
    authority on what to destroy, and `delete_session`'s pre-check stays.
 
-## Exit-path coverage — and the honest gap
+## Trigger point (NOT signals — per the user's explicit instruction)
 
-| exit path | can we destroy? | handling |
-|---|---|---|
-| `quit` / normal return | yes | `tui_run` teardown already retires children; add the destroy step there |
-| Ctrl-C / SIGINT | yes | restore-terminal path must run the destroy too |
-| SIGTERM / SIGHUP | yes | same path that restores the terminal (`install_terminal_restore_handlers`) |
-| **SIGKILL / crash / OOM** | **NO** | **unfixable in-process. Document it.** |
+**No signal handlers. No crash ledger. No orphan sweep.** The trigger is the **natural return** of the
+herdr child:
 
-For the unfixable case, do not pretend. Two-part answer:
-- Record the created-by-us ledger to a small state file under the scratch convention so a later run
-  can **reconcile orphans** and report them.
-- A next-start reconciliation that *reports* orphaned sessions is acceptable; silently deleting on the
-  strength of a stale ledger file is **not** — a stale file could name a session someone else is using.
-  Report and require an explicit action.
+```
+our program --launch/attach--> herdr (takes the terminal)
+       ^                              |
+       +---- Ctrl+B q detaches -------+
+                 |
+                 +--> delete the session by the name we handed off
+```
 
-## Testing requirements (this is where it must be proven)
+`app.execute(cmd, …)` in `tui_run_command` (`src/main.odin:640`) is the choke point where
+launch/attach happens. The delete belongs on the path where that handoff **comes back**, using the
+`(device, name)` recorded at handoff time.
 
-- **The trap must have a test that would catch a naive implementation**: pre-existing session with the
-  same name, program launches (attaches), exits → session **still exists**.
-- Program creates a session, exits → session **gone** (stopped then deleted, via `delete_session`).
-- Program attaches only → nothing destroyed.
-- `HERDR_SESSION` and `default` refused on the destroy path.
-- Remote identity destroyed via the remote path, and a local same-name session untouched.
-- Each destroyed-session test must assert the ledger said "created by us" and that the destroy count
-  matches — not just that a delete was attempted. Per D-E, state how each could fail.
-- Fixture-tier notes: anything needing a real remote goes to the T14 fixture lane, reported not dropped.
+**Terminal close is intentionally NOT a trigger.** If the user closes the terminal, herdr keeps running
+and the session is preserved — that is the other half of the user's choice and must not be broken by
+adding cleanup where it was not asked for.
+
+## Testing requirements
+
+- Create a session, detach back → session **gone** (stop then delete, via `delete_session`).
+- Attach to an existing session, detach back → session **gone**. *(This is the amended behaviour — the
+  earlier "attach survives" test is withdrawn.)*
+- `HERDR_SESSION` refused on the destroy path — and asserted, because getting this wrong kills the
+  user's own session.
+- `default` refused (D12).
+- Remote session deleted via its **remote** device path; a local session sharing that name is
+  **untouched**.
+- Each test asserts the **actual session state after** the run (re-list and check absence), not merely
+  that a delete command was issued. Per D-E: state how each could fail.
+- Closing-the-terminal / no-return case must NOT destroy — worth a test so a future contributor does not
+  "helpfully" add cleanup at exit.
+- Anything needing a real remote belongs to the **T14 fixture lane** — reported, not dropped.
 
 ## Sequencing
 
-- **After RCH-10 merge**, own branch. Do not mix with paint.
-- Requires the T14 fixture lane for the remote cases; the local create/attach/destroy cases can be
-  hermetic.
-- `tests/parity.tsv` gets a **new additive row** (this behaviour has no predecessor in the bash
-  baseline), applied by the orchestrator, not the lane.
+- **After RCH-10 merge**, its own branch. Do not mix with paint.
+- Local create/attach/destroy cases can be hermetic; remote cases need the T14 fixture lane.
+- `tests/parity.tsv` gets a **new additive row** — this behaviour has no predecessor in the bash
+  baseline. Applied by the orchestrator, not the lane.
 
-## Open question I am explicitly NOT deciding by guesswork
+## Superseded concern (kept for provenance)
 
-If the user actually intends "every session shown/used must die on exit, including pre-existing ones",
-that is a **different and much more destructive** product, and it contradicts the existing D12 /
-create-or-attach / never-trust-delete safety model. This plan implements the **created-by-us**
-reading. If the broader reading was intended, it needs an explicit product decision and its own
-safety review — it should not be implemented by extending this one.
+An earlier draft of this document objected that destroying attached sessions risks deleting pre-existing
+work, and proposed a created-by-us snapshot. **The user reviewed and explicitly overrode it:** closing
+the terminal is how you keep herdr running, so the return path is free to destroy. Do not re-introduce
+the snapshot as a hedge.
