@@ -26,7 +26,25 @@ import app "../../src/app"
 import support "../support"
 
 app_env_battery_app_scrub_live_env_has_no_herdr_keys :: proc(c: ^AU_Ctx) {
+	// THE SAME DEFECT THE SPAWN TEST HAD, IN ITS MAP-LEVEL FORM
+	//
+	// "scrub_env removes every HERDR_* key" over a LIVE snapshot is true of
+	// any environment that happens to carry none — and the gate strips the
+	// whole HERDR_* namespace before this suite runs. An assertion that
+	// cannot fail on the box that runs it most is not an assertion. So the
+	// live half arms the shared sentinel first (support/sentinel.odin) and
+	// names the armed keys in BOTH halves: present before the scrub, absent
+	// after. Removing the scrub turns this red; not arming turns it red.
+	//
+	// The synthetic half below is untouched and still covers the namespace
+	// boundary with values this file owns outright; that is what makes this
+	// file hold on a box with no herdr in it at all.
+	probe := support.Scrub_Probe{}
+	support.probe_arm(&probe)
+	defer support.probe_disarm(&probe)
 
+	// HALF 1 — the premise: the snapshot has HERDR_* keys in it, and we know
+	// exactly which because we put them there.
 	env, err := app.env_snapshot()
 	if err != nil {
 		au_check(c, "env_snapshot", false, fmt.tprintf("{}", err))
@@ -39,6 +57,10 @@ app_env_battery_app_scrub_live_env_has_no_herdr_keys :: proc(c: ^AU_Ctx) {
 	}
 	au_say(c, fmt.tprintf("  live env carries {} HERDR_* key(s): {}",
 		len(leaked[:]), leaked[:]))
+	au_check(c, "the live snapshot carries the armed HERDR_* sentinels (there is something to remove)",
+		probe.armed && au_has_key(leaked[:], support.SCRATCH_PROBE_ENV) &&
+			au_has_key(leaked[:], support.SCRATCH_PROBE_SESSION),
+		fmt.tprintf("armed={} keys={}", probe.armed, leaked[:]))
 
 	clean := app.scrub_env(env)
 	still: [dynamic]string = {}
@@ -49,6 +71,11 @@ app_env_battery_app_scrub_live_env_has_no_herdr_keys :: proc(c: ^AU_Ctx) {
 		fmt.tprintf("{} leaked: {}", len(still[:]), still[:]))
 	au_check(c, "scrub_env keeps TERM", "TERM" in clean,
 		fmt.tprintf("TERM={}", clean["TERM"]))
+}
+
+au_has_key :: proc(keys: []string, want: string) -> bool {
+	for k in keys { if k == want { return true } }
+	return false
 }
 @(test)
 app_scrub_live_env_has_no_herdr_keys :: proc(t: ^testing.T) {

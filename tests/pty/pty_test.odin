@@ -599,6 +599,18 @@ driver_cli_does_not_inherit_our_herdr_namespace :: proc(t: ^testing.T) {
 	// observable: a child started through the harness sees no HERDR_* by
 	// construction, because argv[0] resolution and env construction both
 	// happen through the same product procs the TUI uses.
+	//
+	// ARMED, FOR THE SAME REASON app_spawn_test HAD TO BE.
+	// "Zero HERDR_* entries" is trivially true of an environment that had
+	// none. The gate strips HERDR_* from every suite before it runs, so
+	// without arming, this assertion was counting an empty room and reporting
+	// the room was tidy. Arm the shared sentinel, prove it is here, then
+	// prove the scrub did not carry it.
+	probe := support.Scrub_Probe{}
+	support.probe_arm(&probe)
+	defer support.probe_disarm(&probe)
+	support.check_probe_armed(t, "the harness scrub has a sentinel to remove", probe.armed)
+
 	env := th.build_scrubbed_env()
 	count := 0
 	i := 0
@@ -614,6 +626,11 @@ driver_cli_does_not_inherit_our_herdr_namespace :: proc(t: ^testing.T) {
 		i += 1
 	}
 	support.eq_i(t, "the product's scrub leaves zero HERDR_* entries for a child", count, 0)
+	// …and say what WAS armed while it was zero, so the number reads with its
+	// premise attached rather than as a bare zero.
+	support.note(t, fmt.tprintf("  while HERDR_ENV={} HERDR_SESSION={} were armed HERE",
+		support.SCRATCH_PROBE_ENV_VALUE, support.SCRATCH_PROBE_SESSION_VALUE))
 	// Free it the way the harness frees it, so this test does not leak.
 	free_cstring_array(env)
 }
+
