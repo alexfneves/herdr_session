@@ -73,6 +73,83 @@ New semantic roles (key vs description fg, caret, state-under-highlight) must be
 entries with theme-resolution + fallback, so `theme`/`colour_wire`/`hygiene` keep meaning
 something and a theme change still reaches them. No hardcoded RGB in `src/ui/*`.
 
+## D-K — Blink: ship BOTH halves, and blink is **not** a floor requirement
+
+Decided from scout section A/J1.
+
+- **Shape + pair colour = Clay.** Keep the caret a real Clay element so it stays clipped by layout
+  (the reason `CARET_GLYPH` is a Clay `Text` at all). Change `▏` → a fat block.
+- **Blink = the terminal's own cursor**, requested with DECSCUSR (`ESC[3 q` / blinking block) via
+  `tb_send`. **One-shot escape at paint time — no app-side timer.** An app timer is FORBIDDEN: it
+  breaks the frozen `idle <= 2 ticks / 5 s` floor.
+- **Blink can never be asserted.** The pty emulator ignores private modes and colour
+  (`tests/pty/screen.odin:33-38`), and this machine's `cnorm` explicitly clears blink, hence the
+  need for DECSCUSR in the first place. Therefore: implement it, but **do not encode blink as an
+  assertion or a floor component.** Test the testable half (block shape, caret cell, pair colours,
+  derived column) and record blink as a named, deliberate limitation.
+- Also record: blink ultimately depends on the user's terminal/`—cursor` config. That is honest, not a
+  failure.
+
+## D-L — Change 6: fix the spine **symmetrically**
+
+Root cause is Clay centring the betweenChildren rule at `child_top - floor(gap/2) - floor(between/2)`
+(`clay.h:2861`): with gap=2 the rule lands on row 3 while header content ends at row 1, so **row 2
+is the empty line**, and **no `(gap, between)` pair fixes it** — which is exactly what the
+"DO NOT LOWER" guard at `frame.odin:68` protects. So the rule must become a 1-row element /
+header bottom border.
+
+Decision: apply the **same mechanism to both spine boundaries**. Fixing only the top makes the two
+halves of one spine look different, which is a new defect introduced to remove an old one. If the
+bottom does not have the same defect, confirm that explicitly rather than assuming symmetry.
+
+## D-M — Palette: add an explicit `state_hl` role; do NOT re-tune `accent` per theme
+
+Re-tuning `accent` changes **every** highlighted element across all 10 themes and can regress the
+existing highlight-legibility behaviour broadly and silently. An explicit `state_hl` role is
+contained and directly assertable. Since `key_fg`, `desc_fg`, `caret_bg`, `caret_fg` already take
+the palette 13 → 17, adding `state_hl` (→ 18) is not a special burden — roughly 10 literal values
+per slot per `theme.odin`. All new roles need a fallback so an incomplete theme cannot paint
+undefined colour (D-H: no literals in `src/ui/*`).
+
+## D-N — Re-derive the rule assertion by POSITION, not by Clay mechanism
+
+With the top rule moving from `betweenChildren` to a border element, do **not** assert which Clay
+internal produced it. The user-visible property is "a `─` rule is drawn at row N, and no empty row
+sits between the state and that rule". So:
+- assert the **rendered rule rows and their positions**,
+- re-derive `st.rules` / `st.borders` expected values from the new layout, honestly,
+- keep the existing landed survival check intact — `rh_rule_count` counts rendered `─` rows
+  (`resize_harness.odin:350-358`) and is already mechanism-independent. That is the model to follow.
+
+## D-O — T12's floor stays 145 as a labelled placeholder; and its source is STALE
+
+The per-case `tui` inventory was not read this pass, so the re-derived floor **cannot** be set yet.
+- Keep `tui` floor at 145 in `tests/parity.tsv` and mark it **`RE-DERIVE BEFORE PORTING (RCH-10)`**
+  in the notes so nobody treats it as settled.
+- **Bigger hazard:** `dev/tui_drive.py` is already stale against RCH-9 (it still expects the footer
+  list-age token that no longer exists). Porting T12 by transcribing that driver would port
+  **obsolete expectations that can no longer pass**. T12 must be re-derived from the requirements +
+  current paint, using the old driver only as a list of *properties to check*, never as a source of
+  needles.
+- Schedule the T12 per-case inventory as the first step of the T12 port, not before RCH-10.
+
+## D-P — Sequencing refinement from the scout's size numbers
+
+Scout measured: **~78 of the 92 `ui/frame` assertions are the footer hint-width sweep**, and ~149
+of the 168 `ui` assertions touch one of the changed dimensions — only `float` (11) is untouched.
+That is ~89% of the `ui` floor sitting on the footer, which the footer redesign rewrites.
+
+This strengthens D-A decisively: **do not start T8 at all until RCH-10 is merged.** There is no
+partial-early-start that is safe here.
+
+## D-Q — Change 5 is a narrow edit; do not over-engineer it
+
+The flattening is a single deliberate condition: `state_fg := fg; if !is_sel { running/stopped }`
+(`sessions.odin:287-289`). The fix is to give the state cell its own fg under selection
+(`state_hl`, per D-M). Note the scout's warning: **overlay blending is a no-op since Phase 2**
+(`sessions.odin:32-37`) — any blend/tint approach paints *nothing at all*. Per-cell fg is the only
+working model. Do not attempt blending.
+
 ## D-I — Agent budget: **at most 3 concurrent agents**
 
 Halogen is a local LLM; parallelism is a hard resource limit, not a preference.
