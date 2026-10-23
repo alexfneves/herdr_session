@@ -479,3 +479,15 @@ too-small notice replaces the spine, exactly as designed).
 - `dev/tui_drive.py refresh-key`: the three list-age assertions
   (`"list " in footer`, `"list now" in footer`) fail by construction — the
   token is off the footer. The `Ctrl-L` notice assertion itself still passes.
+- `dev/resize_drive.py too-small`: both "the normal UI" checks use
+  `"filter:" in screen` as their proxy for "the spine is painted". {Mode
+  selection} no longer paints a filter line, so the proxy reads false while the
+  frame itself is correct — every other assertion in the scenario (notice drawn,
+  no half-drawn spine, spine back after enlarging) still passes.
+- `dev/resize_drive.py eintr-safe`: both "it is still reading keys" checks use
+  "bytes came out after Down" as the proxy for a repaint. With the age token off
+  the footer, a Down that cannot move the selection (one row on screen) changes
+  **no cell at all**, so the app legitimately emits zero bytes. The loop is
+  alive and reading: the same probe with a key that *does* change the screen
+  (`a` -> {Attach session}) emitted 1162 bytes on the new binary. The proxy,
+  not the program, is what the requirement change broke.
