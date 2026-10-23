@@ -358,15 +358,15 @@ Tui :: struct {
 	quitting : bool,
 
 	// When the table was last actually RE-READ, and whether that ever happened.
-	// The footer renders this as "list 4s" so a snapshot never passes itself off
-	// as live: a session created or destroyed elsewhere is invisible until
-	// something re-reads, and the user can only judge what they are looking at
-	// if the age of it is on screen.
+	// `tui_list_age` renders this as "list 4s" for the NOTICE that asks for it
+	// (Ctrl+L), so a snapshot never passes itself off as live. It is no longer a
+	// permanent footer cell — RCH-9 took the age token out of the footer — but
+	// the stamp itself is still what makes the refresh notice honest, and what
+	// lets "re-read now" mean something.
 	//
 	// It is stamped at PAINT time and the loop never wakes on a timer (ISC-A-2:
-	// 0 ticks idle), so the number is "the age as of the last frame" — which is
-	// exactly when it matters, because the frame that shows a big age is the
-	// frame the user is reading after not touching the app for that long.
+	// 0 ticks idle), so the age is "as of the last frame" — the frame the user
+	// is reading after not touching the app for that long.
 	list_at   : time.Time,
 	list_seen : bool,
 
