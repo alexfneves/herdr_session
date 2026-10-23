@@ -85,7 +85,7 @@ handoff_abi_probe_reports_the_pinned_abi :: proc(t: ^testing.T) {
 		"abi_wcwidth_A", "abi_wcwidth_CJK", "abi_attr_width",
 		"abi_has_truecolor", "abi_clay_min_memory", "abi_event_size",
 	}
-	m, ok := hh_wait_ev(h, "abi_event_size", 20_000)
+	m, ok := hh_wait_ev(h, "abi_role_complete", 20_000)
 	// The completeness check comes FIRST: if the role died halfway, six
 	// "absent != 1" failures would bury the one fact that matters (which key
 	// never arrived).
@@ -124,7 +124,7 @@ handoff_double_init_shutdown_round_trips :: proc(t: ^testing.T) {
 	}
 	defer hh_finish(h)
 
-	m, ok := hh_wait_ev(h, "double_r6", 20_000)
+	m, ok := hh_wait_ev(h, "double_role_complete", 20_000)
 	if !ok {
 		ck(t, "the double role reported all six init/shutdown codes", false,
 			fmt.tprintf("never saw double_r6; keys present: {}; {}",
@@ -206,7 +206,11 @@ handoff_to_sleep_repaints_and_reads_a_key :: proc(t: ^testing.T) {
 	// Now the key. 'j' = 0x6A, the same byte the old suite piped in after a
 	// delay, sent here only after the role announced it was listening.
 	pty.pty_send(h.d, "j")
-	km, kok := hh_wait_ev(h, "got_key", 15_000)
+	// Wait on the sentinel rather than on `got_key`: `key_ch` is written two
+	// reports later, and reading it from a snapshot taken at `got_key` is a
+	// race that showed up as `key_ch=<absent>` on a run where the key itself
+	// had been read perfectly.
+	km, kok := hh_wait_ev(h, "handoff_role_complete", 15_000)
 	got, _ := hh_ev_bool(km, "got_key")
 	ck(t, "a keypress is readable after the handoff", kok && got,
 		fmt.tprintf("got_key={} wait_ok={} {}", hh_ev_str(km, "got_key"), kok, hh_exit_info(h)))
@@ -249,7 +253,7 @@ handoff_child_exit_code_surfaces :: proc(t: ^testing.T) {
 	}
 	defer hh_finish(h)
 
-	m, ok := hh_wait_ev(h, "handoff_exit", 20_000)
+	m, ok := hh_wait_ev(h, "child_role_complete", 20_000)
 	if !ok {
 		ck(t, "the handoff of the exit-7 child completed", false,
 			fmt.tprintf("never saw handoff_exit; missing={}; {}",
@@ -323,7 +327,7 @@ handoff_scrubs_herdr_env :: proc(t: ^testing.T) {
 	}
 	defer hh_finish(h)
 
-	m, ok := hh_wait_ev(h, "env_probe_done", 20_000)
+	m, ok := hh_wait_ev(h, "child_role_complete", 20_000)
 	if !ok {
 		ck(t, "the env probe reported", false,
 			fmt.tprintf("never saw env_probe_done; missing={}; {}",
@@ -468,7 +472,7 @@ handoff_sigint_goes_to_the_child_and_not_the_app :: proc(t: ^testing.T) {
 	// Group-kill, exactly as the tty driver does with Ctrl-C.
 	pty.pty_signal_group(h.d, posix.Signal.SIGINT)
 
-	mm, mm_ok := hh_wait_ev(h, "handoff_exit", 20_000)
+	mm, mm_ok := hh_wait_ev(h, "child_role_complete", 20_000)
 	if !mm_ok {
 		ck(t, "the handoff completed after the group SIGINT", false,
 			fmt.tprintf("never saw handoff_exit; {}", hh_exit_info(h)))

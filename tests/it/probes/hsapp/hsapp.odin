@@ -263,6 +263,11 @@ role_abi :: proc() -> i32 {
 	ev.report("abi_has_truecolor", fmt.tprintf("{}", termbox2.tb_has_truecolor()))
 	ev.report("abi_clay_min_memory", fmt.tprintf("{}", clay.MinMemorySize()))
 	ev.report("abi_event_size", fmt.tprintf("{}", size_of(termbox2.Event)))
+	// COMPLETION SENTINEL. A harness that waits on the first fact it wants and
+	// then reads the later ones off the same snapshot races the writer. Every
+	// role ends with one key that means "everything else for this role is
+	// already in the file", and the suite waits on THAT.
+	ev.report("abi_role_complete", "1")
 	ev.say("HSABI role done\n")
 	return 0
 }
@@ -287,6 +292,7 @@ role_double :: proc() -> i32 {
 	ev.report("double_r4", fmt.tprintf("{}", r4))
 	ev.report("double_r5", fmt.tprintf("{}", r5))
 	ev.report("double_r6", fmt.tprintf("{}", r6))
+	ev.report("double_role_complete", "1")
 	ev.say("HSDOUBLE role done\n")
 	return 0
 }
@@ -322,6 +328,7 @@ role_handoff :: proc(secs: string) -> i32 {
 	ev.report("key_ch", fmt.tprintf("{}", k.ch))
 	ev.report("resize_before_key", fmt.tprintf("{}", k.resize_before))
 	ev.report("frames", fmt.tprintf("{}", FRAMES_PAINTED))
+	ev.report("handoff_role_complete", "1")
 	term_leave()
 	ev.say("HSHANDOFF role done\n")
 	return 0
@@ -453,6 +460,7 @@ role_child :: proc() -> i32 {
 	// blocking SIGINT|SIGQUIT forever and a user's Ctrl-C would be dead.
 	report_sigblk("app_after", "self")
 	ev.report("app_alive_after_handoff", "1")
+	ev.report("child_role_complete", "1")
 	term_leave()
 	ev.say("HSCHILD role done\n")
 	return 0
