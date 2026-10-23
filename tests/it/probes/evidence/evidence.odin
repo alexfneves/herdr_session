@@ -32,6 +32,7 @@ package evidence
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 
 DEFAULT_ENV :: "HS_EVIDENCE"
 
@@ -93,8 +94,8 @@ load :: proc(path: string, alloc: mem.Allocator = context.allocator) -> map[stri
 	if len(path) == 0 { return m }
 	data, err := os.read_entire_file(path, alloc)
 	if err != nil { return m }
+	defer delete(data)
 	parse_into(&m, string(data[:]))
-	delete(data)
 	return m
 }
 
@@ -118,7 +119,13 @@ fold_line :: proc(m: ^map[string]string, line: string) {
 		key := line[:i]
 		val := line[i+1:]
 		if len(key) == 0 { return }
-		m^[key] = val
+		// CLONE both halves. Odin's string slicing does not copy: without this
+		// the map would hold views into the file buffer that `load` frees the
+		// moment it returns. Map lookups hash the needle you pass and then
+		// compare against that freed memory, which produces the signature this
+		// bug was found by: a key is "present" for one moment, then reads back
+		// as absent one statement later, in the same test, on the same map.
+		m^[strings.clone(key, context.allocator)] = strings.clone(val, context.allocator)
 		return
 	}
 }

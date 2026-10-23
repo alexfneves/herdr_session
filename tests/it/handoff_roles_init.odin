@@ -22,7 +22,7 @@ package it
 // installed locally before doing anything that allocates.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import hsapp "../probes/hsapp"
+import hsapp "./probes/hsapp"
 
 import "core:fmt"
 import "core:os"
@@ -37,5 +37,5 @@ handoff_role_dispatch :: proc "contextless" () {
 	code := hsapp.claim_and_run()
 	if code < 0 { return }
 	fmt.eprintf("[hsrole] role '{}' exited {}\n", role, code)
-	os.exit(code)
+	os.exit(int(code))
 }

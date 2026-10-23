@@ -141,7 +141,7 @@ term_leave :: proc() {
 
 // sigblk_hex_of reads SigBlk from /proc/<pid>/status as the hex string the
 // kernel wrote there. `who` is "self" or a decimal pid.
-sigblk_hex_of :: proc(who: string) -> string {
+sig_field_of :: proc(who: string, field: string) -> string {
 	path := "/proc/self/status"
 	if who != "self" { path = fmt.tprintf("/proc/{}/status", who) }
 	data, err := os.read_entire_file(path, context.allocator)
@@ -149,12 +149,28 @@ sigblk_hex_of :: proc(who: string) -> string {
 	defer delete(data)
 	lines, _ := strings.split_lines(string(data[:]))
 	for line in lines {
-		if !strings.has_prefix(line, "SigBlk:") { continue }
+		if !strings.has_prefix(line, field) { continue }
 		f, _ := strings.fields(line)
 		if len(f) < 2 { return "" }
-		return f[1]
+		// CLONE, do not return the slice. Odin's split_lines/fields return VIEWS
+		// into `data`, and the `defer delete(data)` above runs at THIS proc's
+		// exit — i.e. before the caller ever reads what we returned. Left as a
+		// view it is a use-after-free that reads fine early in a process's life
+		// and comes back as `\t000000000000000` later. That was measured here,
+		// not theorised.
+		return strings.clone(f[1], context.allocator)
 	}
 	return ""
+}
+
+sig_field_dec :: proc(who: string, field: string) -> i64 {
+	v, ok := hex_to_i64(sig_field_of(who, field))
+	if !ok { return -1 }
+	return v
+}
+
+sigblk_hex_of :: proc(who: string) -> string {
+	return sig_field_of(who, "SigBlk:")
 }
 
 // hex_to_i64 parses the kernel's SigBlk field. Reports ok=false rather than
@@ -186,11 +202,40 @@ report_sigblk :: proc(prefix: string, who: string) {
 	v, ok := hex_to_i64(hex)
 	ev.report(fmt.tprintf("{}_sigblk", prefix), fmt.tprintf("{}", v))
 	ev.report(fmt.tprintf("{}_sigblk_readable", prefix), ifok(ok))
+	// The IGNORE set is reported alongside the MASK because the two are not the
+	// same question and the difference decided a real result here: a signal
+	// that is BLOCKED stays pending and is delivered when the mask is lifted,
+	// but a signal that is IGNORED is dropped at send time and never arrives.
+	ev.report(fmt.tprintf("{}_sigign", prefix), sig_field_of(who, "SigIgn:"))
+	ev.report(fmt.tprintf("{}_sigign_dec", prefix), fmt.tprintf("{}", sig_field_dec(who, "SigIgn:")))
 }
 
 ifok :: proc(ok: bool) -> string {
 	if ok { return "yes" }
 	return "no"
+}
+
+// report_tty_raw answers, from the fd the app itself holds, whether the line
+// discipline is in the raw mode tb_init put it in. The suite needs this as an
+// ANTI-VACUITY fact: "termios before == after" is equally true of a process
+// that never took the terminal, so a round-trip assertion without a "was it
+// ever raw?" companion proves nothing.
+//
+// It is reported BY THE APP rather than sampled by the harness because the
+// window where it is true can be microseconds: for a child that exits
+// immediately (`exit 7`), the app re-acquires the tty, repaints and leaves
+// before a harness poll could ever see it. Measured that way and it produced a
+// false red. The app's own observation of its own fd has no such race.
+report_tty_raw :: proc(tag: string) {
+	t : posix.termios = {}
+	if posix.tcgetattr(posix.FD(1), &t) != {} {
+		ev.report(fmt.tprintf("{}_tty_raw", tag), "unreadable")
+		return
+	}
+	echo_off := (t.c_lflag & posix.CLocal_Flags{.ECHO}) == {}
+	icanon_off := (t.c_lflag & posix.CLocal_Flags{.ICANON}) == {}
+	ev.report(fmt.tprintf("{}_tty_raw", tag), ifok(echo_off && icanon_off))
+	ev.report(fmt.tprintf("{}_tty_lflag", tag), fmt.tprintf("{}", t.c_lflag))
 }
 
 report_self :: proc(tag: string) {
@@ -267,6 +312,7 @@ role_handoff :: proc(secs: string) -> i32 {
 	ev.report("handoff_ok", fmt.tprintf("{}", h.ok))
 	ev.report("handoff_err", fmt.tprintf("{}", h.err))
 	ev.report("frames", fmt.tprintf("{}", FRAMES_PAINTED))
+	report_tty_raw("app_after")
 
 	ev.report("ready_for_key", "1")
 	ev.say("hsapp: ready for the post-handoff keypress\n")
@@ -335,6 +381,23 @@ wait_key :: proc(attempts: int) -> Key_Result {
 // ─────────────────────────────────────────────────────────────────────────────
 
 role_child :: proc() -> i32 {
+	// HS_IGN_INT_QUIT mirrors the disposition the OLD suite's app ran with.
+	// It is not decoration and it is not papering over anything: it is what
+	// `script -q -e -c "stty …; $BIN …"` gave the product. A non-interactive
+	// shell that has to FORK (any -c string with more than one command) sets
+	// SIGINT and SIGQUIT to SIG_IGN in the child, so every handoff case in
+	// dev/handoff-smoke.sh ran with Ctrl-C ignored in the app. That is why
+	// its "SIGINT during handoff" case exited 0. Measured both ways:
+	//   script launcher   -> app SigIgn=0x6, app survives, exit 0
+	//   direct spawn      -> app SigIgn=0x0, app dies 130 once the handoff
+	//                       lifts its own block (the pending signal is
+	//                       delivered then, and the default disposition is
+	//                       "terminate")
+	// The suite covers BOTH. See handoff_sigint_* in tests/it/handoff_test.odin.
+	if os.get_env_alloc("HS_IGN_INT_QUIT", context.allocator) == "1" {
+		posix.signal(posix.Signal.SIGINT, auto_cast posix.SIG_IGN)
+		posix.signal(posix.Signal.SIGQUIT, auto_cast posix.SIG_IGN)
+	}
 	child_role := os.get_env_alloc("HS_CHILD_ROLE", context.allocator)
 	if len(child_role) == 0 {
 		ev.report("fatal", "child role needs HS_CHILD_ROLE")
@@ -384,6 +447,7 @@ role_child :: proc() -> i32 {
 	ev.report("handoff_ok", fmt.tprintf("{}", h.ok))
 	ev.report("handoff_err", fmt.tprintf("{}", h.err))
 	ev.report("frames", fmt.tprintf("{}", FRAMES_PAINTED))
+	report_tty_raw("app_after")
 	// `after` is read AFTER handoff_run returned, i.e. after its
 	// restore_signals(). If the restore were missing, the app would go on
 	// blocking SIGINT|SIGQUIT forever and a user's Ctrl-C would be dead.
@@ -744,6 +808,11 @@ self_exe_path :: proc() -> string {
 // names come back as 2 rather than falling through to a default: a typo must be
 // loud, not a silent no-op that the harness reads as "the role ran".
 run_role :: proc(role: string) -> i32 {
+	// Registered BEFORE any handoff, for every role, so there is exactly one
+	// repaint hook and it is unmistakably ours. The handoff calls it after it
+	// gets the terminal back; FRAMES_PAINTED going nonzero is what makes
+	// "the handoff forced a repaint" (plan step 6) assertable from outside.
+	termhandoff.set_full_repaint(hs_repaint_hook)
 	switch role {
 	case "abi":       return role_abi()
 	case "double":    return role_double()
