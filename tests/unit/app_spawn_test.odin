@@ -66,8 +66,95 @@ alu_first_line :: proc(s: string) -> string {
 }
 
 // ── ISC-2: the scrub, proven by asking the CHILD ───────────────────────────
+//
+// THE SENTINEL, AND WHY IT EXISTS
+//
+// "The child sees no HERDR_*" has two ways to pass: the scrub removed them,
+// or there was nothing to remove. Only one of those is a test. The old
+// version closed that hole by reading OUR OWN inherited `HERDR_ENV` — which
+// worked from an interactive shell and was WRONG as a proof, because it made
+// the non-vacuity of this assertion depend on how the binary happened to be
+// launched. The gate strips the whole `HERDR_*` namespace before any suite
+// runs (support.base_env — deliberately, since a leaked HERDR_SESSION makes
+// a child believe it IS the developer's session), so an inherited-value
+// guard fires red there for a reason that has nothing to do with the product.
+//
+// The fix is not to weaken the guard and not to un-strip the namespace. It is
+// to stop borrowing the premise from the launcher and supply it ourselves:
+// arm a sentinel HERDR_* value in this process, prove it is armed, and then
+// show the spawn did not carry it. Both halves can fail:
+//
+//   * arm a HERDR_* that the scrub then reaches the child with  -> leaked=[..]
+//   * fail to arm (set_env refused, wrong name)                -> "armed" red
+//
+// The armed value is `hs-t-…`, the scratch prefix (support.SCRATCH_PREFIX):
+// a string that is never a real session name, so if the scrub ever DID fail
+// the worst a child could be pointed at is a name this suite never creates.
+// The prior values are restored on every exit path, including the difference
+// between "unset" and "set but empty", which a sloppy restore flattens.
+
+ALU_PROBE_ENV :: "HERDR_ENV"
+ALU_PROBE_ENV_VALUE :: "1"
+ALU_PROBE_SESSION :: "HERDR_SESSION"
+ALU_PROBE_SESSION_VALUE :: "hs-t-scrub-probe"
+
+Alu_Probe :: struct {
+	env_prev  : string,
+	env_had   : bool,
+	sess_prev : string,
+	sess_had  : bool,
+	armed     : bool,
+}
+
+// alu_probe_arm puts two HERDR_* variables into THIS process and reads them
+// back. `armed` is the read-back, not the return code: a set_env that
+// reported success but did not land would otherwise let the whole test pass
+// on a premise that is not true.
+alu_probe_arm :: proc(p: ^Alu_Probe) {
+	p.env_prev, p.env_had = os.lookup_env(ALU_PROBE_ENV, context.allocator)
+	p.sess_prev, p.sess_had = os.lookup_env(ALU_PROBE_SESSION, context.allocator)
+
+	if e := os.set_env(ALU_PROBE_ENV, ALU_PROBE_ENV_VALUE); e != nil {
+		alu_probe_disarm(p)
+		return
+	}
+	if e := os.set_env(ALU_PROBE_SESSION, ALU_PROBE_SESSION_VALUE); e != nil {
+		alu_probe_disarm(p)
+		return
+	}
+
+	got_env, env_ok := os.lookup_env(ALU_PROBE_ENV, context.allocator)
+	got_sess, sess_ok := os.lookup_env(ALU_PROBE_SESSION, context.allocator)
+	p.armed = env_ok && sess_ok &&
+		got_env == ALU_PROBE_ENV_VALUE &&
+		got_sess == ALU_PROBE_SESSION_VALUE
+}
+
+// alu_probe_disarm puts back EXACTLY what was there. Restoring "was unset"
+// as "" would leave a HERDR_SESSION the suite never had and every later test
+// in this binary would read a session that does not exist.
+alu_probe_disarm :: proc(p: ^Alu_Probe) {
+	if p.env_had { os.set_env(ALU_PROBE_ENV, p.env_prev) } else { os.unset_env(ALU_PROBE_ENV) }
+	if p.sess_had { os.set_env(ALU_PROBE_SESSION, p.sess_prev) } else { os.unset_env(ALU_PROBE_SESSION) }
+	p.armed = false
+}
 
 app_spawn_battery_alu_child_sees_no_herdr_namespace :: proc(c: ^AU_Ctx) {
+	probe := Alu_Probe{}
+	alu_probe_arm(&probe)
+	defer alu_probe_disarm(&probe)
+
+	au_say(c, fmt.tprintf("  armed sentinel: %s=%q %s=%q  (inherited beforehand: %s=%q %s=%q)",
+		ALU_PROBE_ENV, ALU_PROBE_ENV_VALUE, ALU_PROBE_SESSION, ALU_PROBE_SESSION_VALUE,
+		ALU_PROBE_ENV, probe.env_prev, ALU_PROBE_SESSION, probe.sess_prev))
+
+	// HALF 1 — the premise. Without this, HALF 2 could be "nothing was ever
+	// there to scrub" and still be green.
+	au_check(c, "the HERDR_* sentinel is armed in OUR OWN env before spawning",
+		probe.armed,
+		fmt.tprintf("{}={} {}={} — both must be set HERE, or the child check below proves nothing",
+			ALU_PROBE_ENV, ALU_PROBE_ENV_VALUE, ALU_PROBE_SESSION, ALU_PROBE_SESSION_VALUE))
+
 	// `env` is /usr/bin/env — not herdr, but the SAME run_capture path, so
 	// the environment we build is exactly the one herdr would get.
 	cs := app.run_capture({"env"}, 5 * time.Second)
@@ -75,26 +162,34 @@ app_spawn_battery_alu_child_sees_no_herdr_namespace :: proc(c: ^AU_Ctx) {
 
 	lines, _ := strings.split(string(cs.out), "\n")
 	leaked: [dynamic]string = {}
+	saw_child_env := false
 	had_term := false
 	term_val := ""
 	for l in lines {
 		eq_pos := strings.index(l, "=")
 		if eq_pos < 0 { continue }
+		saw_child_env = true
 		k := l[:eq_pos]
 		if app.env_is_herdr_namespace(k) { append(&leaked, k) }
 		if k == "TERM" { had_term = true; term_val = l[eq_pos+1:] }
 	}
+
+	// HALF 2 — the verdict. The sentinel armed above is what makes "leaked=[]"
+	// a measurement rather than an absence of evidence.
 	au_check(c, "child sees NO HERDR_* variable", len(leaked) == 0,
 		fmt.tprintf("leaked={}", leaked[:]))
+	// …and the child env has to be a real env for that to mean anything: an
+	// empty capture would satisfy `leaked == []` without scrubbing a thing.
+	au_check(c, "the child env was captured at all (leaked=[] over nothing is not evidence)",
+		saw_child_env && len(cs.out) > 0,
+		fmt.tprintf("{} bytes of `env` output", len(cs.out)))
 	au_check(c, "child still has TERM", had_term, fmt.tprintf("TERM={}", term_val))
 
-	// …and we are IN a herdr pane, or the scrub above proves nothing about
-	// nesting. This is what stops the check being vacuous on a bare box.
-	inside := os.get_env_alloc("HERDR_ENV", context.allocator)
-	au_say(c, fmt.tprintf("  our own env: HERDR_ENV=%q HERDR_SESSION=%q",
-		inside, os.get_env_alloc("HERDR_SESSION", context.allocator)))
-	au_check(c, "we are running inside herdr (the scrub is not vacuous)",
-		inside != "", fmt.tprintf("HERDR_ENV={}", inside))
+	// HALF 3 — the launcher-independence claim, stated as a check. Whether
+	// this process started inside herdr or under a stripped gate environment,
+	// the SENTINEL is what is tested, and it did not cross.
+	au_say(c, fmt.tprintf("  ambient HERDR_ENV before the arm was %q — the proof above does not depend on it",
+		probe.env_prev))
 }
 @(test)
 alu_child_sees_no_herdr_namespace :: proc(t: ^testing.T) {
