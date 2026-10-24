@@ -132,3 +132,34 @@ A group nobody claims is surfaced, never silently folded into a passing total.
 16 assertions covering: empty table fails, 1-test fixture passes, unreachable
 floor is named a REGRESSION, missing row is refused, attribution is per-group,
 and a hanging suite times out without leaking processes.
+
+## The gate RUNS the suite binary — its env must be able to find the product
+
+This is not a report reader. For every `--suite=` row the gate spawns the binary
+itself, so the checks the binary performs at spawn time apply to the gate's
+environment, not to the one you used for your manual run.
+
+`pty_resolve_bin()` resolves the product binary as: `$BIN` → `$HS_BIN` →
+`pty_bin_default`. `pty_bin_default` points at `result/bin/herdr-session`,
+which only exists where a nix build has created the `result` symlink.
+
+**In a linked worktree there is usually no `result/`.** The gate then reports
+`binary not found` for every spawn-based test, which reads as a regression in
+whatever you just changed when it is really a missing env var. Export the local
+build instead:
+
+```sh
+./dev/local-build.sh          # -> /tmp/hs-local
+export BIN=/tmp/hs-local      # MUST be exported; the gate spawns its own children
+odin build ./tests/it -build-mode:test -define:ODIN_TEST_THREADS=1 \
+     -define:ODIN_TEST_JSON_REPORT=/tmp/it.json -out:/tmp/bin_it
+BIN=/tmp/hs-local /tmp/bin_it                     # manual run
+/tmp/hs_check --parity=tests/parity.tsv --tier=hermetic \
+  --report-dir=/tmp/r/run --suite=resize=/tmp/bin_it:/tmp/it.json
+```
+
+Related trap: **the report file is overwritten by the gate's own run**, because
+the report path is baked in at build time. A clean manual run's JSON is clobbered
+by the gate's next run, so a `pass=0 fail=N` row may describe the *gate's*
+spawn, not yours. Read the report after the run you care about, or build a
+separate binary per report path.
