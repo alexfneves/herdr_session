@@ -80,7 +80,7 @@ theme_set_no_duplicate_names :: proc(t: ^testing.T) {
 
 @(test)
 theme_set_palette_slot_count :: proc(t: ^testing.T) {
-	support.eq_i(t, "PALETTE_SLOTS matches ui.Palette's field count", app.PALETTE_SLOTS, 13)
+	support.eq_i(t, "PALETTE_SLOTS matches ui.Palette's field count", app.PALETTE_SLOTS, 19)
 }
 
 @(test)
@@ -93,6 +93,7 @@ theme_set_every_theme_fills_every_slot :: proc(t: ^testing.T) {
 	slot_names := [app.PALETTE_SLOTS]string{
 		"bg", "fg", "dim", "border", "header_fg", "accent", "sel_fg", "caret",
 		"float_bg", "float_fg", "err_fg", "running", "stopped",
+		"key_fg", "desc_fg", "caret_bg", "caret_fg", "run_hl", "stop_hl",
 	}
 	gaps := 0
 	detail := ""
@@ -102,6 +103,8 @@ theme_set_every_theme_fills_every_slot :: proc(t: ^testing.T) {
 			th.pal.bg, th.pal.fg, th.pal.dim, th.pal.border, th.pal.header_fg,
 			th.pal.accent, th.pal.sel_fg, th.pal.caret, th.pal.float_bg,
 			th.pal.float_fg, th.pal.err_fg, th.pal.running, th.pal.stopped,
+			th.pal.key_fg, th.pal.desc_fg, th.pal.caret_bg, th.pal.caret_fg,
+			th.pal.run_hl, th.pal.stop_hl,
 		}
 		for s, k in slots {
 			if (s & 0xff000000) != 0 {
@@ -115,7 +118,7 @@ theme_set_every_theme_fills_every_slot :: proc(t: ^testing.T) {
 		}
 	}
 	support.check(t,
-		"every theme fills all 13 slots (bg/fg/border/rule/accent/selection/running/stopped/error)",
+		"every theme fills all 19 slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair/highlights)",
 		gaps == 0, fmt.tprintf("{} gap(s) across {} themes{}", gaps, app.theme_count(), detail))
 }
 

@@ -195,9 +195,10 @@ case_theme_set :: proc() -> bool {
 	slot_names := [app.PALETTE_SLOTS]string{
 		"bg", "fg", "dim", "border", "header_fg", "accent", "sel_fg", "caret",
 		"float_bg", "float_fg", "err_fg", "running", "stopped",
+		"key_fg", "desc_fg", "caret_bg", "caret_fg", "run_hl", "stop_hl",
 	}
 	check("PALETTE_SLOTS matches ui.Palette's field count",
-		app.PALETTE_SLOTS == 13, fmt.tprintf("{}", app.PALETTE_SLOTS))
+		app.PALETTE_SLOTS == 19, fmt.tprintf("{}", app.PALETTE_SLOTS))
 
 	gaps := 0
 	for i in 0..<n {
@@ -206,6 +207,8 @@ case_theme_set :: proc() -> bool {
 			t.pal.bg, t.pal.fg, t.pal.dim, t.pal.border, t.pal.header_fg,
 			t.pal.accent, t.pal.sel_fg, t.pal.caret, t.pal.float_bg,
 			t.pal.float_fg, t.pal.err_fg, t.pal.running, t.pal.stopped,
+			t.pal.key_fg, t.pal.desc_fg, t.pal.caret_bg, t.pal.caret_fg,
+			t.pal.run_hl, t.pal.stop_hl,
 		}
 		for s, k in slots {
 			if (s & 0xff000000) != 0 {
@@ -218,7 +221,7 @@ case_theme_set :: proc() -> bool {
 			}
 		}
 	}
-	check("every theme fills all 13 slots (bg/fg/border/rule/accent/selection/running/stopped/error)",
+	check("every theme fills all 19 slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair/highlights)",
 		gaps == 0, fmt.tprintf("{} gap(s) across {} themes", gaps, n))
 
 	// Text must never be the same colour as its own background: a palette where
@@ -758,9 +761,10 @@ case_colour_wire :: proc() -> bool {
 	holes := 0
 	for i in 0..<app.theme_count() {
 		tp := ui.palette_of(app.theme_at(i))
-		slots := [13]clay.Color{tp.bg, tp.fg, tp.dim, tp.border, tp.header_fg,
+		slots := [19]clay.Color{tp.bg, tp.fg, tp.dim, tp.border, tp.header_fg,
 			tp.accent, tp.sel_fg, tp.caret, tp.float_bg, tp.float_fg, tp.err_fg,
-			tp.running, tp.stopped}
+			tp.running, tp.stopped, tp.key_fg, tp.desc_fg, tp.caret_bg, tp.caret_fg,
+			tp.run_hl, tp.stop_hl}
 		for s in slots {
 			if _, okp := render.attr_of(s); !okp { holes += 1 }
 		}

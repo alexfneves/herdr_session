@@ -51,16 +51,34 @@ package app
 //
 // The rule for "no gaps" is: the palette has a slot for every semantic colour
 // the view layer references, so a view never reaches for a colour the theme does
-// not define. The thirteen slots are exactly the fields of `ui.Palette`:
+// not define. The nineteen slots are exactly the fields of `ui.Palette`:
 //
 //   bg, fg, dim, border (== the between-children rule colour; with D14 there is
 //   no outer box, so border and rule are the same colour by construction),
 //   header_fg, accent (the selection bar background), sel_fg (text drawn ON the
-//   bar), caret, float_bg, float_fg, err_fg, running, stopped.
+//   bar), caret, float_bg, float_fg, err_fg, running, stopped,
+//   key_fg, desc_fg, caret_bg, caret_fg, run_hl, stop_hl.
 //
 // `running` / `stopped` are new with the theme work: the sessions table painted
 // both with the default fg, so a theme could not distinguish a live session from
 // a dormant one. Both now come from the palette.
+//
+// The six roles added by RCH-10 (`key_fg`, `desc_fg`, `caret_bg`, `caret_fg`,
+// `run_hl`, `stop_hl`) exist because the footer, the caret and the selection bar
+// each need a colour the existing slots cannot express: two DIFFERENT foregrounds
+// in one line (key vs description), a colour PAIR for the caret block (the
+// single `caret` slot is a fg for a bare glyph, not a block with a background),
+// and a readable state word ON the accent bar.
+//
+// WHY TWO HIGHLIGHT ROLES AND NOT ONE (ORCH D-M corrected by ACK-1) — the
+// original decision asked for a single `state_hl` (13 -> 18). That version is
+// WRONG and is not what this palette ships: with one colour, a selected RUNNING
+// row and a selected STOPPED row render identically, so selection would flatten
+// the running/stopped distinction — the exact thing RCH-10 change 5 forbids. One
+// colour cannot preserve a distinction it exists to preserve. `run_hl` +
+// `stop_hl` is the only version the requirement can be falsified against, at the
+// same mechanical cost, so the total is 19 and NOT 18. The deviation from the
+// 18 in D-M is deliberate and is recorded here as well as in the worker report.
 //
 // # DEFAULT IS gruvbox-dark (D4)
 //
@@ -97,12 +115,50 @@ Palette :: struct {
 	err_fg    : u32, // error text / error pane border
 	running   : u32, // a session that is up
 	stopped   : u32, // a session that is not
+
+	// ── RCH-10: the six roles the footer/caret/selection paint needs ────
+	// Every one of these is theme-resolved and carries a fallback (see
+	// `theme_slot_or`), so an incomplete theme cannot paint an unchosen colour.
+	key_fg   : u32, // the KEY token in a footer hint — the token the eye hunts for (AD-1.2)
+	desc_fg  : u32, // the DESCRIPTION token — muted relative to key_fg
+	caret_bg : u32, // background of the cell the caret sits on
+	caret_fg : u32, // the caret glyph itself
+	run_hl   : u32, // the "running" word WHILE its row is selected
+	stop_hl  : u32, // the "stopped" word WHILE its row is selected
 }
 
 // PALETTE_SLOTS names the count the smoke suite asserts on. Adding a slot to
 // `Palette` without bumping this makes that check fail, which is the point: the
 // view layer must never be left without a colour.
-PALETTE_SLOTS :: 13
+//
+// 19 = the 13 original semantic slots + RCH-10's six (key_fg, desc_fg,
+// caret_bg, caret_fg, run_hl, stop_hl). It is NOT 18: see the ACK-1 note in the
+// header — a single shared highlight role would make selected-running and
+// selected-stopped indistinguishable.
+PALETTE_SLOTS :: 19
+
+// theme_slot_or resolves a slot that a theme may leave unset.
+//
+// Every shipped theme fills every slot and `theme_set_test` proves it, so this
+// cannot rescue a typo in the table — it covers the case the table cannot:
+// a theme added later that does not bother to fill a role it does not care
+// about. A 0x000000 in a slot means "this theme never chose a colour here" (0 is
+// never a shipped semantic colour; `theme_set_test` treats it as a gap for the
+// same reason), and `fallback` is the nearest EXISTING role — a colour the theme
+// did choose. That is the fallback D-H asks for: an incomplete theme degrades to
+// a colour someone picked, never to an unchosen one.
+//
+// The pairing for each RCH-10 role is the role it visually substitutes for:
+//   key_fg -> fg        (the key is still body text, just not emphasised)
+//   desc_fg -> dim      (descriptions were already `dim`)
+//   caret_bg -> caret   (the caret colour was always the caret's colour)
+//   caret_fg -> bg      (glyph over a block: the block's own page colour)
+//   run_hl -> running   (the unselected live-state colour)
+//   stop_hl -> stopped  (the unselected dormant-state colour)
+theme_slot_or :: proc(hex: u32, fallback: u32) -> u32 {
+	if (hex & 0xffffff) == 0 { return fallback }
+	return hex
+}
 
 // theme_rgb splits a palette entry into 0..255 channels.
 //
@@ -187,6 +243,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xfb4934, // red
 			running   = 0xb8bb26, // green
 			stopped   = 0x928374, // gray
+			key_fg    = 0xfabd2f, // bright yellow — the footer hunt-token
+			desc_fg   = 0xa89984, // fg4 — muted against the key
+			caret_bg  = 0xfe8019, // orange — == caret, the block the glyph sits in
+			caret_fg  = 0x1d2021, // dark0_hard — the glyph knocked out of the block
+			run_hl    = 0x1d2021, // dark0_hard — loudest thing on a bright bar
+			stop_hl   = 0x504945, // dark2 — dormant grey on the bar, not the same colour
 		},
 	},
 
@@ -208,6 +270,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0x9d0006, // neutral red
 			running   = 0x79740e, // neutral green
 			stopped   = 0x928374, // mid gray (documented neutral)
+			key_fg    = 0x076678, // faded blue — reads as the token, not the prose
+			desc_fg   = 0x928374, // mid gray — muted against the key
+			caret_bg  = 0xaf3a03, // dark orange — == caret
+			caret_fg  = 0xfbf1c7, // light0 — the glyph knocked out of the block
+			run_hl    = 0xfbf1c7, // light0 — loudest on the dark-yellow bar
+			stop_hl   = 0x3c3836, // dark1 — near-black, opposite end of the bar
 		},
 	},
 
@@ -232,6 +300,21 @@ THEMES : [10]Theme = {
 			err_fg    = 0xd20f39, // red
 			running   = 0x40a02b, // green
 			stopped   = 0x9ca0b0, // overlay0
+			// NOTE: `key_fg` repeats the accent hex. That is a deliberate choice,
+			// not a laziness — latte has no second saturated colour that clears the
+			// 4.5:1 floor for a text token on `base`, and mauve is the theme's own
+			// "look here" colour. The roles stay distinct from the bar by context
+			// (footer vs row) and the contrast is proven by the test either way.
+			key_fg    = 0x8839ef, // mauve
+			desc_fg   = 0x8c8fa1, // overlay1 — muted against the key
+			// NOTE: the caret block is `blue`, not latte's own peach `caret` slot.
+			// A peach block with base knocked out measures 2.6:1, under the 3.0:1
+			// floor this palette enforces for a caret glyph; no documented latte
+			// colour pairs with peach above it. Blue gives 4.3:1. Deviation flagged.
+			caret_bg  = 0x1e66f5, // blue
+			caret_fg  = 0xeff1f5, // base
+			run_hl    = 0xeff1f5, // base — loudest on the mauve bar
+			stop_hl   = 0xbcc0cc, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -252,6 +335,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xe78284, // red
 			running   = 0xa6d189, // green
 			stopped   = 0x737994, // overlay0
+			key_fg    = 0xe5c890, // yellow — the footer hunt-token
+			desc_fg   = 0x838ba7, // overlay1 — muted against the key
+			caret_bg  = 0xef9f76, // peach — == caret
+			caret_fg  = 0x232634, // crust — the glyph knocked out of the block
+			run_hl    = 0x232634, // crust — loudest on the light-mauve bar
+			stop_hl   = 0x51576d, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -272,6 +361,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xed8796, // red
 			running   = 0xa6da95, // green
 			stopped   = 0x6e738d, // overlay0
+			key_fg    = 0xeed49f, // yellow — the footer hunt-token
+			desc_fg   = 0x8087a2, // overlay1 — muted against the key
+			caret_bg  = 0xf5a97f, // peach — == caret
+			caret_fg  = 0x181926, // crust — the glyph knocked out of the block
+			run_hl    = 0x181926, // crust — loudest on the light-mauve bar
+			stop_hl   = 0x494d64, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -292,6 +387,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xf38ba8, // red
 			running   = 0xa6e3a1, // green
 			stopped   = 0x6c7086, // overlay0
+			key_fg    = 0xf9e2af, // yellow — the footer hunt-token
+			desc_fg   = 0x7f849c, // overlay1 — muted against the key
+			caret_bg  = 0xfab387, // peach — == caret
+			caret_fg  = 0x11111b, // crust — the glyph knocked out of the block
+			run_hl    = 0x11111b, // crust — loudest on the light-mauve bar
+			stop_hl   = 0x45475a, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -313,6 +414,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xf7768e, // red
 			running   = 0x9ece6a, // green
 			stopped   = 0x565f89, // comment
+			key_fg    = 0xe0af68, // yellow — the footer hunt-token
+			desc_fg   = 0x565f89, // comment — muted against the key
+			caret_bg  = 0xff9e64, // orange — == caret
+			caret_fg  = 0x0c0e14, // bg_crust — the glyph knocked out of the block
+			run_hl    = 0x0c0e14, // bg_crust — loudest on the blue bar
+			stop_hl   = 0x3b4261, // fg_gutter — quiet grey, still above the floor
 		},
 	},
 
@@ -334,6 +441,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xbf616a, // nord11
 			running   = 0xa3be8c, // nord14
 			stopped   = 0x4c566a, // nord3
+			key_fg    = 0xebcb8b, // nord13 — the footer hunt-token
+			desc_fg   = 0x5e81ac, // nord10 — muted against the key
+			caret_bg  = 0xd08770, // nord12 — == caret
+			caret_fg  = 0x2e3440, // nord0 — the glyph knocked out of the block
+			run_hl    = 0x2e3440, // nord0 — loudest on the frost bar
+			stop_hl   = 0x4c566a, // nord3 — the theme's own dormant grey
 		},
 	},
 
@@ -357,6 +470,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xdc322f, // red
 			running   = 0x859900, // green
 			stopped   = 0x586e75, // base01
+			key_fg    = 0xb58900, // yellow — the footer hunt-token
+			desc_fg   = 0x586e75, // base01 — muted against the key
+			caret_bg  = 0xcb4b16, // orange — == caret
+			caret_fg  = 0x002b36, // base03 — the glyph knocked out of the block
+			run_hl    = 0x002b36, // base03 — the dark end of the blue bar
+			stop_hl   = 0xeee8d5, // base2 — the light end: nothing flattens these
 		},
 	},
 
@@ -377,6 +496,12 @@ THEMES : [10]Theme = {
 			err_fg    = 0xdc322f, // red
 			running   = 0x859900, // green
 			stopped   = 0x93a1a1, // base1
+			key_fg    = 0x586e75, // base01 — the footer hunt-token on cream
+			desc_fg   = 0x839496, // base0 — muted against the key
+			caret_bg  = 0xcb4b16, // orange — == caret
+			caret_fg  = 0xfdf6e3, // base3 — the glyph knocked out of the block
+			run_hl    = 0xfdf6e3, // base3 — the light end of the blue bar
+			stop_hl   = 0x073642, // base02 — the dark end: nothing flattens these
 		},
 	},
 }

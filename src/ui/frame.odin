@@ -138,6 +138,17 @@ Palette :: struct {
 	err_fg : clay.Color,
 	running : clay.Color, // a session that is up
 	stopped : clay.Color, // a session that is not
+
+	// ── RCH-10: the six roles added on top of the original thirteen ────
+	// Mirrored from `app.Palette` by name. `err_fg` above is the error text;
+	// these are the footer's two foregrounds, the caret's colour PAIR, and the
+	// state word's colour while its row is selected. All theme-resolved.
+	key_fg : clay.Color, // the KEY token in a footer hint (AD-1.2)
+	desc_fg : clay.Color, // the DESCRIPTION token, muted vs key_fg
+	caret_bg : clay.Color, // background of the cell the caret sits on
+	caret_fg : clay.Color, // the caret glyph itself
+	run_hl : clay.Color, // "running" WHILE its row is selected
+	stop_hl : clay.Color, // "stopped" WHILE its row is selected
 }
 
 // ── the ONE place a theme becomes a palette ───────────────────────────────
@@ -166,6 +177,16 @@ palette_of :: proc(t: app.Theme) -> Palette {
 		err_fg    = clay_colour(t.pal.err_fg),
 		running   = clay_colour(t.pal.running),
 		stopped   = clay_colour(t.pal.stopped),
+		// The six RCH-10 roles go through `theme_slot_or`, so a theme that
+		// leaves one unset degrades to the nearest colour IT chose instead of to
+		// black-by-zero. Every shipped theme fills all six, so on today's table
+		// the fallback is inert; it exists for the theme someone adds later.
+		key_fg    = clay_colour(app.theme_slot_or(t.pal.key_fg, t.pal.fg)),
+		desc_fg   = clay_colour(app.theme_slot_or(t.pal.desc_fg, t.pal.dim)),
+		caret_bg  = clay_colour(app.theme_slot_or(t.pal.caret_bg, t.pal.caret)),
+		caret_fg  = clay_colour(app.theme_slot_or(t.pal.caret_fg, t.pal.bg)),
+		run_hl    = clay_colour(app.theme_slot_or(t.pal.run_hl, t.pal.running)),
+		stop_hl   = clay_colour(app.theme_slot_or(t.pal.stop_hl, t.pal.stopped)),
 	}
 }
 
@@ -196,6 +217,16 @@ DEFAULT_PALETTE : Palette = Palette{
 	err_fg    = clay.Color{222, 96, 88, 255},
 	running   = clay.Color{120, 190, 120, 255},
 	stopped   = clay.Color{110, 114, 122, 255},
+	// The six RCH-10 roles, filled like every other slot: this stand-in must
+	// not paint an undefined colour either. run_hl/stop_hl are far apart on
+	// purpose (crust-dark vs a mid slate) so even the stand-in cannot flatten
+	// a selected running row into a selected stopped one.
+	key_fg    = clay.Color{232, 202, 120, 255},
+	desc_fg   = clay.Color{110, 114, 122, 255},
+	caret_bg  = clay.Color{222, 172, 84, 255},
+	caret_fg  = clay.Color{16, 20, 28, 255},
+	run_hl    = clay.Color{236, 236, 236, 255},
+	stop_hl   = clay.Color{120, 132, 156, 255},
 }
 
 // ── footer vocabulary ──────────────────────────────────────────────────────
