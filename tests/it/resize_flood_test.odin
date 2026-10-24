@@ -79,19 +79,23 @@ FLOOD_N :: 30
 // legitimate answer of "it never got two events at once". The count is
 // arithmetic over the measured per-rep miss rate:
 //
-//   P(max_run == 1 | one storm), ordinary load, this box ......... 0 / 120
-//   P(no merge in a rep) under heavy load (flood lane, old data) . 4 /  90
-//   worst observation on record (orchestrator, idle box) .......... 1 /   3
+//   P(no merge in one storm), ordinary load, THIS box, post-change ..  2 / 320
+//   P(no merge in one storm), pre-change sample, this box .........   0 / 120
+//   P(no merge in a rep) under heavy load (flood lane, old data) ..  4 /  90
+//   worst observation on record (orchestrator, idle box) ..........   1 /   3
 //
-// Taking the WORST observed rate (p ≈ 1/3) as the bound, a whole set flips red
-// only if EVERY rep misses the opportunity: p^N. N=3 → 3.7e-2 — which is the
-// rate the old per-rep check lived at, and it did go red. N=6 → 1.4e-3.
-// N=8 → 1.5e-4. Eight is where one unlucky rep cannot flip the verdict while
-// the scenario still costs seconds.
+// Taking the WORST observed rate (p ≈ 1/3) as the bound rather than the 0.6%
+// this box actually shows, the set flips red only if EVERY rep misses the
+// opportunity: p^N. N=3 → 3.7e-2 — which is the rate the old per-rep check
+// lived at, and it DID go red. N=6 → 1.4e-3. N=8 → 1.5e-4. Eight is where one
+// unlucky rep cannot flip the verdict while the scenario still costs seconds; at
+// the 0.6% rate this box really runs it is 1.7e-17.
 //
-// The tooth runs the other way and is not diluted by N: an app that cannot merge
-// misses the MERGE, not the opportunity, so it misses all N of N and fails the
-// set on every run. Verified — see the perturbation table in the task report.
+// The tooth runs the other way and is NOT diluted by N: an app that cannot merge
+// misses the MERGE, not the opportunity, so it misses all N of N. Measured with
+// a merge-disabled mutant (one event per loop iteration, so passes == resizes
+// and max_run == 1 by construction): SET APP-MERGED failed 10 runs out of 10,
+// each at 0/8 storms merged.
 FLOOD_MERGE_REPS :: 8
 
 // Flood_Stats is what one storm left behind. `measured` is false for a rep that
@@ -132,6 +136,21 @@ resize_flood_survives_and_lands_final_size :: proc(t: ^testing.T) {
 // one measured storm must show the app folding >=2 received events into one
 // layout pass. Moving this back to a per-rep assertion would reintroduce the
 // load-fragility this file exists to remove; see the header.
+//
+// WHY THE HEADLINE ALONE IS NOT ENOUGH — measured, not argued. A merge-disabled
+// mutant was run against these very checks with FLOOD_N=30, and in four of its
+// eight storms the kernel swallowed enough of the burst that the headline went
+// GREEN on an app that merged nothing at all:
+//
+//     issued=30 resizes=14 passes=14 max_run=1  ->  14*2 <= 30  headline PASS
+//     issued=30 resizes=11 passes=11 max_run=1  ->  11*2 <= 30  headline PASS
+//     issued=30 resizes=12 passes=12 max_run=1  ->  12*2 <= 30  headline PASS
+//     issued=30 resizes=15 passes=15 max_run=1  ->  15*2 <= 30  headline PASS
+//
+// That is the hole this check exists to close: `passes * 2 <= issued` cannot see
+// a non-merging app once delivery has been thinned, and `passes <= resizes` is
+// satisfied with equality. Only `max_run >= 2`, required across the whole set,
+// cannot be explained away by delivery spacing.
 flood_merge_set_check :: proc(t: ^testing.T, stats: []Flood_Stats) {
 	merged, measured := 0, 0
 	for i := 0; i < len(stats); i += 1 {
