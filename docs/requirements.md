@@ -8,6 +8,36 @@ This has to be implemented in the Odin language (https://devenv.sh/languages/odi
 https://github.com/nicbarker/clay/tree/main/bindings/odin), for calculating the layout of the TUI. Look in /home/alexfneves/gits/tui_experiment for inspiration of how the odin language could be used with clay to make a TUI (it's just an experiment with not enough content and possible a wrong structure).
 
 
+## REQUIREMENT: Odin for everything
+
+**Odin is the only implementation language for this project.** That covers product code, tests,
+tooling, scripts, generators, probes, fixtures, build helpers and one-off analysis.
+
+This repo is mid-migration: the legacy test suite is Python and shell under `dev/`, and porting it to
+Odin is the current work. Writing new Python or shell moves the project backwards, and it happens
+quietly -- an agent reaches for a scripting language to parse output or compute a value, gets an
+answer fast, and leaves behind code that itself must later be migrated.
+
+Therefore:
+
+- Do not add new `.py` files, and do not add new shell scripts, to the repo or to any worktree.
+- Do not use `python -c`, `awk`, `sed` or `jq` to reimplement what an existing Odin tool already
+  does. `tests/tools/hscheck` already parses `HS_TALLY` output, reads the JSON test report, enforces
+  every parity floor and emits a verdict. Use it instead of re-parsing in another language.
+- Scratch analysis and throwaway measurement are not exempt.
+- Need a value computed? Compute it in Odin, or derive it by reasoning and put the literal in the
+  source with a comment explaining it. If a value needs a solver, the value or the design is wrong.
+
+**If Python, or any non-Odin language, is genuinely required: stop and consult the user first.** Do
+not proceed assuming a throwaway script is harmless. State what is needed, why Odin cannot do it, and
+wait for a decision.
+
+The existing `dev/*.py` and `dev/*.sh` are the source of the migration, not a precedent for adding
+more. They are deleted at T17, once every assertion they carry has been ported.
+
+The migration is not finished when the old files are gone. It is finished when nobody is writing new
+non-Odin code here.
+
 For reference, this is a program that I will use to replace the herdr-cycle in my
 home-manager configuration (see /home/alexfneves/.config/home-manager).
 
