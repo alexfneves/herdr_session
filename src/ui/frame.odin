@@ -79,6 +79,7 @@ ROOT_ID :: "hs.frame.root"
 HEADER_ID :: "hs.frame.header"
 MAIN_ID :: "hs.frame.main"
 FOOTER_ID :: "hs.frame.footer"
+FOOTER_HINTS_ID :: "hs.frame.footer.hints"
 
 // Frame_Layout is the cell box the frame hands to its sections. Every field is
 // absolute (terminal coordinates) so a view can assert against a back-buffer
@@ -231,10 +232,32 @@ DEFAULT_PALETTE : Palette = Palette{
 
 // ── footer vocabulary ──────────────────────────────────────────────────────
 
-// Key_Hint is one "key -> action" pair drawn in the footer.
+// Key_Hint is one footer hint: a key and what pressing it does. Under AD-1 the
+// pair renders as `Description: key` — `action` is the DESCRIPTION half, the
+// thing that reads as a sentence, and `key` is the token the eye hunts for.
+// The field kept its name; its POSITION on the line flipped.
 Key_Hint :: struct {
 	key : string,
 	action : string,
+}
+
+// Footer_Span_Kind says what a piece of the footer IS. The renderer takes its
+// colour from the KIND and never from the string, which is the entire point of
+// making the spans the source of truth: text and colour are produced together,
+// from one value, so they cannot drift apart the way a coloured string built
+// somewhere else can.
+Footer_Span_Kind :: enum {
+	desc, // the description half of a unit — "New remote"
+	key,  // the key half — "r". The dominant token on the line (AD-1.2).
+	sep,  // punctuation: ": ", " | ", and the "…" cut marker
+}
+
+// Footer_Span is one painted piece of the footer. A unit is three spans
+// (desc, ": ", key); the line is units joined by " | " spans, optionally
+// headed by the cut marker.
+Footer_Span :: struct {
+	text : string,
+	kind : Footer_Span_Kind,
 }
 
 // Frame is everything the spine needs to draw itself. The state machine (T5.4)
@@ -580,6 +603,10 @@ frame_close :: proc(p: ^Painter, f: ^Frame) -> render.Stats {
 // list-age token is gone from this line entirely. What is left in `rest` is the
 // notice, the config warning, the per-host verdict and the provenance of the
 // remote set, composed by the driver.
+//
+// The hints are NOT one string in one colour any more. Each unit is painted as
+// its own spans, so the key and its description carry the two roles they are
+// supposed to carry (AD-1) rather than sharing `dim` with the whole line.
 frame_footer :: proc(f: ^Frame, pal: ^Palette) {
 	inner := frame_layout(f.cols, f.rows).cols
 	if clay.UI(clay.ID(FOOTER_ID))({
@@ -599,65 +626,201 @@ frame_footer :: proc(f: ^Frame, pal: ^Palette) {
 		clay.Text(ellipsize(f.rest, rest_w), clay.TextElementConfig{textColor = pal.accent})
 		room := inner - rest_w - 1
 		if room > 0 {
-			clay.Text(keys_line(f.keys, room), clay.TextElementConfig{textColor = pal.dim})
+			footer_hints(f.keys, room, pal)
 		}
 	}
 }
 
-// keys_line renders "j move  k quit  enter open" truncated to `max` cells, dropping
-// whole hints (never half a hint) so the footer never wraps.
+// footer_hints paints the hint units of `keys` into `room` cells, ONE Clay
+// text element per span, each in the colour its KIND says it should be.
 //
-// RETENTION (P3-12). When the line cannot hold every hint, the cut is made from
-// the FRONT, not the back — and it is marked with `…`. This is deliberate:
-// every KEYS_* table in main.odin lists its "how you get out" hints last
-// (`t theme`, `esc quit`, `ctrl-c quit`), so filling from the front and cutting
-// from the front keeps the exit visible and sheds the optional verbs first. A
-// footer that keeps `enter new local session` while dropping `esc quit` tells
-// the user how to start things and not how to stop, which at 80–120 columns — a
-// perfectly ordinary terminal — is the difference between a UI and a trap.
-//
-// The rule is "keep the hints nearest the exit, drop the ones furthest from it",
-// which is the same ordering the tables are written in and needs no second table
-// of priorities to drift out of sync.
-keys_line :: proc(keys: []Key_Hint, max: i32) -> string {
-	if max <= 0 || len(keys) == 0 {
-		return ""
+// The spans go in their own zero-gap container rather than directly into FOOTER,
+// because FOOTER's childGap is 1 and is already priced into `room` as the
+// single gap after `rest`. A per-span gap there would add cells that no
+// truncation arithmetic ever accounted for — the line would overflow its own
+// budget by one cell per span while every string length check still read green.
+footer_hints :: proc(keys: []Key_Hint, room: i32, pal: ^Palette) {
+	spans := footer_spans(keys, room)
+	defer delete(spans)
+	if len(spans) == 0 {
+		return
 	}
-
-	// The exit hint alone decides whether anything can be shown at all.
-	last := fmt.tprintf("{} {}", keys[len(keys)-1].key, keys[len(keys)-1].action)
-	if text_cols(last) > max {
-		return ellipsize(last, max)
+	if clay.UI(clay.ID(FOOTER_HINTS_ID))({
+		layout = clay.LayoutConfig{
+			sizing = clay.Sizing{
+				width  = clay.SizingGrow(),
+				height = clay.SizingFixed(FOOTER_ROWS),
+			},
+			layoutDirection = clay.LayoutDirection.LeftToRight,
+			childGap = 0,
+		},
+	}) {
+		for s in spans {
+			clay.Text(s.text, clay.TextElementConfig{textColor = footer_span_fg(pal, s.kind)})
+		}
 	}
-
-	// Walk backwards from the exit hint, prepending whatever still fits.
-	kept: []Key_Hint = keys[len(keys)-1:]
-	used := text_cols(last)
-	for i := len(keys) - 2; i >= 0; i -= 1 {
-		hint := fmt.tprintf("{} {}", keys[i].key, keys[i].action)
-		// Room for the hint, its separator, and — if we will still be dropping
-		// something further left — the `…` marker and its separator.
-		marker: i32 = 0
-		if i > 0 { marker = text_cols("…") + len(SEP) }
-		if used + len(SEP) + text_cols(hint) + marker > max { break }
-		kept = keys[i:len(keys)]
-		used += len(SEP) + text_cols(hint)
-	}
-
-	line := keys_joined(kept, max)
-	if len(kept) == len(keys) {
-		return line // everything fit; no marker
-	}
-	// Mark the cut. If even the marker does not fit, the hints alone are shown —
-	// the exit hint is still there either way.
-	marked := cat("…", SEP, line)
-	if text_cols(marked) <= max {
-		return marked
-	}
-	return line
 }
 
-SEP :: "  "
+// footer_span_fg is the ONLY place footer colour is decided. Nothing else in
+// this package maps a footer piece to a colour, so "the key is painted with
+// the key role" cannot be true in one call site and false in another.
+//
+// The key is the dominant token (AD-1.2): `key_fg` is the role the palette
+// tunes for huntability (measured, per theme, in tests/unit/theme_roles_uip2_test
+// — key_fg clears WCAG 4.5 on the page background while desc_fg is held DOWN at
+// 2.7 and at least 1.5x quieter than the key). No hex lives here; the roles
+// come from the palette and a theme change moves the footer with it.
+footer_span_fg :: proc(pal: ^Palette, kind: Footer_Span_Kind) -> clay.Color {
+	switch kind {
+	case .key:
+		return pal.key_fg
+	case .sep:
+		return pal.dim // punctuation is the quietest thing on the line
+	case .desc:
+		return pal.desc_fg
+	}
+	return pal.desc_fg
+}
+
+// ── the footer unit: `Description: key` ───────────────────────────────────
+//
+// FORMAT INVERSION (AD-1). The unit used to be `key description` ("r new
+// remote"); it is now `description: key` ("New remote: r"). Everything that
+// consumes the footer — `keys_line`, the retention rule, the truncation proofs —
+// goes through the spans below, so there is exactly one definition of a unit
+// and a coloured line and a plain line can never describe different text.
+//
+// THE WIDTH PRICE (AD-3), stated so nobody re-derives it by surprise:
+//
+//	unit  = len(Description) + len(": ") + len(key)   cells
+//	join  = len(SEP) = 3                            cells, per hint after the first
+//	marker = len("…") + len(SEP) = 4                cells, once, when hints were cut
+//
+// Against the old format that is one extra cell per join and the same marker,
+// and the units themselves changed length too because the descriptions are
+// display strings now (AD-2), not the old lowercase verb. Every survival
+// threshold moved. The tests sweep the widths again rather than trust any of
+// the numbers below.
+SEP :: " | "
+
+// CUT_MARKER heads the line when hints to the left were dropped, so a short
+// footer says "there was more" instead of looking like the whole truth.
+CUT_MARKER :: "…"
+
+// UNIT_COLON joins a unit's description to its key.
+UNIT_COLON :: ": "
+
+// NO_LIMIT is the `max` used when a caller wants everything. It is 1<<30
+// rather than max_int so the width arithmetic inside footer_spans
+// (`used + join + unit + marker`) cannot overflow however many hints arrive.
+NO_LIMIT : i32 = 1 << 30
+
+// footer_unit_cols is the cell width of one hint unit rendered whole.
+footer_unit_cols :: proc(k: Key_Hint) -> i32 {
+	return text_cols(k.action) + text_cols(UNIT_COLON) + text_cols(k.key)
+}
+
+// footer_unit_text is the plain-text projection of one whole unit.
+footer_unit_text :: proc(k: Key_Hint) -> string {
+	return cat(k.action, UNIT_COLON, k.key)
+}
+
+// footer_spans is THE footer: every hint becomes desc / ": " / key, units are
+// joined by " | ", and truncation drops WHOLE UNITS from the FRONT under the
+// retention rule (see below), marking the cut with "…".
+//
+// RETENTION (P3-12) IS UNCHANGED, AND DELIBERATELY SO. When the line cannot
+// hold every unit, the cut is made from the FRONT, not the back, and it is
+// marked. Every KEYS_* table lists its "how you get out" hints last
+// (`t theme`, `esc quit`, `ctrl-c quit`), so filling from the exit side and
+// cutting from the front keeps the exit visible and sheds the optional verbs
+// first. The rule is positional — "keep the hints nearest the exit" — and
+// inverting what each unit SAYS does not touch it. A footer that keeps
+// `New local session: enter` while dropping `Quit: esc` tells the user how to
+// start things and not how to stop, which at 80-120 columns — a perfectly
+// ordinary terminal — is the difference between a UI and a trap.
+//
+// What IS new is only the size of the atoms the rule counts, which is why the
+// sweep lives in tests/unit/keyhints_test.odin and is re-derived, not reused.
+footer_spans :: proc(keys: []Key_Hint, max: i32) -> [dynamic]Footer_Span {
+	out: [dynamic]Footer_Span = {}
+	if max <= 0 || len(keys) == 0 {
+		return out
+	}
+
+	// The exit unit alone decides whether anything can be shown at all.
+	last := keys[len(keys)-1]
+	last_w := footer_unit_cols(last)
+	if last_w > max {
+		// Not even the exit unit fits whole. Same degradation this line has
+		// always had — the exit unit, ellipsised — and it is genuinely NOT a
+		// whole unit any more, which is precisely why the width floors in the
+		// tests sit at or above a unit's own width. `no_half_unit` fails such
+		// a line, on purpose: there is no honest `Description: key` in fewer
+		// cells than the unit needs.
+		append(&out, Footer_Span{ellipsize(footer_unit_text(last), max), .desc})
+		return out
+	}
+
+	// Walk backwards from the exit unit, prepending whatever still fits.
+	kept := keys[len(keys)-1:]
+	used := last_w
+	for i := len(keys) - 2; i >= 0; i -= 1 {
+		w := footer_unit_cols(keys[i])
+		// Room for the unit, its separator, and — if we will still be dropping
+		// something further left — the cut marker and its separator.
+		marker: i32 = 0
+		if i > 0 { marker = text_cols(CUT_MARKER) + text_cols(SEP) }
+		if used + text_cols(SEP) + w + marker > max { break }
+		kept = keys[i:len(keys)]
+		used += text_cols(SEP) + w
+	}
+
+	for k in kept {
+		if len(out) > 0 { append(&out, Footer_Span{SEP, .sep}) }
+		append(&out, Footer_Span{k.action, .desc})
+		append(&out, Footer_Span{UNIT_COLON, .sep})
+		append(&out, Footer_Span{k.key, .key})
+	}
+	if len(kept) == len(keys) {
+		return out // everything fit; no marker
+	}
+
+	// Mark the cut. If even the marker does not fit, the units alone are
+	// shown — the exit unit is still there either way.
+	marker_w := text_cols(CUT_MARKER) + text_cols(SEP)
+	if used + marker_w > max {
+		return out
+	}
+	head: [dynamic]Footer_Span = {}
+	append(&head, Footer_Span{CUT_MARKER, .sep})
+	append(&head, Footer_Span{SEP, .sep})
+	for s in out { append(&head, s) }
+	delete(out)
+	return head
+}
+
+// keys_line renders the footer hint line as plain text, truncated to `max`
+// cells, dropping whole units (never half a unit) so the footer never wraps.
+//
+// It is the TEXT PROJECTION of `footer_spans` and nothing else: it holds no
+// format string and no separator of its own, so a plain line and the coloured
+// line the user sees cannot disagree. The legacy suites and the width proofs
+// call this; they read exactly what the footer paints.
+keys_line :: proc(keys: []Key_Hint, max: i32) -> string {
+	spans := footer_spans(keys, max)
+	defer delete(spans)
+	return join_spans(spans[:])
+}
+
+// join_spans concatenates already-chosen span text. No format string is
+// involved, which is what keeps the `%!(EXTRA …)` class of bug out of the
+// footer entirely.
+join_spans :: proc(spans: []Footer_Span) -> string {
+	buf: [dynamic]byte
+	for s in spans { append_bytes(&buf, s.text) }
+	return string(buf[:])
+}
 
 // cat joins three pieces without any format string, so no user-supplied text can
 // ever hit a format-specifier path (the `%!(EXTRA …)` class of bug).
@@ -670,12 +833,11 @@ cat :: proc(a, b, c: string) -> string {
 }
 
 // keys_joined renders every hint, untruncated (the `max` is only used to size
-// the buffer's growth, never to drop anything).
+// the buffer's growth, never to drop anything). It goes through the SAME spans
+// as the painted footer, so it is a projection rather than a second string
+// somebody has to remember to keep in sync.
 keys_joined :: proc(keys: []Key_Hint, max: i32) -> string {
-	buf: [dynamic]byte
-	for &k in keys {
-		if len(buf) > 0 { append_bytes(&buf, SEP) }
-		append_bytes(&buf, fmt.tprintf("{} {}", k.key, k.action))
-	}
-	return string(buf[:])
+	spans := footer_spans(keys, NO_LIMIT)
+	defer delete(spans)
+	return join_spans(spans[:])
 }

@@ -19,6 +19,22 @@ import app "../app"
 // `app.State`, which is what `main.tui_keys` was reading out of the global
 // `tui.machine.state`; taking it as a parameter is what makes it testable.
 //
+// DESCRIPTIONS ARE DISPLAY STRINGS, NOT STATE LABELS (AD-2). Every hint below
+// carries its OWN display string, written to read as `Description: key`
+// (frame.odin inverts the pair and joins units with ` | `). They are
+// deliberately NOT derived from RCH-9's `state_label`, which answers "where
+// am I" ("Name remote session") rather than "what does this key do".
+// Deriving one from the other would make every hint inside a state read the
+// same, which is worse than useless in a footer whose whole job is telling
+// eight keys apart at a glance. The three the plan pins by name:
+//
+//	`r`  New remote        — reached from .remote_server
+//	`s`  New named remote  — reached from .name_remote_named
+//	`a`  Attach            — reached from .attach
+//
+// and the same rule applies to every other row in all seven tables. The one
+// row that resists the shape is flagged where it sits.
+//
 // ORDER IS CONTRACT, NOT STYLE. `keys_line` keeps the exit hint and fills from
 // the exit-hint side, cutting from the front when the footer runs out of room
 // (frame.odin). So the LAST entry of every table is "how you get out", and the
@@ -27,59 +43,59 @@ import app "../app"
 // ─────────────────────────────────────────────────────────────────────────────
 
 KEYS_MODE : [8]Key_Hint = {
-	Key_Hint{"enter", "new local session"},
-	Key_Hint{"n", "named local"},
-	Key_Hint{"r", "new remote"},
-	Key_Hint{"s", "named remote"},
-	Key_Hint{"a", "attach"},
-	Key_Hint{"d", "delete"},
-	Key_Hint{"t", "theme"},
-	Key_Hint{"esc", "quit"},
+	Key_Hint{"enter", "New local session"},
+	Key_Hint{"n", "New named local"},
+	Key_Hint{"r", "New remote"},
+	Key_Hint{"s", "New named remote"},
+	Key_Hint{"a", "Attach"},
+	Key_Hint{"d", "Delete"},
+	Key_Hint{"t", "Theme"},
+	Key_Hint{"esc", "Quit"},
 }
 
 KEYS_ATTACH : [5]Key_Hint = {
-	Key_Hint{"up/down", "select"},
-	Key_Hint{"type", "filter"},
-	Key_Hint{"enter", "attach (existing only)"},
-	Key_Hint{"esc", "back"},
-	Key_Hint{"ctrl-c", "quit"},
+	Key_Hint{"up/down", "Select"},
+	Key_Hint{"type", "Filter"},
+	Key_Hint{"enter", "Attach existing"},
+	Key_Hint{"esc", "Back"},
+	Key_Hint{"ctrl-c", "Quit"},
 }
 
 KEYS_DELETE : [5]Key_Hint = {
-	Key_Hint{"up/down", "select"},
-	Key_Hint{"type", "filter"},
-	Key_Hint{"enter", "stop + delete"},
-	Key_Hint{"esc", "back"},
-	Key_Hint{"ctrl-c", "quit"},
+	Key_Hint{"up/down", "Select"},
+	Key_Hint{"type", "Filter"},
+	Key_Hint{"enter", "Stop + delete"},
+	Key_Hint{"esc", "Back"},
+	Key_Hint{"ctrl-c", "Quit"},
 }
 
 KEYS_NAME : [4]Key_Hint = {
-	Key_Hint{"type", "A-Z a-z 0-9 . _ -"},
-	Key_Hint{"enter", "create"},
-	Key_Hint{"esc", "back"},
-	Key_Hint{"ctrl-c", "quit"},
+	Key_Hint{"type", "Name with A-Z a-z 0-9 . _ -"},
+	Key_Hint{"enter", "Create"},
+	Key_Hint{"esc", "Back"},
+	Key_Hint{"ctrl-c", "Quit"},
 }
 
 KEYS_PICK : [5]Key_Hint = {
-	Key_Hint{"up/down", "select"},
-	Key_Hint{"type", "filter"},
-	Key_Hint{"enter", "choose"},
-	Key_Hint{"esc", "back"},
-	Key_Hint{"ctrl-c", "quit"},
+	Key_Hint{"up/down", "Select"},
+	Key_Hint{"type", "Filter"},
+	Key_Hint{"enter", "Choose"},
+	Key_Hint{"esc", "Back"},
+	Key_Hint{"ctrl-c", "Quit"},
 }
 
 KEYS_THEME : [5]Key_Hint = {
-	Key_Hint{"up/down", "select"},
-	Key_Hint{"type", "filter"},
-	Key_Hint{"enter", "apply theme"},
-	Key_Hint{"esc", "back"},
-	Key_Hint{"ctrl-c", "quit"},
+	Key_Hint{"up/down", "Select"},
+	Key_Hint{"type", "Filter"},
+	Key_Hint{"enter", "Apply theme"},
+	Key_Hint{"esc", "Back"},
+	Key_Hint{"ctrl-c", "Quit"},
 }
 
 KEYS_ERROR : [3]Key_Hint = {
-	Key_Hint{"enter", "dismiss"},
-	Key_Hint{"esc", "dismiss"},
-	Key_Hint{"ctrl-c", "quit"},
+	Key_Hint{"enter", "Dismiss"},
+	Key_Hint{"esc", "Dismiss"},
+	Key_Hint{"ctrl-c", "Quit"},
 }
 
 // ALL_HINTS is every table in the module, paired with the state it belongs to.
