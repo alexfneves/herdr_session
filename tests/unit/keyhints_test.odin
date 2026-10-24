@@ -357,6 +357,7 @@ keyhints_every_table_honours_the_width_contract :: proc(t: ^testing.T) {
 	half := ""
 	blank := ""
 	misplaced := ""
+	double := ""
 	tables := ui.all_hint_tables()
 	n_tables := 0
 	for th in tables {
@@ -380,6 +381,16 @@ keyhints_every_table_honours_the_width_contract :: proc(t: ^testing.T) {
 			if line == "" {
 				kh_first(&blank, fmt.tprintf("{} at {} cols: blank footer", th.name, w))
 			}
+			// No footer line may contain a run of two spaces. This is not
+			// cosmetic: the pre-migration no-half check in src/ui_cases.odin
+			// splits the line on `  ` (two spaces). ` | ` is one space, pipe,
+			// one space, so the projection never contains a double space and
+			// that older check keeps slicing at unit boundaries instead of inside
+			// a unit. A description that ever carried a double space would break
+			// it, and this is where that shows up first.
+			if strings_contains(line, "  ") {
+				kh_first(&double, fmt.tprintf("{} at {} cols: '{}' contains a double space", th.name, w, line))
+			}
 			pieces := kh_split(line, ui.SEP)
 			for j := 0; j < len(pieces); j += 1 {
 				if pieces[j] == ui.CUT_MARKER && j != 0 {
@@ -400,6 +411,8 @@ keyhints_every_table_honours_the_width_contract :: proc(t: ^testing.T) {
 		fmt.tprintf("first blank: '{}'", blank))
 	support.check(t, "and the front-cut marker only ever heads the line", misplaced == "",
 		fmt.tprintf("first misplaced marker: '{}'", misplaced))
+	support.check(t, "and no footer line contains a double space (the legacy split boundary)",
+		double == "", fmt.tprintf("first offender: '{}'", double))
 }
 
 // THE FALSIFIABILITY OF THE PREDICATE ITSELF.
