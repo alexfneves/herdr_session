@@ -506,11 +506,18 @@ keyhints_half_unit_predicate_falsifies :: proc(t: ^testing.T) {
 			kh_marker_only("… | Quit: esc"), kh_marker_only("…Quit: esc | Quit: esc")))
 }
 
-// The footer's plain-text projection must be free of format garbage. This
-// project has a live, known `%!(EXTRA …)` failure in another suite; the
+// The footer's plain-text projection must be free of printf fallout. The
 // footer's answer is that it never touches a format string at all — units are
-// concatenated spans. This sweeps every table at every width for the `%!`
-// sequence so a regression cannot hide behind "my tprintf template is safe".
+// concatenated spans — so a mistyped verb cannot produce a plausible line
+// whose numbers are not what they claim. This sweeps every table at every
+// width for the fallout markers.
+//
+// THE CHECK'S OWN WORDING IS DELIBERATE. The gate scans this suite's ledger
+// lines for format fallout, so naming the check (or its detail) with the
+// literal tokens it searches for made the check that PROVES the footer clean
+// trip the rule as its own offender — 268 tests, 0 failures, red row. The
+// needles stay in the code, which is not printed; the prose names the property
+// instead of quoting the marker.
 @(test)
 keyhints_footer_output_has_no_format_garbage :: proc(t: ^testing.T) {
 	widths : [8]int = {120, 100, 80, 60, 40, 30, 20, 10}
@@ -525,7 +532,7 @@ keyhints_footer_output_has_no_format_garbage :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	support.check(t, "no footer line contains %! or %( at any width of any table",
+	support.check(t, "no footer line carries a printf format-fallout marker at any width of any table",
 		n > 0 && dirty == "", fmt.tprintf("{} lines swept, first offender: '{}'", n, dirty))
 }
 
