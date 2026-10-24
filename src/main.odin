@@ -341,6 +341,13 @@ Tui :: struct {
 	flt      : ui.Float,
 	pal      : ui.Palette,
 
+	// caret_src is WHICH editor owns the caret for the frame being painted, and
+	// it is written by the body painter that drew the editor. After the frame is
+	// closed it is what the real terminal cursor gets aimed at; nil means this
+	// frame has no caret at all, so the cursor is hidden rather than left on
+	// some older frame's cell. Reset at the top of every paint.
+	caret_src : ^ui.Edit,
+
 	cfg     : app.Config, // what ~/.config/herdr_session.json said (T6.1)
 
 	remotes     : []app.Remote,
@@ -901,10 +908,19 @@ tui_project_shown :: proc() -> []app.Session {
 // tui_sync_text copies the MACHINE's text into a view editor. The machine owns
 // filter/field text (T5.4); the view only renders it. Feeding typed characters
 // straight to the editor would put the caret somewhere the machine has never
-// heard of, so the copy goes one way only, once per frame.
-tui_sync_text :: proc(e: ^ui.Edit, s: string) {
+// heard of, so the copy goes one way only, once per frame — CARET INCLUDED,
+// because the caret is machine state now (arrow keys move it) and a view that
+// re-forgot it would snap to end-of-line on every repaint.
+tui_sync_text :: proc(e: ^ui.Edit, s: string, caret: int) {
 	ui.edit_clear(e)
 	if len(s) > 0 { ui.edit_paste(e, s) }
+	// The clamp is a safety net, not a policy: the machine keeps the caret on a
+	// rune boundary, so the only way to be out of range is a desync — and a
+	// clamped caret is a visible-but-wrong caret, never a crash.
+	at := caret
+	if at < 0 { at = 0 }
+	if at > e.len { at = e.len }
+	e.caret = at
 }
 
 // ── painting ─────────────────────────────────────────────────────────────
@@ -1012,6 +1028,27 @@ tui_source_line :: proc() -> string {
 	return fmt.tprintf("from {}", app.machine_source_label(tui.disc_source))
 }
 
+// tui_paint_cursor aims the REAL terminal cursor at the cell Clay painted the
+// caret into, and asks the terminal for a blinking block while it is there.
+// The bytes themselves are the caret's own concern (ui.edit_place_cursor);
+// which editor owns the caret, and whether to hide instead, is decided here.
+//
+// There is NO TIMER. One emission per painted frame, driven by paint alone: a
+// blink timer would wake the loop on a clock and break the frozen idle budget
+// (≤ 2 ticks per 5 s, D-K). The terminal blinks the cursor by itself, so
+// nothing has to be scheduled in order to let it.
+tui_paint_cursor :: proc() {
+	if tui.caret_src == nil {
+		termbox2.tb_hide_cursor()
+		return
+	}
+	if _, _, ok := ui.edit_place_cursor(tui.caret_src); !ok {
+		// No caret in this frame: hide, rather than leave the cursor sitting on
+		// the cell an earlier frame's caret occupied.
+		termbox2.tb_hide_cursor()
+	}
+}
+
 tui_paint :: proc() {
 	cols, rows := termbox2.tb_width(), termbox2.tb_height()
 	if cols != tui.painter.cols || rows != tui.painter.rows {
@@ -1034,14 +1071,20 @@ tui_paint :: proc() {
 	// column of one cell would read as a bug.
 	if termhandoff.too_small(cols, rows) {
 		termhandoff.too_small_paint(&tui.coalescer)
+		tui.caret_src = nil // a notice has no caret in it
 		ui.paint_notice(&tui.painter, cols, rows, &tui.pal,
 			termhandoff.too_small_message(cols, rows))
+		tui_paint_cursor()
 		termbox2.tb_present()
 		tui.dirty = false
 		TUI_FRAMES += 1
 		return
 	}
 	l := ui.frame_layout(cols, rows)
+
+	// Which editor owns the caret is decided by whichever body painter runs; a
+	// frame that never paints one must not inherit last frame's answer.
+	tui.caret_src = nil
 
 	f := &tui.frame
 	f.cols = cols
@@ -1068,6 +1111,15 @@ tui_paint :: proc() {
 		error_body(l)
 	}
 	ui.frame_close(&tui.painter, f)
+	// The caret's cursor bytes are queued BEFORE the flush that carries them.
+	// Measured (see tests/unit/caret_cursor_test): termbox has no exported
+	// flush of its own — tb_set_cursor/tb_send only append to termbox's output
+	// buffer — so emitting AFTER tb_present leaves those bytes sitting in that
+	// buffer until some LATER flush. The caret would land a frame late, or, in
+	// an idle app with no next frame, never arrive at all. Emitting before the
+	// present puts them in the same write as the frame, and termbox's own
+	// end-of-flush cursor sync then leaves the real cursor on the caret cell.
+	tui_paint_cursor()
 	termbox2.tb_present()
 	termhandoff.note_paint(&tui.coalescer)
 	tui.dirty = false
@@ -1078,7 +1130,7 @@ TUI_FRAMES : int = 0
 
 session_body :: proc(l: ui.Frame_Layout) {
 	rows := tui_project_shown()
-	tui_sync_text(&tui.sess.filter, app.text_of(&tui.machine.filter))
+	tui_sync_text(&tui.sess.filter, app.text_of(&tui.machine.filter), tui.machine.filter.caret)
 	tui.sess.sel = tui.machine.held
 	// The filter LINE is drawn only where the machine says this state displays
 	// one. {Mode selection} does not, so it gets the row back rather than an
@@ -1087,6 +1139,14 @@ session_body :: proc(l: ui.Frame_Layout) {
 	// loses a row to a phantom.
 	show_filter := app.state_is_filter_view(tui.machine.state)
 	tui.sess.show_filter = show_filter
+	// The caret lives in the filter line only where that line exists. In
+	// {Mode selection} there is no editable filter, so there is no caret to
+	// aim the terminal cursor at either.
+	if show_filter {
+		tui.caret_src = &tui.sess.filter
+	} else {
+		tui.caret_src = nil
+	}
 	chrome: i32 = 1 // the column header
 	if show_filter { chrome += 1 }
 	body := l.main_rows - chrome
@@ -1096,7 +1156,8 @@ session_body :: proc(l: ui.Frame_Layout) {
 }
 
 edit_body :: proc(l: ui.Frame_Layout) {
-	tui_sync_text(&tui.name_ed, app.text_of(&tui.machine.field))
+	tui_sync_text(&tui.name_ed, app.text_of(&tui.machine.field), tui.machine.field.caret)
+	tui.caret_src = &tui.name_ed
 	w := l.cols - 2
 	if w < 8 { w = 8 }
 	ui.edit_paint(&tui.name_ed, "hs.tui.name.edit", w, &tui.pal)
@@ -1106,7 +1167,8 @@ edit_body :: proc(l: ui.Frame_Layout) {
 // picker. The filter line above it is the machine's text rendered through the
 // editor, so the caret behaves identically to the name field.
 picker_body :: proc(l: ui.Frame_Layout, rows: []ui.Picker_Row) {
-	tui_sync_text(&tui.filter_ed, app.text_of(&tui.machine.filter))
+	tui_sync_text(&tui.filter_ed, app.text_of(&tui.machine.filter), tui.machine.filter.caret)
+	tui.caret_src = &tui.filter_ed
 	w := l.cols - 2
 	if w < 8 { w = 8 }
 	ui.edit_paint(&tui.filter_ed, "hs.tui.pick.filter", w, &tui.pal)

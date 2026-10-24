@@ -277,9 +277,15 @@ TEXT_MAX :: 256
 //    backspace does — `len -= n` is the whole operation;
 //  * it bounds what a held-down key can put in a buffer with no allocator on
 //    the hot path. Same shape as `ui.Edit`, for the same reasons.
+// Text is the machine's own single-line buffer: a FIXED array, a length and a
+// caret. `caret` is a BYTE index (0 <= caret <= len), always sitting on a rune
+// boundary because every mover and every mutator here works on whole runes.
+// It is still NOT a screen position: the caret's column is derived from it by
+// the view, exactly as `ui.Edit` derives its own.
 Text :: struct {
-	buf : [TEXT_MAX]u8,
-	len : int,
+	buf   : [TEXT_MAX]u8,
+	len   : int,
+	caret : int, // byte index, 0 <= caret <= len, always on a rune boundary
 }
 
 // text_of returns the buffer's contents. The returned string ALIASES the
@@ -295,28 +301,77 @@ text_empty :: proc(t: ^Text) -> bool {
 
 text_clear :: proc(t: ^Text) {
 	t.len = 0
+	t.caret = 0
 }
 
-// text_append appends ONE WHOLE RUNE as its UTF-8 bytes. Keys arrive decoded,
-// so multi-byte input can never be split at this layer.
+// text_append inserts ONE WHOLE RUNE at the CARET and leaves the caret after
+// it. Keys arrive decoded, so multi-byte input can never be split here.
+//
+// With the caret at the end — where it sits until an arrow key moves it — that
+// is byte-for-byte the old "append", so no existing caller changes behaviour.
+// With the caret mid-field it is what typing into the middle of a line means,
+// which is the whole point of having a caret at this layer at all.
 text_append :: proc(t: ^Text, r: rune) -> bool {
 	tmp, n := utf8.encode_rune(r)
 	if n <= 0 || t.len+n > TEXT_MAX { return false }
-	for i in 0..<n {
-		t.buf[t.len+i] = tmp[i]
+	at := t.caret
+	if at < 0 { at = 0 }
+	if at > t.len { at = t.len }
+	// Shift the tail right, back to front, so nothing is copied over itself.
+	i := t.len - at
+	for i > 0 {
+		i -= 1
+		t.buf[at+n+i] = t.buf[at+i]
+	}
+	for j in 0..<n {
+		t.buf[at+j] = tmp[j]
 	}
 	t.len += n
+	t.caret = at + n
 	return true
 }
 
-// text_backspace removes the WHOLE rune at the end. Deleting one byte of a
-// 3-byte rune would leave a dangling continuation byte that renders as garbage.
+// text_backspace removes the WHOLE rune BEFORE THE CARET. Deleting one byte of
+// a 3-byte rune would leave a dangling continuation byte that renders as
+// garbage, so the rune boundary is found first and its full length removed.
+// With the caret at the end this is plain end-of-line backspace, as before.
 text_backspace :: proc(t: ^Text) -> bool {
-	if t.len == 0 { return false }
-	_, n := utf8.decode_last_rune_in_string(string(t.buf[0:t.len]))
+	if t.caret <= 0 || t.len == 0 { return false }
+	_, n := utf8.decode_last_rune_in_string(string(t.buf[0:t.caret]))
 	if n <= 0 { n = 1 } // undecodable tail: drop one byte so the field stays usable
-	if n > t.len { n = t.len }
+	if n > t.caret { n = t.caret }
+	start := t.caret - n
+	// Pull the tail left over the removed rune.
+	i := 0
+	for i < t.len-(start+n) {
+		t.buf[start+i] = t.buf[start+n+i]
+		i += 1
+	}
 	t.len -= n
+	t.caret = start
+	return true
+}
+
+// text_caret_left / text_caret_right move the caret by ONE WHOLE RUNE and
+// report whether the caret actually moved. Stepping a byte at a time would stop
+// inside a multi-byte rune, where no display column can be derived at all.
+// At either end of the line they are NO-OPS that return false, which is what
+// lets a caller tell "blocked" apart from "moved".
+text_caret_left :: proc(t: ^Text) -> bool {
+	if t.caret <= 0 { return false }
+	_, n := utf8.decode_last_rune_in_string(string(t.buf[0:t.caret]))
+	if n <= 0 { n = 1 }
+	if n > t.caret { n = t.caret }
+	t.caret -= n
+	return true
+}
+
+text_caret_right :: proc(t: ^Text) -> bool {
+	if t.caret >= t.len { return false }
+	_, n := utf8.decode_rune_in_string(string(t.buf[t.caret:t.len]))
+	if n <= 0 { n = 1 }
+	t.caret += n
+	if t.caret > t.len { t.caret = t.len }
 	return true
 }
 
@@ -744,6 +799,10 @@ consume_edit_key :: proc(a: ^App, k: input.Key) {
 	#partial switch k.kind {
 	case .backspace:
 		text_backspace(&a.field)
+	case .left:
+		text_caret_left(&a.field)
+	case .right:
+		text_caret_right(&a.field)
 	case .character:
 		if k.r > 0x7f { return }  // non-ASCII can never be a legal name byte
 		if !name_is_valid_character(byte(k.r)) { return }
@@ -881,6 +940,13 @@ filter_navigate :: proc(a: ^App, k: input.Key) {
 		move_shown(a, -1)
 	case .backspace:
 		if text_backspace(&a.filter) { rebuild_shown(a) }
+	case .left:
+		// The caret MOVES; the filter text does not. No rebuild, because
+		// nothing the filter is built from changed — a rebuild here would also
+		// drag the selection along with a keypress that only moved a cursor.
+		text_caret_left(&a.filter)
+	case .right:
+		text_caret_right(&a.filter)
 	case .character:
 		if a.filter.len >= FILTER_MAX { return }
 		text_append(&a.filter, k.r)
