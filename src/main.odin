@@ -1037,6 +1037,13 @@ tui_source_line :: proc() -> string {
 // blink timer would wake the loop on a clock and break the frozen idle budget
 // (≤ 2 ticks per 5 s, D-K). The terminal blinks the cursor by itself, so
 // nothing has to be scheduled in order to let it.
+//
+// CAVEAT before changing the order: a captured frame ends
+// `<caret CUP><ESC[3 q><caret CUP><ESC[?12l><ESC[?25h>` — termbox appends its
+// own end-of-flush cursor sync and un-hide AFTER the caret's DECSCUSR. Whether
+// that mode-12 reset suppresses the blink the DECSCUSR asked for is emulator
+// behaviour this suite cannot observe (the bundled pty emulator parses DECSCUSR
+// and ignores it), so "it blinks" stays eyeball-only rather than asserted.
 tui_paint_cursor :: proc() {
 	if tui.caret_src == nil {
 		termbox2.tb_hide_cursor()
