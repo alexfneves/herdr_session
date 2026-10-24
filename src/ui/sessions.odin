@@ -36,6 +36,15 @@ package ui
 // Phase 2 left overlay blending as a no-op, so a highlight that relied on it
 // would silently be nothing.
 //
+// THE STATE COLUMN IS THE ONE EXCEPTION TO `sel_fg` (RCH-10 change 5). A row's
+// device / timestamp / name cells all take `sel_fg` under selection; the state
+// word does not, because it carries information the row colour cannot: whether
+// the session is up. Forcing `sel_fg` there made a selected RUNNING row and a
+// selected STOPPED row render IDENTICALLY, which flattened the one thing that
+// column exists to say. Selected rows therefore use the highlight PAIR
+// `run_hl` / `stop_hl` — the two roles UIP-2 derived to stay legible ON the
+// accent bar and to stay distinguishable from EACH OTHER. See `sess_paint_row`.
+//
 // ── SHRINK NEVER LOSES THE SELECTION ────────────────────────────────────────
 // sessions_clamp runs every frame with the current visible row count: scroll is
 // clamped into [0, count-visible] and then the selection is pulled back into the
@@ -279,13 +288,34 @@ sess_paint_row :: proc(row: app.Session, cols: Sessions_Columns, is_sel: bool, p
 	}) {
 		paint_cell(ellipsize(row.device, cols.device), cols.device, fg)
 		paint_cell(ellipsize(app.ts_display(row.ts), cols.ts), cols.ts, fg)
-		// The state column is themed, not hardcoded: `running` / `stopped` are
-		// palette roles (T6.2 "no gaps"). Selected rows keep the selection
-		// foreground, because a themed green on the accent bar is how the two
-		// encodings would otherwise collide.
-		state_fg := fg
-		if !is_sel {
-			if row.running { state_fg = pal.running } else { state_fg = pal.stopped }
+		// ── the state word: four combinations, never flattened ────────────
+		// RCH-10 change 5. `running` / `stopped` are palette roles in BOTH
+		// selection states (T6.2 "no gaps"), and the selected pair is the
+		// highlight variant of the same distinction rather than the row's own
+		// `sel_fg`:
+		//
+		//                 not selected      selected
+		//   running       pal.running       pal.run_hl
+		//   stopped       pal.stopped     pal.stop_hl
+		//
+		// The previous shape was `state_fg := fg; if !is_sel { running/stopped }`,
+		// i.e. while a row was selected the state word took the ROW's colour and
+		// the two states collapsed into one. That is the flattening change 5
+		// forbids.
+		//
+		// This is a per-cell foreground decision on purpose. A blend/tint of the
+		// highlight over the state colour is NOT available: overlay blending has
+		// been a deliberate no-op since Phase 2 (this file's header), so a tint
+		// approach paints nothing at all (D-Q).
+		state_fg : clay.Color
+		if is_sel && row.running {
+			state_fg = pal.run_hl
+		} else if is_sel {
+			state_fg = pal.stop_hl
+		} else if row.running {
+			state_fg = pal.running
+		} else {
+			state_fg = pal.stopped
 		}
 		paint_cell(state_text(row.running), cols.state, state_fg)
 		paint_cell(ellipsize(row.name, cols.name), cols.name, fg)
