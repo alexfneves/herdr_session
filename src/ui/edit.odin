@@ -45,8 +45,10 @@ package ui
 // ============================================================================
 
 import clay "../../clay-odin"
+import render "../render"
 import tb "../../vendor/termbox2-odin"
 
+import "core:c"
 import "core:unicode/utf8"
 
 // CARET_GLYPH is a one-cell full block: it fills the cell it sits on, so it
@@ -56,6 +58,12 @@ CARET_GLYPH :: '█'
 
 // CARET_TEXT is the same glyph as a string, for the text element.
 CARET_TEXT :: "█"
+
+// CARET_ID_LABEL is the label the caret element's Clay id is derived from.
+// LOCAL means parented: inside an editor opened as `hs.tui.name.edit` the caret
+// is an element of its own, and a second editor in the same frame can never
+// collide with it.
+CARET_ID_LABEL :: "caret"
 
 // EDIT_MAX caps one line of input. Generous for a filter or a session name, and a
 // hard bound on what a single paste can put on screen.
@@ -67,16 +75,28 @@ Edit :: struct {
 	buf : [EDIT_MAX]u8,
 	len : int, // bytes in use
 	caret : int, // byte index, 0 <= caret <= len
+
+	// caret_id is CLAY'S OWN id for the caret element edit_paint laid out, and
+	// caret_laid_out says whether that happened in the frame currently being
+	// assembled. Whoever aims the real terminal cursor reads them back through
+	// edit_caret_cell after layout. The id is MINTED BY THE PAINT, so it can
+	// never name an element this frame did not draw.
+	caret_id       : clay.ElementId,
+	caret_laid_out : bool,
 }
 
 edit_init :: proc(e: ^Edit) {
 	e.len = 0
 	e.caret = 0
+	e.caret_id = clay.ElementId{}
+	e.caret_laid_out = false
 }
 
 edit_clear :: proc(e: ^Edit) {
 	e.len = 0
 	e.caret = 0
+	e.caret_id = clay.ElementId{}
+	e.caret_laid_out = false
 }
 
 edit_text :: proc(e: ^Edit) -> string {
@@ -367,8 +387,19 @@ edit_view :: proc(e: ^Edit, width: i32) -> Edit_View {
 }
 
 // edit_paint draws one line of editor as [prefix][caret][suffix]. All three are
-// ordinary Clay text elements, so the caret obeys whatever scissor the enclosing
+// ordinary Clay elements, so the caret obeys whatever scissor the enclosing
 // section is under.
+//
+// The caret is its OWN element rather than bare text, for two reasons:
+//
+//  * it carries its own background. The caret is a PAIR — a `caret_fg` glyph
+//    knocked out of a `caret_bg` block — and a bare text element has no
+//    background of its own. The block has to be a container whose
+//    backgroundColor is the caret's cell.
+//  * the caller can find it. Clay records the box it gave the caret; once the
+//    frame is laid out edit_caret_cell reads that box back and the real
+//    terminal cursor is aimed at the cell Clay itself chose. Nothing predicts
+//    the layout, so nothing can drift from it.
 edit_paint :: proc(e: ^Edit, id: string, width: i32, pal: ^Palette) {
 	v := edit_view(e, width)
 	if clay.UI(clay.ID(id))({
@@ -383,9 +414,72 @@ edit_paint :: proc(e: ^Edit, id: string, width: i32, pal: ^Palette) {
 		if len(v.prefix) > 0 {
 			clay.Text(v.prefix, clay.TextElementConfig{textColor = pal.fg})
 		}
-		clay.Text(CARET_TEXT, clay.TextElementConfig{textColor = pal.caret})
+		// ID_LOCAL parents the id to the open editor, so the caret of
+		// `hs.tui.name.edit` and the caret of `hs.tui.pick.filter` are two
+		// different elements even though both are labelled "caret".
+		cid := clay.ID_LOCAL(CARET_ID_LABEL)
+		e.caret_id = cid
+		e.caret_laid_out = true
+		if clay.UI(cid)({
+			layout = clay.LayoutConfig{
+				sizing = clay.Sizing{
+					width  = clay.SizingFixed(1),
+					height = clay.SizingFixed(1),
+				},
+				layoutDirection = clay.LayoutDirection.LeftToRight,
+			},
+			backgroundColor = pal.caret_bg,
+		}) {
+			clay.Text(CARET_TEXT, clay.TextElementConfig{textColor = pal.caret_fg})
+		}
 		if len(v.suffix) > 0 {
 			clay.Text(v.suffix, clay.TextElementConfig{textColor = pal.fg})
 		}
 	}
+}
+
+// edit_caret_cell returns the terminal CELL the caret occupies in the frame that
+// was just laid out, as CLAY reported it — not as anything here recomputed.
+//
+// False means "this frame has no caret to point at": the editor was never
+// painted, or Clay reported nothing for it. That is the caller's signal to HIDE
+// the terminal cursor rather than leave it parked on a cell from an older frame.
+edit_caret_cell :: proc(e: ^Edit) -> (x, y: i32, ok: bool) {
+	if !e.caret_laid_out {
+		return 0, 0, false
+	}
+	d := clay.GetElementData(e.caret_id)
+	if !d.found {
+		return 0, 0, false
+	}
+	r := render.snap_box(d.boundingBox)
+	if r.w <= 0 || r.h <= 0 {
+		return 0, 0, false
+	}
+	return r.x, r.y, true
+}
+
+// CARET_SHAPE_BLINK_BLOCK is DECSCUSR `ESC[3 q` — a BLINKING BLOCK cursor, the
+// shape that matches the painted block caret.
+//
+// Raw bytes because tb_send takes a `rawptr` and Odin will NOT coerce a string
+// literal into one (measured: `Cannot convert "\x1b[3 q" to 'rawptr'`).
+CARET_SHAPE_BLINK_BLOCK := []u8{0x1b, '[', '3', ' ', 'q'}
+
+// edit_place_cursor points the terminal's REAL cursor at the cell the caret was
+// painted into, and asks the terminal for a blinking block to match. Both bytes
+// go out on the frame's own flush — see the caller's note on ordering.
+//
+// This is the ONLY place the caret touches the terminal directly, and it moves
+// the cursor without drawing anything: the caret's CELLS still arrive through
+// Clay -> render.paint. Which editor owns the caret, and whether to hide the
+// cursor instead, is the caller's decision.
+edit_place_cursor :: proc(e: ^Edit) -> (x, y: i32, ok: bool) {
+	x, y, ok = edit_caret_cell(e)
+	if !ok {
+		return
+	}
+	tb.tb_set_cursor(x, y)
+	tb.tb_send(raw_data(CARET_SHAPE_BLINK_BLOCK), c.size_t(len(CARET_SHAPE_BLINK_BLOCK)))
+	return x, y, true
 }

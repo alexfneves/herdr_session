@@ -1054,11 +1054,20 @@ case_ui_edit :: proc() -> bool {
 		fmt.tprintf("bytes={} cells={} gap={}", len(expect), want_caret, i32(len(expect))-want_caret))
 
 	// 2. Find the caret's ACTUAL cell and prove it sits at the derived column.
-	caret_attr := paint_attr(g_pal.caret)
+	//    The caret is a PAIR (RCH-10 change 3): the block cell must carry BOTH
+	//    caret_fg (the glyph) and caret_bg (the cell it is knocked out of).
+	//    Matching on fg alone would let a caret painted over the wrong
+	//    background pass, which is not the requirement.
+	caret_fg_attr := paint_attr(g_pal.caret_fg)
+	caret_bg_attr := paint_attr(g_pal.caret_bg)
+	check("the caret glyph is the fat block U+2588, not the old thin bar U+258F",
+		ui.CARET_GLYPH == '█',
+		fmt.tprintf("CARET_GLYPH={}", glyph_name(ui.CARET_GLYPH)))
 	found := i32(-1)
 	x: i32 = 0
 	for x < cols {
-		if glyph_at(x, edit_y) == ui.CARET_GLYPH && cell_at(x, edit_y).fg == caret_attr {
+		c := cell_at(x, edit_y)
+		if c.ch == u32(ui.CARET_GLYPH) && c.fg == caret_fg_attr && c.bg == caret_bg_attr {
 			found = x
 			break
 		}
@@ -1086,6 +1095,18 @@ case_ui_edit :: proc() -> bool {
 	}
 	check("cells consumed by the typed glyphs == caret column (zero drift)",
 		walked == want_caret, fmt.tprintf("walked {} cells to reach the caret at {}", walked, want_caret))
+
+	// 2b. THE CARET REPORTS ITS OWN CELL. edit_caret_cell asks Clay for the box
+	//     it gave the caret element — that is the coordinate the real terminal
+	//     cursor is aimed at, so it must equal the cell the block was painted
+	//     into. If the two ever disagree, the cursor points somewhere the caret
+	//     is not.
+	ccx, ccy, ccok := ui.edit_caret_cell(&g_edit)
+	check("the caret element reported a cell of its own", ccok,
+		fmt.tprintf("ok={}", ccok))
+	check("…and that cell IS the painted caret cell (the cursor aims where the block is)",
+		ccx == found && ccy == edit_y,
+		fmt.tprintf("clay cell=({},{}) painted cell=({},{})", ccx, ccy, found, edit_y))
 
 	// 3. WHOLE-RUNE BACKSPACE.
 	ui.edit_backspace(&g_edit)
@@ -1160,6 +1181,66 @@ case_ui_edit :: proc() -> bool {
 	ui.edit_right(&g_edit)
 	check("one whole-rune step right lands on column 2 (the CJK rune's width)",
 		ui.edit_caret_col(&g_edit) == 2, fmt.tprintf("caret_col={}", ui.edit_caret_col(&g_edit)))
+
+	// 7. RIGHT-then-LEFT is an exact round trip at EVERY boundary, across a
+	//    string that mixes all three width classes: ASCII (1 cell), CJK (2
+	//    cells) and an astral emoji (2 cells). A byte-stepping caret would come
+	//    back on a different column every time it crossed a multi-byte rune; a
+	//    cell-blind caret would step one cell across a two-cell glyph.
+	ui.edit_clear(&g_edit)
+	ui.edit_paste(&g_edit, expect)
+	// a=1 世=2 b=1 😀=2 c=1 -> the caret column after each whole-rune step right
+	want_steps := [5]i32{1, 3, 4, 6, 7}
+	back := 0
+	for ui.edit_left(&g_edit) {
+		back += 1
+	}
+	check("five whole-rune steps LEFT reach column 0 and then stop",
+		back == 5 && ui.edit_caret_col(&g_edit) == 0,
+		fmt.tprintf("steps={} caret_col={}", back, ui.edit_caret_col(&g_edit)))
+
+	// Walk RIGHT rune by rune. At each boundary: step right, step left back over
+	// the same rune (must restore the column exactly), then step right again and
+	// confirm the caret is back on the column it had. Every boundary in the
+	// string gets the round trip, and the sequence of columns reached is itself
+	// the whole-rune-width evidence.
+	seen: [dynamic]i32
+	rt_ok := true
+	rt_detail := ""
+	for i := 0; i < 5; i += 1 {
+		from := ui.edit_caret_col(&g_edit)
+		ui.edit_right(&g_edit)
+		to := ui.edit_caret_col(&g_edit)
+		append(&seen, to)
+		ui.edit_left(&g_edit)
+		if ui.edit_caret_col(&g_edit) != from {
+			rt_ok = false
+			rt_detail = fmt.tprintf("{} step{}: right->{} then left->{} not {}", rt_detail, i+1,
+				to, ui.edit_caret_col(&g_edit), from)
+		}
+		ui.edit_right(&g_edit)
+		if ui.edit_caret_col(&g_edit) != to {
+			rt_ok = false
+			rt_detail = fmt.tprintf("{} step{}: re-right->{} not {}", rt_detail, i+1,
+				ui.edit_caret_col(&g_edit), to)
+		}
+	}
+	check("the forward walk crosses exactly the rune boundaries [1,3,4,6,7]",
+		len(seen) == 5 && seen[0] == want_steps[0] && seen[1] == want_steps[1] &&
+			seen[2] == want_steps[2] && seen[3] == want_steps[3] && seen[4] == want_steps[4],
+		fmt.tprintf("seen={} want={}", seen, want_steps[:]))
+	check("right-then-left at EVERY boundary restores the caret's derived column",
+		rt_ok, fmt.tprintf("{}buffer='{}'", rt_detail, ui.edit_text(&g_edit)))
+	check("…and the walk ends on the derived end column (display width, not bytes)",
+		ui.edit_caret_col(&g_edit) == want_caret,
+		fmt.tprintf("caret_col={} want={}", ui.edit_caret_col(&g_edit), want_caret))
+	// The caret DRIVES insertion: parked one rune from the end (col 6, just
+	// before the 'c'), a typed rune lands BEFORE the last rune.
+	ui.edit_left(&g_edit)
+	ui.edit_insert_rune(&g_edit, 'X')
+	check("typing at a caret parked mid-field inserts AT the caret",
+		ui.edit_text(&g_edit) == "a世b😀Xc",
+		fmt.tprintf("buffer='{}' caret_col={}", ui.edit_text(&g_edit), ui.edit_caret_col(&g_edit)))
 
 	dump_rows("edit field", 0, edit_y, cols, 1)
 	return !any_failed
