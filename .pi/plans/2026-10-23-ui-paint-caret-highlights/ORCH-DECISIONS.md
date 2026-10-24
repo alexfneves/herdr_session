@@ -9,7 +9,25 @@ record the contradiction loudly rather than silently deviating.**
 
 ## ACKS — planner pushed back on three orchestrator assumptions. All three accepted.
 
-### ACK-1 — D-M is WRONG as written. Use `run_hl` + `stop_hl`, not a single `state_hl`. (palette 13 → 19)
+### ACK-0 — Dispatch discipline from repeated agent failures (binding on every dispatch)
+
+**4 of the last 6 long-running agents in this session died without producing a result** (scout at 759m,
+scout at 6m, planner killed, worker at 523m). Consistent failure mode: **long runs read for hours and
+write nothing**, and with no commit the loss is total.
+
+Mitigation for every remaining dispatch:
+1. **One task per dispatch.** The last worker was told UIP-1 through 6, completed only UIP-1, died
+   mid-UIP-2 with 0 commits and lost ~8h.
+2. **Commit before you think.** Land the source change as soon as it builds; tests follow as a second
+   commit. Never hold unwritten work across a reasoning step.
+3. **WIP commits are fine.** A commit saying what is broken preserves the work. An empty tree preserves
+   nothing.
+4. **Resume beats restart** when the session still holds expensive computation — the palette values were
+   mid-derivation and would otherwise have to be recomputed from scratch.
+5. **Verify the tree, not the report.** `git rev-list --count main..HEAD` plus
+   `git status --porcelain -uall` settles in one command whether anything survived.
+
+## ACK-1 — D-M is WRONG as written. Use `run_hl` + `stop_hl`, not a single `state_hl`. (palette 13 → 19)
 
 A single `state_hl` makes **selected-running and selected-stopped render identically** — which is
 precisely the flattening that change 5 forbids. One colour cannot preserve a distinction it is supposed
