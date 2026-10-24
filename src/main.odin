@@ -1154,8 +1154,7 @@ session_body :: proc(l: ui.Frame_Layout) {
 	} else {
 		tui.caret_src = nil
 	}
-	chrome: i32 = 1 // the column header
-	if show_filter { chrome += 1 }
+	chrome := ui.sessions_chrome(show_filter)
 	body := l.main_rows - chrome
 	if body < 1 { body = 1 }
 	ui.sessions_clamp(&tui.sess, rows, body)
@@ -1179,6 +1178,11 @@ picker_body :: proc(l: ui.Frame_Layout, rows: []ui.Picker_Row) {
 	w := l.cols - 2
 	if w < 8 { w = 8 }
 	ui.edit_paint(&tui.filter_ed, "hs.tui.pick.filter", w, &tui.pal)
+	// RCH-10 change 1, picker half. "Wherever the filter line is drawn" means
+	// BOTH filter surfaces -- the one in the sessions table and this one -- and a
+	// rule under only the first would make the two filters look like different
+	// features. Same element, same id-scheme, same row price.
+	ui.frame_rule("hs.tui.pick.filter.rule", &tui.pal)
 
 	// The machine already decided which rows pass the filter; the view needs those
 	// indices so its scroll/selection arithmetic lines up. Note the binding:
@@ -1188,7 +1192,7 @@ picker_body :: proc(l: ui.Frame_Layout, rows: []ui.Picker_Row) {
 	for idx, _ in tui.machine.shown { append(&tui.list.shown, idx) }
 	tui.list.sel = tui.machine.sel
 
-	visible := l.main_rows - 1
+	visible := l.main_rows - ui.RULED_SURFACE_ROWS
 	if visible < 1 { visible = 1 }
 	tui.list.scroll = ui.keep_visible(tui.list.scroll, i32(len(rows)), visible, i32(tui.list.sel))
 	ui.list_paint(&tui.list, rows, l.cols, visible, &tui.pal)

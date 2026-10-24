@@ -251,6 +251,84 @@ is_rule_glyph :: proc(ch: rune) -> bool {
 	return ch == '─' || ch == '━' || ch == '╌'
 }
 
+// row_is_rule reads one row off the grid and reports how many cells carry the
+// horizontal rule glyph, and how many carry anything that is NOT a rule glyph
+// (blank cells excluded -- a rule row is allowed to be blank only where the
+// rule itself did not paint).
+//
+// This is the rendered-property model `rh_rule_count` uses in the resize IT
+// tier (tests/it/resize_harness.odin): it asks what the terminal SHOWS, not
+// which Clay call produced it. That distinction is the whole point of D-N -- a
+// rule drawn by a betweenChildren fill-rect and a rule drawn by a dedicated
+// border element are the same thing to the user and different things to
+// render.Stats, so only the grid gets to settle the assertion.
+row_is_rule :: proc(y: i32, cols: i32) -> (ruled: int, content: int) {
+	ruled = 0
+	content = 0
+	x: i32 = 0
+	for x < cols {
+		ch := glyph_at(x, y)
+		if ch == '─' {
+			ruled += 1
+		} else if ch != 0 && ch != ' ' {
+			content += 1
+		}
+		x += 1
+	}
+	return ruled, content
+}
+
+// rendered_rule_rows lists every row of the screen that is rule-only, i.e.
+// made of nothing but horizontal rule glyphs. Mechanism-independent.
+rendered_rule_rows :: proc(rows, cols: i32) -> [dynamic]i32 {
+	out: [dynamic]i32
+	y: i32 = 0
+	for y < rows {
+		ruled, content := row_is_rule(y, cols)
+		if ruled == int(cols) && content == 0 {
+			append(&out, y)
+		}
+		y += 1
+	}
+	return out
+}
+
+// row_is_blank: nothing at all painted on the row.
+row_is_blank :: proc(y: i32, cols: i32) -> bool {
+	x: i32 = 0
+	for x < cols {
+		ch := glyph_at(x, y)
+		if ch != 0 && ch != ' ' {
+			return false
+		}
+		x += 1
+	}
+	return true
+}
+
+// rule_at asserts the single property every rule assertion in this file needs:
+// row `y` is a full-width rule row and holds no content. Falsifiable in both
+// directions -- a rule that failed to draw reads ruled<cols, and a rule the
+// product dropped or misplaced reads as a row that is not rule-only.
+rule_at :: proc(y: i32, cols: i32) -> bool {
+	ruled, content := row_is_rule(y, cols)
+	return ruled == int(cols) && content == 0
+}
+
+// rows_csv renders a row list for a failure detail.
+rows_csv :: proc(rs: []i32) -> string {
+	if len(rs) == 0 {
+		return "(none)"
+	}
+	buf: [dynamic]byte
+	// Odin gotcha: `for v, i in slice` yields VALUE then INDEX.
+	for r, i in rs {
+		if i > 0 { append(&buf, ',') }
+		push_str(&buf, fmt.tprintf("{}", r))
+	}
+	return string(buf[:])
+}
+
 // grid_snapshot grabs the visible grid so a later frame can be diffed against
 // "what was on the screen before".
 grid_snapshot :: proc(cols, rows: i32) -> []rune {
@@ -499,6 +577,49 @@ case_ui_frame :: proc() -> bool {
 	check("the two dividers are on different rows",
 		l.rule_bot != l.rule_top, fmt.tprintf("rule rows {} and {}", l.rule_top, l.rule_bot))
 
+	// 2b. RCH-10 CHANGE 1 -- the rule directly under the filter.
+	//
+	// The filter line is MAIN's first row, so its rule is MAIN's second. Both
+	// halves are asserted because each half alone can pass on the wrong row: a
+	// full-width rule somewhere proves nothing about WHERE, and "filter: is on
+	// some row" proves nothing about the rule. Together they pin the pair.
+	filter_row := l.main_y
+	filter_rule_row := l.main_y + ui.RULE_ROWS
+	_, filter_content := row_is_rule(filter_row, cols)
+	check("change 1: the filter line is painted, not overwritten by its own rule",
+		filter_content > 0 && str_contains_ignore_case(line_of(filter_row, cols), "filter:"),
+		fmt.tprintf("row {} = '{}' (want the filter line)", filter_row,
+			trim(line_of(filter_row, cols))))
+	check("change 1: a full-width rule sits DIRECTLY under the filter line",
+		rule_at(filter_rule_row, cols),
+		fmt.tprintf("row {} below the filter at {} -> ruled row? {}",
+			filter_rule_row, filter_row, rule_at(filter_rule_row, cols)))
+	check("change 1: the filter's rule is a row apart from the header rule",
+		filter_rule_row != l.rule_top,
+		fmt.tprintf("filter rule {} header rule {}", filter_rule_row, l.rule_top))
+
+	// 2c. EVERY RULE THE SCREEN SHOWS, AND NOTHING ELSE. The rendered rule rows
+	//     must be EXACTLY the set the layout predicts. This is the check that
+	//     catches a rule appearing somewhere nobody asked for it, and (equally
+	//     important) catches one going missing while the positional checks above
+	//     still pass because `l` moved with the bug.
+	seen_rules := rendered_rule_rows(rows, cols)
+	want_rules: [dynamic]i32
+	append(&want_rules, l.rule_top)
+	append(&want_rules, filter_rule_row)
+	append(&want_rules, l.rule_bot)
+	sort.quick_sort_proc(seen_rules[:], proc(a, b: i32) -> int { return int(a - b) })
+	sort.quick_sort_proc(want_rules[:], proc(a, b: i32) -> int { return int(a - b) })
+	same_rule_set := len(seen_rules) == len(want_rules)
+	if same_rule_set {
+		for a, i in seen_rules {
+			if a != want_rules[i] { same_rule_set = false }
+		}
+	}
+	check("the rule rows on screen are exactly the rule rows the frame lays out",
+		same_rule_set,
+		fmt.tprintf("rendered=[{}] expected=[{}]", rows_csv(seen_rules[:]), rows_csv(want_rules[:])))
+
 	// 5. THE childGap >= 2 INVARIANT. With childGap = 1 the betweenChildren rule
 	//    resolves onto the FOLLOWING section's first row and paints over its
 	//    content. This is the assertion that fails loudly if FRAME_GAP is lowered.
@@ -691,17 +812,35 @@ case_ui_frame :: proc() -> bool {
 			i32(hd.boundingBox.height) == ui.HEADER_ROWS && i32(fd.boundingBox.height) == ui.FOOTER_ROWS,
 		fmt.tprintf("header y={} footer y={}", i32(hd.boundingBox.y), i32(fd.boundingBox.y)))
 
-	// 9. The lines arrived as Clay geometry, not as hand-drawn glyphs. Exactly
-	//    one border render call exists, and it is the container's betweenChildren
-	//    registration (the dividers' source), not a box: the perimeter assertion
-	//    above is what proves no outer edge was painted.
-	st := scene.last
-	check("the two dividers came from Clay's command stream", st.rules >= 2,
-		fmt.tprintf("rules={} rects={}", st.rules, st.rects))
-	check("exactly one border call, registered as the divider source (RCH-1)",
-		st.borders == 1, fmt.tprintf("borders={} (0 would mean no divider source)", st.borders))
-	check("no cell errors while painting the frame", st.cell_error == 0,
-		fmt.tprintf("cell_error={}", st.cell_error))
+	// 9. The lines arrived as Clay geometry, not as hand-drawn glyphs.
+	//
+	// ── A LANDED ASSERTION CHANGED *BY DESIGN* (D-N) ────────────────────
+	// This used to read:
+	//
+	//     check("the two dividers came from Clay's command stream", st.rules >= 2, …)
+	//     check("exactly one border call, registered as the divider source", st.borders == 1, …)
+	//
+	// Both asserted WHICH Clay internal painted the line, not what the user
+	// sees. `Stats.rules` counts `draw_rule` calls from the betweenChildren
+	// fill-rect path; a rule drawn by `render_border`'s bottom side counts as a
+	// BORDER. RCH-10 changes 1/2/6 move every rule onto dedicated one-row
+	// border elements, so as this lands: `rules` falls to 0 and `borders`
+	// becomes the count of rule ELEMENTS. Said out loud: the first of those two
+	// numbers going to zero is the intended result, not a regression, and a
+	// check that pinned it at >= 2 would have to be broken by this change.
+	//
+	// They are replaced by the rendered-property pair above (2c: the set of
+	// rule-only rows is exactly the set the frame lays out) plus the
+	// command-stream-source check below, which is the property the old pair was
+	// reaching for without naming the mechanism.
+	check("every rendered rule row has a command-stream source (nothing hand-painted)",
+		int(scene.last.borders)+int(scene.last.rules) >= len(seen_rules),
+		fmt.tprintf("borders={} rules={} rendered_rule_rows={} ({}; rows {})",
+			scene.last.borders, scene.last.rules, len(seen_rules),
+			"rules=0 is expected once every rule is a dedicated element",
+			rows_csv(seen_rules[:])))
+	check("no cell errors while painting the frame", scene.last.cell_error == 0,
+		fmt.tprintf("cell_error={}", scene.last.cell_error))
 
 	// 10. Alpha is never an identity tag: every palette colour is opaque, so the
 	//     only thing alpha can mean in this renderer is "don't paint".
@@ -753,8 +892,8 @@ case_ui_sessions :: proc() -> bool {
 	}
 	cols := scene.f.cols
 	l := scene.l
-	body := l.main_rows - 2 // filter line + column header line
-	first := l.main_y + 2
+	body := l.main_rows - ui.sessions_chrome(true) // filter line + its rule + column header
+	first := ui.sessions_first_row(l, true)
 
 	scene.mode = .sessions
 	scene.v = &g_sessions
@@ -767,7 +906,7 @@ case_ui_sessions :: proc() -> bool {
 	check("filter starts empty", ui.edit_is_empty(&g_sessions.filter),
 		fmt.tprintf("filter='{}'", ui.edit_text(&g_sessions.filter)))
 
-	head_row := l.main_y + 1
+	head_row := first - 1 // the column header sits directly above the first row
 	head := line_of(head_row, cols)
 	check("column header lists device / timestamp / state / name",
 		str_contains_ignore_case(head, "device") && str_contains_ignore_case(head, "timestamp") &&
@@ -995,12 +1134,12 @@ case_ui_shrink :: proc() -> bool {
 	g_sessions.sel = app.selection_of(&ordered[last])
 
 	l := scene.l
-	body := l.main_rows - 2
+	body := l.main_rows - ui.sessions_chrome(true)
 	scene.mode = .sessions
 	scene.v = &g_sessions
 	scene.rows = ordered
 	scene.body = body
-	scene.first = l.main_y + 2
+	scene.first = ui.sessions_first_row(l, true)
 
 	ui.sessions_clamp(&g_sessions, ordered, body)
 	say(fmt.tprintf("  before: {}x{} body={} sel='{}'/'{}' scroll={}",
@@ -1021,8 +1160,8 @@ case_ui_shrink :: proc() -> bool {
 	scene.f.rows = rr
 	l2 := ui.frame_layout(cc, rr)
 	scene.l = l2
-	body2 := l2.main_rows - 2
-	first2 := l2.main_y + 2
+	body2 := l2.main_rows - ui.sessions_chrome(true)
+	first2 := ui.sessions_first_row(l2, true)
 	check("the window really got smaller", body2 < body && cc < old_cols && rr < old_rows,
 		fmt.tprintf("cols {} -> {}, rows {} -> {}, body {} -> {}",
 			old_cols, cc, old_rows, rr, body, body2))
@@ -1063,7 +1202,7 @@ case_ui_shrink :: proc() -> bool {
 	scene.f.rows = rr2
 	l3 := ui.frame_layout(cc2, rr2)
 	scene.l = l3
-	body3 := l3.main_rows - 2
+	body3 := l3.main_rows - ui.sessions_chrome(true)
 	ui.sessions_clamp(&g_sessions, ordered, body3)
 	check("after a second shrink the selection is still the SAME session",
 		g_sessions.sel.name == ordered[last].name && g_sessions.sel.device == ordered[last].device,
@@ -1074,7 +1213,7 @@ case_ui_shrink :: proc() -> bool {
 	check("the new window is genuinely tiny (so the clamp is doing real work)",
 		body3 <= 4, fmt.tprintf("body3={}", body3))
 	scene.body = body3
-	scene.first = l3.main_y + 2
+	scene.first = ui.sessions_first_row(l3, true)
 	paint_scene()
 	dump_rows("shrunk frame", 0, 0, min(60, cc2), min(12, rr2))
 	return !any_failed
@@ -1528,7 +1667,7 @@ case_ui_float :: proc() -> bool {
 	cols := scene.f.cols
 	rows := scene.f.rows
 	l := scene.l
-	body := l.main_rows - 2
+	body := l.main_rows - ui.sessions_chrome(true)
 
 	ordered := sorted_rows(fixture_rows())
 	defer delete(ordered)
@@ -1538,7 +1677,7 @@ case_ui_float :: proc() -> bool {
 	scene.v = &g_sessions
 	scene.rows = ordered
 	scene.body = body
-	scene.first = l.main_y + 2
+	scene.first = ui.sessions_first_row(l, true)
 	paint_scene()
 	snap := grid_snapshot(cols, rows)
 	defer delete(snap)

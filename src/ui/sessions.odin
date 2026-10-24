@@ -68,6 +68,7 @@ SESS_COL_GAP :: 1 // no borders inside a row, so a 1-cell gap is safe here
 SESS_COLS_N :: 4
 
 SESS_HEADER_FILTER_ID :: "hs.sessions.filter"
+SESS_FILTER_RULE_ID :: "hs.sessions.filter.rule" // RCH-10 change 1
 SESS_HEADER_ROW_ID :: "hs.sessions.head"
 SESS_BODY_ID :: "hs.sessions.body"
 
@@ -129,6 +130,29 @@ sessions_init :: proc(v: ^Sessions) {
 	v.sel = app.NO_SELECTION
 	v.scroll = 0
 	v.show_filter = true
+}
+
+// sessions_chrome is the number of MAIN rows the table spends ABOVE its
+// scrolled body: the column header, plus the ruled filter surface (the filter
+// line AND the rule under it) in the states that display one.
+//
+// This exists so no consumer hardcodes the 2 again. Before change 1 the filter
+// cost one row and every caller wrote `- 2`; change 1 added a rule row under it,
+// so a hardcoded 2 would now hand the table a row that the rule is standing on
+// -- the phantom-row class of bug, just moved down one line.
+sessions_chrome :: proc(show_filter: bool) -> i32 {
+	chrome : i32 = 1 // the column header
+	if show_filter {
+		chrome += RULED_SURFACE_ROWS
+	}
+	return chrome
+}
+
+// sessions_first_row is the screen row of the table's first data row. The
+// smoke cases assert against a row index read off the grid, so they must derive
+// it the same way the view lays it out rather than adding their own constants.
+sessions_first_row :: proc(l: Frame_Layout, show_filter: bool) -> i32 {
+	return l.main_y + sessions_chrome(show_filter)
 }
 
 // ── filtering ──────────────────────────────────────────────────────────────
@@ -220,6 +244,19 @@ sessions_paint :: proc(v: ^Sessions, rows: []app.Session, avail: i32, body_rows:
 			// paste. It starts empty, which shows every row.
 			edit_paint(&v.filter, "hs.sessions.filter.edit", avail-8, pal)
 		}
+		// RCH-10 CHANGE 1 -- the separation line below the filter.
+		//
+		// The rule is a dedicated element OUTSIDE the filter's own box, placed
+		// immediately after it in MAIN's vertical stack. Two reasons it is done
+		// this way rather than as a border on the filter row itself:
+		//
+		//  * The filter row is a LeftToRight container whose height is fixed at
+		//    1. A bottom border on it would be drawn ON the filter's own last
+		//    row, over the input, not under it.
+		//  * A separate element is a row that the ROW ACCOUNTING can see. It is
+		//    charged to RULED_SURFACE_ROWS, which `session_body` reads, so the
+		//    table below shrinks by exactly one row and never paints over it.
+		frame_rule(SESS_FILTER_RULE_ID, pal)
 	}
 
 	// ── column header ──

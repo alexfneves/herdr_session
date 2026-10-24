@@ -81,6 +81,41 @@ MAIN_ID :: "hs.frame.main"
 FOOTER_ID :: "hs.frame.footer"
 FOOTER_HINTS_ID :: "hs.frame.footer.hints"
 
+// RULED_SURFACE_ROWS is the price of a RULED SURFACE: one row of content with
+// a dedicated rule element directly underneath it. The filter line and the
+// single-line edit field are both ruled surfaces (RCH-10 changes 1 and 2), and
+// every consumer that counts rows inside MAIN must price them the same way --
+// a surface counted as one row is a row the table then paints OVER its rule.
+RULED_SURFACE_ROWS :: 1 + RULE_ROWS
+
+// frame_rule draws one dedicated rule: an element exactly RULE_ROWS tall whose
+// ONLY decoration is a 1-cell bottom border in the palette's border colour.
+//
+// The reason a dedicated element exists rather than another use of Clay's
+// `betweenChildren` fill-rect is placement. A betweenChildren rule is
+// positioned by Clay from the gap it shares with its neighbours
+// (`rule_y = child_top - floor(childGap/2) - floor(between/2)`), so its row
+// is a function of a knob that also moves content -- which is why closing the
+// blank row by lowering the gap makes the rule overwrite the next section.
+// A dedicated element owns its own row: it is laid out by the same vertical
+// stack as everything else, cannot be moved by a gap, and cannot land on a
+// glyph. Its rule is the bottom side of its own box.
+frame_rule :: proc(id: string, pal: ^Palette) {
+	if clay.UI(clay.ID(id))({
+		layout = clay.LayoutConfig{
+			sizing = clay.Sizing{
+				width  = clay.SizingGrow(),
+				height = clay.SizingFixed(RULE_ROWS),
+			},
+		},
+		border = clay.BorderElementConfig{
+			color = pal.border,
+			width = clay.BorderWidth{bottom = 1},
+		},
+	}) {
+	}
+}
+
 // Frame_Layout is the cell box the frame hands to its sections. Every field is
 // absolute (terminal coordinates) so a view can assert against a back-buffer
 // position without re-deriving anything.
