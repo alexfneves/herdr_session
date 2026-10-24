@@ -1,62 +1,100 @@
-# KNOWN DEFECT — pty screen emulator drops an in-flight UTF-8 sequence on resize
+# pty screen emulator and UTF-8 / escape-state across a resize
 
-**Found by:** the flood lane (`resize_flood` frame check), reported in its final report, corroborated by the orchestrator.
-**Location:** `tests/pty/screen.odin` — `screen_resize` → `screen_init`, `carry_len = 0` (`:98`).
-**Severity:** harness-only. Causes a ~2% flake in any suite that resizes while the app is mid-glyph. **No product bug.**
+**Status: the byte-loss defect described below is FIXED** (`f9573cd`, folded `pty_screen` 73 → 163).
+**Status: a SIBLING defect in the same file is OPEN** — see *Sibling defect* near the bottom.
 
-## Symptom
+---
+
+## FIXED — an in-flight UTF-8 sequence was lost across `screen_resize`
+
+**Found by:** the flood lane (`resize_flood` frame check). **Fixed by:** the pty lane, `f9573cd`.
+**Was harness-only. No product bug.**
+
+### Symptom (as it read before the fix)
 
 `the surviving frame is the FINAL size, not a stale one — spine widths lo=118 hi=118 want 118
 (last request 25x118, rules=1, settled=true)`
 
-The width is **correct**. What is wrong is the rule count: the row holds 115 correct `─` glyphs plus
-**3 × U+FFFD**, so `rh_is_rule` rejects the row and `rules` reads 1 instead of 2. The check therefore
-reports "stale frame" when the frame is fine and the *emulator* lost bytes.
+The width was **correct**. What was wrong is the rule count: the row held 115 correct `─` glyphs plus
+**3 × U+FFFD**, so `rh_is_rule` rejected the row and `rh_rule_count` read 1 where the app drew 2 —
+"stale frame" reported about a frame that was fine.
 
-## Mechanism (verified in code)
+### Mechanism
 
 ```
 screen_resize(s, rows, cols)  ->  screen_init(s, rows, cols)  ->  s.carry_len = 0
 ```
 
-`carry` holds a UTF-8 sequence split across `feed()` calls (`screen.odin:78-81`). A resize arriving in
-the middle of a multi-byte glyph discards the partial sequence. The continuation bytes that arrive next
-are then decoded without their lead byte and land in the grid as `U+FFFD`.
+`carry` / `carry_len` hold a UTF-8 sequence split across `feed()` calls. A resize arriving mid-glyph
+discarded the partial sequence; its continuation bytes then decoded with no lead byte and landed as
+`U+FFFD`. A 2-byte split → 1 replacement char, 3-byte → 2, **4-byte astral → 3** (exactly the reported
+signature).
 
-The lane's isolation test: whole glyph → clean · split glyph, **no** resize → clean ·
-split glyph **+** resize → `"\ufffd\ufffdCD"`.
+### Two loss paths, not one
 
-**The app is exonerated directly:** in real failing reps the driver's `raw` byte stream contained
-**0 orphan continuation bytes** — the app wrote well-formed UTF-8 and the emulator lost it.
+The brief described only the first. The lane found a **second, independent** instance of the same class
+inside `screen_feed`'s 4096-byte working-buffer flush: the flush stashed an unfinished sequence into
+`carry` and kept decoding the same feed — but `carry` is only **prepended at the start of a feed**, so
+continuation bytes further down the buffer decoded as orphans and `carry` stayed dirty, corrupting the
+*next* feed too. A full termbox frame exceeds 4096 bytes, so this fired on **every repaint**.
 
-## Rate (measured, pre-existing)
+That is why fixing only the resize path was not enough — measured:
 
-| binary | failing storms | rate |
-|---|---|---|
-| pre-change (`792a350` era) | 3 / 120 | 2.5% |
-| post-change (d.1 merged) | 7 / 320 | 2.2% |
+| tree | storms | frame-check failures | rate |
+|---|---|---|---|
+| pre-fix | 192 | 2 | 1.04% |
+| carry/resize fix **only** | 96 | 2 | **2.08% — not sufficient** |
+| **both fixes** | 288 (lane) / **64 (orchestrator, post-merge)** | **0** | **0.00%** |
 
-Same rate before and after the flood reformulation. The check text itself is byte-identical to the
-pre-change version (md5 `ac988a…`), so this is **not** a consequence of the invariant work — the
-flood lane just ran enough storms to see it.
+### Why the fix is shaped this way
 
-## Fix
+A partial sequence belongs to the **byte stream**, not to the grid — it has no cell yet, so there is no
+reflow rule to invent. Resize blanks the grid (unchanged, python-faithful) and hands the pending bytes
+straight back. `screen_init` stays a full reset including `carry`, because it is the **construction**
+path: `pty_spawn` (one fresh driver per scenario) and every test-built `Screen`. A carry surviving
+between scenarios would be cross-talk between unrelated byte streams.
 
-Preserve `carry` (and `carry_len`) across `screen_resize` — the partial sequence belongs to the byte
-stream, not to the screen geometry, so a resize must not consume it. Grid contents legitimately reset
-(no reflow rule invented); the carry buffer must not.
+**The wrong fix, explicitly rejected:** loosening `rh_is_rule` to tolerate `U+FFFD`. That hides a real
+emulator defect behind a widened matcher and lets genuinely corrupt rule rows pass. The emulator has to
+satisfy the matcher **as-is** — the new spine test ships a byte-exact local mirror of it for that reason.
 
-**Do not** "fix" it by making `rh_is_rule` tolerate U+FFFD — that hides a real emulator defect behind
-a widened matcher and would let genuinely corrupt rule rows pass.
+---
 
-## Falsifiable test required with the fix
+## OPEN — SIBLING DEFECT: a resize mid-ESCAPE resets parser state, so surviving escape bytes paint as text
 
-Feed a multi-byte glyph split across a `screen_resize` boundary and assert the glyph is intact in the
-grid afterwards — and that the same split **without** a resize still works (control). State how the
-test fails against the current code.
+Found by the same lane while verifying. **Deliberately not changed** — same class, wider blast radius,
+one-line extension away (preserve `state` / `csi_buf` / `csi_len` exactly as `carry` now is), but it is a
+separate change with its own falsification and should be scheduled rather than tacked on.
 
-## Why this matters beyond one flake
+| where the resize lands | what the emulator does today |
+|---|---|
+| mid-ESC | `[2;3HWORLD` painted as literal text → `row0='[2;3HWORLD'` |
+| mid-CSI params | `row0='3HAGAIN'` — the parameters paint as text |
+| mid-CSI digit | the CUP is destroyed; `Z` lands at col 0 instead of col 3 |
+| mid-OSC | **window title leaks onto the grid**: `row0='tle:secret cd'` |
+| mid-`ESC (` | `'Bion'` — the exact charset-smear class this emulator exists to prevent |
 
-Every suite that resizes during paint (resize tier, and anything driving a drag) inherits this. At ~2%
-per storm, a lane running 8-storm sets will hit it roughly once every 6 runs, which is exactly the kind
-of low-rate noise that gets a real check widened or disabled by the next person who hits it.
+**Why it matters more than the carry bug:** the carry bug corrupted a glyph. This puts **control-sequence
+bytes on the screen as content** — including an OSC payload (window title). Any suite that drives resizes
+while the app is mid-escape can read a row that never existed, and a mid-OSC leak could surface a string
+in a frame assertion that was never meant to be visible content.
+
+**Probe preserved by the lane:** `/tmp/csi_probe_preserved_for_dispatch.odin` (`csi_probe_preserved_for_report.odin`
+in the lane report) — reproduce before scheduling.
+
+**Fix shape:** preserve the escape-parser state across `screen_resize` the same way `carry` is preserved.
+Required falsification per row of the table above, plus the control that a resize with no pending escape
+still blanks normally.
+
+---
+
+## Invocation note (cost a debugging cycle)
+
+The pty test binary **must** be built with `-define:ODIN_TEST_THREADS=1`. Without it two pre-existing
+tests fail — `driver_timing_requires_a_single_threaded_runner` and an fd-leak check — which reads as a
+regression introduced by whatever you just changed. With it, the baseline is green.
+
+```sh
+odin build ./tests/pty -build-mode:test -define:ODIN_TEST_THREADS=1 \
+     -define:ODIN_TEST_JSON_REPORT=/tmp/pty.json -out:/tmp/bin_pty
+```
