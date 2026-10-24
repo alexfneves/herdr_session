@@ -3,6 +3,39 @@
 > **HARD LIMIT: maximum 3 concurrent agents at any time (halogen is a local LLM).**
 > Count before every spawn. Do not spawn a fourth — wait instead.
 
+> **HARD RULE — NO NEW PYTHON. ANYWHERE. INCLUDING SCRATCH TOOLING.**
+>
+> The goal of this project is migrating python/bash → **Odin**. Writing new Python works against that
+> goal even when it never gets committed. Explicitly banned:
+> - new `.py` files in the repo or any worktree
+> - throwaway `/tmp/*.py` scripts for measurement, tally parsing, colour computation, verification,
+>   or "just this one check"
+> - `python -c` one-liners used to parse test output
+> - shell/awk/sed pipelines used to reimplement something an Odin tool already does
+>
+> **Use Odin instead — the tooling already exists:**
+> - Tally parsing / parity / gate verdicts → **`tests/tools/hscheck`** (already Odin; it reads the
+>   `HS_TALLY` lines and the JSON report and enforces every floor rule). Do not re-parse that output
+>   in another language.
+> - Screen / cell / colour inspection → the **`tests/pty`** driver + `tb_get_cell(back = 1)`.
+> - One-off computation (colour derivation, arithmetic, string shaping) → a small Odin program or
+>   `@(test)` in the test tree, or just reason it out and put the literal in the source with a comment.
+>   If a value needs a solver, the value is wrong or the design is.
+> - Capturing a pty stream for eyeball checks → a tiny Odin program using the existing pty FFI, not a
+>   script.
+>
+> Existing `dev/*.py` and `dev/*.sh` are the **migration source**, not a licence to add more.
+> They get deleted at T17; nothing new joins them.
+>
+> > **If Python is genuinely needed, STOP AND CONSULT THE USER.** This is now a project requirement
+> (`docs/requirements.md` → "Odin for everything"), not just a dispatch rule. Do not assume a
+> throwaway script is harmless: state what is needed, why Odin cannot do it, and wait for a decision.
+
+**Why this is hard and not stylistic:** an agent that reaches for Python solves the immediate problem
+> and leaves behind code that must later be migrated, plus a habit that spreads to the next task. The
+> migration is not finished when the old files are deleted — it is finished when nobody is writing new
+> non-Odin code.
+
 Made by the orchestrator. The user is unavailable and explicitly delegated all decisions.
 **These bind the planner and all workers. Do not re-litigate them; if one is actually wrong,
 record the contradiction loudly rather than silently deviating.**
