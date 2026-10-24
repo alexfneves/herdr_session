@@ -386,6 +386,63 @@ body_empty :: proc(ev: ^termbox2.Event) {
 	_ = ev
 }
 
+// half_hint_pieces counts the pieces of a rendered footer line that are NOT
+// whole `Description: key` units. Used by the two 7b retention blocks below.
+//
+// WHY THE OLD VERSION STOPPED TESTING ANYTHING (UIP-5).
+// It split the line on TWO SPACES, because that is what the pre-AD-1 footer
+// joined on. The footer now joins on ` | ` — one space, pipe, one space — so
+// the split found no separator at all, handed the WHOLE LINE back as a single
+// piece, and the test `!contains(p, " ")` could not fire because a
+// `Theme: t`-shaped piece always contains a space. The check went green while
+// asserting nothing, which is worse than red: it looks like coverage from the
+// outside and protects nothing from the inside.
+//
+// It splits on the UNIT SEPARATOR now, and asks a question that can actually
+// fail against the new atom.
+half_hint_pieces :: proc(line: string) -> int {
+	parts, _ := strings.split(line, ui.SEP)
+	partial := 0
+	for p in parts {
+		if p == "" || p == ui.CUT_MARKER { continue } // the front-cut marker stays legal
+		if !hint_seam_ok(p) { partial += 1 }
+	}
+	return partial
+}
+
+// hint_seam_ok: the `: ` seam must be present, something must PRECEDE it (a
+// piece that starts at the seam is a bare key whose description was cut
+// away), and a NON-SPACE byte must FOLLOW it.
+//
+// `contains(p, ": ")` alone is not enough and this is the reason: "Attach: "
+// contains the seam — the space survived, the key did not — and a
+// containment-only test would call that whole. It is the exact half-unit the
+// predicate exists to catch, so the rule is about what sits on both sides of
+// the seam rather than the seam's presence.
+hint_seam_ok :: proc(p: string) -> bool {
+	b := transmute([]u8)(p)
+	// No `…` inside a unit piece. The ellipsis belongs only to the front-cut
+	// marker, which never reaches here because the caller skips it as its own
+	// piece; a `…` inside a piece means THAT piece was truncated. Without this
+	// the seam rule cannot see a shaved key — `Quit: e…` has a description, a
+	// seam and a non-space byte after it, and its key is `esc` worn down to
+	// `e`. (Identical rule to kh_is_whole_unit in
+	// tests/unit/keyhints_test.odin; the two copies live in different packages
+	// and MUST stay equivalent.)
+	for i := 0; i + 2 < len(b); i += 1 {
+		if b[i] == 0xE2 && b[i+1] == 0x80 && b[i+2] == 0xA6 { return false }
+	}
+	seam := -1
+	for k := 0; k + 1 < len(b); k += 1 {
+		if b[k] == ':' && b[k+1] == ' ' { seam = k; break }
+	}
+	if seam <= 0 { return false } // absent, or the description was cut away
+	for j := seam + 2; j < len(b); j += 1 {
+		if b[j] != ' ' { return true } // something is left of the seam: the key
+	}
+	return false // `Attach: ` — seam with nothing but space after it
+}
+
 case_ui_frame :: proc() -> bool {
 	say("case ui-frame — T5.1: spine, outer border, section rules, title, footer")
 	if !bring_up() {
@@ -537,25 +594,37 @@ case_ui_frame :: proc() -> bool {
 		check(fmt.tprintf("KEYS_MODE at {} cols still shows the exit hint `{} {}`", w, last.key, last.action),
 			str_contains_ignore_case(line, last.key) && str_contains_ignore_case(line, last.action),
 			fmt.tprintf("footer = '{}'", line))
-		// `t theme` must survive whenever the width could physically hold it next
-		// to the exit hint. Below that it is arithmetic, not policy, so it is not
-		// asserted — the point of the check is that theme and quit are the LAST
-		// things to go, not that they fit in ten columns.
-		theme_w := ui.text_cols("t theme")
-		quit_w := ui.text_cols("esc quit")
-		if w >= theme_w + 2 + quit_w {
-			check(fmt.tprintf("KEYS_MODE at {} cols still shows `t theme`", w),
-				str_contains_ignore_case(line, "theme"),
-				fmt.tprintf("need={} got='{}'", theme_w + 2 + quit_w, line))
-		}
+		// THE `Theme: t` THRESHOLD, RE-DERIVED (AD-3).
+		// The literals this used to guard on — `ui.text_cols("t theme")`,
+		// `ui.text_cols("esc quit")` and a `+ 2` for the two-space SEP the
+		// footer no longer uses — are stale BY CONSTRUCTION under
+		// `Description: key` units joined by ` | `. What is actually required
+		// comes from the product's own width helpers: the theme unit, the exit
+		// unit, the join between them, plus the front-cut marker and ITS join
+		// (paid for because hints still sit to the theme hint's left):
+		// 8 + 9 + 3 + (1 + 3) = 24 cells.
+		//
+		// AND IT IS ASSERTED AT EVERY WIDTH, NOT ONLY ABOVE THE THRESHOLD. A
+		// biconditional keeps the narrowing a recorded product truth instead of
+		// a silently skipped branch: below 24 this asserts the theme hint is
+		// genuinely NOT on the line — the price AD-1 charges at 20 and at 10
+		// columns, where the footer can only afford the exit hint — and that the
+		// narrow line still carries the exit hint and is not blank. The old
+		// `if w >= …` shape stopped checking anything at those widths, which is
+		// where a footer regression is most damaging and least likely to be
+		// seen by a human.
+		theme_w := ui.footer_unit_cols(ks[len(ks)-2])
+		quit_w := ui.footer_unit_cols(last)
+		gap_w := ui.text_cols(ui.SEP)
+		need := theme_w + quit_w + 2*gap_w + ui.text_cols(ui.CUT_MARKER)
+		theme_seen := str_contains_ignore_case(line, "Theme")
+		check(fmt.tprintf("KEYS_MODE at {} cols shows `Theme: t` iff max >= {} (below it: exit hint, whole and non-blank — nothing more)", w, need),
+			theme_seen == (w >= need) &&
+				(theme_seen || (str_contains_ignore_case(line, last.action) && line != "")),
+			fmt.tprintf("need={} theme_seen={} exit='{}' footer='{}'", need, theme_seen, last.action, line))
 		check(fmt.tprintf("KEYS_MODE at {} cols never overflows", w),
 			ui.text_cols(line) <= w, fmt.tprintf("cols={} line='{}'", ui.text_cols(line), line))
-		parts, _ := strings.split(line, "  ")
-		partial := 0
-		for p in parts {
-			if p == "" || p == "…" { continue }
-			if !strings.contains(p, " ") { partial += 1 }
-		}
+		partial := half_hint_pieces(line)
 		check(fmt.tprintf("KEYS_MODE at {} cols cuts no hint in half", w),
 			partial == 0, fmt.tprintf("partial={} line='{}'", partial, line))
 		check(fmt.tprintf("KEYS_MODE at {} cols is not blank", w), line != "", "footer = ''")
@@ -567,28 +636,32 @@ case_ui_frame :: proc() -> bool {
 			str_contains_ignore_case(line, last.key) && str_contains_ignore_case(line, last.action),
 			fmt.tprintf("footer = '{}'", line))
 
-		// The second-to-last hint (`t theme`) must be there whenever the width
-		// could physically hold it next to the exit hint. Below that it is a
-		// layout impossibility, not a policy failure, so it is not asserted.
+		// The second-to-last hint must be there whenever the width can hold it,
+		// and this is the SAME re-derived threshold as above rather than a
+		// remembered one: two units, the join between them, the marker and its
+		// own join. (8 for `theme: t` + 7 for `quit: q` + 2*3 + 1 = 22.)
+		// Asserted at every width for the same reason given in the KEYS_MODE
+		// block: the `if w >= need` shape hid the narrow widths entirely.
 		two := UI_KEYS[len(UI_KEYS)-2]
-		need := ui.text_cols(fmt.tprintf("{} {}", two.key, two.action)) + 2 +
-			ui.text_cols(fmt.tprintf("{} {}", last.key, last.action))
-		if w >= need {
-			check(fmt.tprintf("UI_KEYS at {} cols also shows `{} {}`", w, two.key, two.action),
-				str_contains_ignore_case(line, two.key) && str_contains_ignore_case(line, two.action),
-				fmt.tprintf("need={} got='{}'", need, line))
-		}
+		gap_w := ui.text_cols(ui.SEP)
+		need := ui.footer_unit_cols(two) + ui.footer_unit_cols(last) +
+			2*gap_w + ui.text_cols(ui.CUT_MARKER)
+		two_seen := str_contains_ignore_case(line, two.action) &&
+			str_contains_ignore_case(line, two.key)
+		check(fmt.tprintf("UI_KEYS at {} cols also shows `{}: {}` iff max >= {} (below it: exit hint, non-blank)",
+			w, two.action, two.key, need),
+			two_seen == (w >= need) &&
+				(two_seen || (str_contains_ignore_case(line, last.action) && line != "")),
+			fmt.tprintf("need={} seen={} exit='{}' footer='{}'", need, two_seen, last.action, line))
 
 		check(fmt.tprintf("UI_KEYS at {} cols never overflows the width", w),
 			ui.text_cols(line) <= w, fmt.tprintf("cols={} line='{}'", ui.text_cols(line), line))
-		// Never half a hint: every visible hint must carry BOTH its key and its
-		// action, so a cut can never leave a key that does nothing.
-		parts, _ := strings.split(line, "  ")
-		partial := 0
-		for p in parts {
-			if p == "" || p == "…" { continue }
-			if !strings.contains(p, " ") { partial += 1 }
-		}
+		// Never half a hint: every visible piece must carry its description AND
+		// its key across the `: ` seam, so a cut can never leave a key that does
+		// nothing or an action no key performs. Split on the UNIT separator —
+		// see half_hint_pieces for why the two-space split this replaced had
+		// gone silently vacuous the moment the join became ` | `.
+		partial := half_hint_pieces(line)
 		check(fmt.tprintf("UI_KEYS at {} cols cuts no hint in half", w),
 			partial == 0, fmt.tprintf("partial pieces={} line='{}'", partial, line))
 		// And the line is never empty while hints exist.
