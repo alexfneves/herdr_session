@@ -485,6 +485,344 @@ utf8_rune_count :: proc(s: string) -> int {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MINIMUM CASE 1d — THE ESCAPE PARSER IS STREAM STATE TOO, SO A RESIZE MUST
+// NOT RESET IT. (The sibling of the carry bug above, and the worse half of it.)
+//
+// The carry bug corrupted a GLYPH. This one puts CONTROL-SEQUENCE BYTES ON THE
+// GRID AS VISIBLE CONTENT: mid-CSI painted `3HAGAIN`, a mid-OSC leaked the
+// WINDOW TITLE onto row 0, a mid-`ESC (` re-created the exact charset smear
+// this emulator exists to prevent. A suite that drives resizes while the app is
+// mid-escape reads a row that never existed, and a mid-OSC leak puts a string
+// into a frame assertion that was never meant to be content.
+//
+// THE RULE, same as carry's and for the same reason
+//   What a resize changes is the GRID. It does not change what the next byte
+//   MEANS. `state`, `csi_buf` and `csi_len` belong to the byte stream, so they
+//   cross the boundary with the stream and the sequence COMPLETES afterwards,
+//   evaluated against the new geometry — which is what a real terminal does:
+//   the parser lives in the input layer, SIGWINCH reshapes the grid and never
+//   touches it.
+//
+// Every row of the reported leak table gets its own case below, plus the two
+// bounds cases (a completed CUP that no longer fits, by row and by column), and
+// three controls: a resize with nothing pending still blanks normally, a resize
+// after a COMPLETE sequence is unaffected, and `screen_init` still wipes the
+// parser so two unrelated byte streams cannot inherit each other's state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// parser_state_line puts every field of the stream side of the Screen on one
+// line, because "the parser was reset" and "the parser was preserved but the
+// grid was wrong" look identical in a row dump.
+parser_state_line :: proc(tag: string, s: ^Screen) -> string {
+	return fmt.tprintf("{} state={} csi_len={} carry_len={} dropped={} rows={} cols={} cx={} cy={}",
+		tag, s.state, s.csi_len, s.carry_len, s.dropped, s.rows, s.cols, s.cx, s.cy)
+}
+
+// grid_is_blank scans the LIVE grid (rows x cols) rather than a rstripped row,
+// so "nothing was painted" is a statement about cells, not about the tail a
+// row accessor chose to hide.
+grid_is_blank :: proc(s: ^Screen) -> bool {
+	for row := 0; row < s.rows; row += 1 {
+		for col := 0; col < s.cols; col += 1 {
+			if s.grid[screen_idx(s, row, col)] != ' ' { return false }
+		}
+	}
+	return true
+}
+
+// CASE 1 — resize lands between ESC and its '[' (state == ESC).
+// Pre-fix: the parser resets, so "[2;3HWORLD" paints literally on row 0 and
+// the CUP never happens.
+@(test)
+screen_resize_mid_esc_completes_the_sequence_instead_of_painting_it :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 4, 40)
+	feed_str(&s, "hello")
+	feed_str(&s, "\x1b")
+	support.check(t, "pre-resize the parser owes the family byte",
+		s.state == .ESC && s.csi_len == 0, parser_state_line("pre", &s))
+
+	screen_resize(&s, 4, 40)
+	support.check(t, "the resize leaves the parser parked in ESC — it is stream state, not grid state",
+		s.state == .ESC && s.csi_len == 0 && s.carry_len == 0,
+		parser_state_line("post-resize", &s))
+
+	feed_str(&s, "[2;3HWORLD")
+	support.check(t, "the CUP completes after the resize and places the text at 2;3",
+		row_of(&s, 1) == "  WORLD",
+		fmt.tprintf("row1='{}' row0='{}' {}", row_of(&s, 1), row_of(&s, 0), parser_state_line("post-feed", &s)))
+	support.check(t, "NO escape bytes were painted as text",
+		!screen_contains(&s, "[2;3H") && !screen_contains(&s, "[") && row_of(&s, 0) == "",
+		fmt.tprintf("row0='{}'", row_of(&s, 0)))
+	support.eq_i(t, "and nothing was dropped — the sequence was parsed, not swallowed", s.dropped, 0)
+}
+
+// CASE 2 — resize lands mid-parameters (state == CSI_PARAMS, csi_len > 0).
+// Pre-fix: the accumulated parameters are thrown away and repaint as text:
+// `3HAGAIN` on the row.
+@(test)
+screen_resize_mid_csi_params_preserves_the_parameters_being_built :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 4, 40)
+	feed_str(&s, "hello")
+	feed_str(&s, "\x1b[2;")
+	support.check(t, "pre-resize two parameter runes are in flight",
+		s.state == .CSI_PARAMS && s.csi_len == 2, parser_state_line("pre", &s))
+
+	screen_resize(&s, 4, 40)
+	support.check(t, "the resize carries the half-built parameter list across unchanged",
+		s.state == .CSI_PARAMS && s.csi_len == 2 && s.carry_len == 0,
+		parser_state_line("post-resize", &s))
+
+	feed_str(&s, "3HAGAIN")
+	support.check(t, "the parameters rejoin: CUP 2;3 lands the text at row 1 col 2",
+		row_of(&s, 1) == "  AGAIN",
+		fmt.tprintf("row1='{}' row0='{}'", row_of(&s, 1), row_of(&s, 0)))
+	support.check(t, "the parameter bytes never painted ('3HAGAIN' is not content anywhere)",
+		!screen_contains(&s, "3H") && !screen_contains(&s, ";") && row_of(&s, 0) == "",
+		fmt.tprintf("row0='{}' row1='{}'", row_of(&s, 0), row_of(&s, 1)))
+	support.eq_i(t, "nothing dropped", s.dropped, 0)
+}
+
+// CASE 3 — resize lands between the last parameter DIGIT and the final byte.
+// Pre-fix: the CUP is destroyed, so the glyph after it lands at column 0 of
+// row 0 instead of row 3 column 4.
+@(test)
+screen_resize_mid_csi_digit_still_lands_the_final_byte_where_it_means :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 4, 40)
+	feed_str(&s, "\x1b[3;4")
+	support.check(t, "pre-resize: 3 parameter runes held, final byte not yet seen",
+		s.state == .CSI_PARAMS && s.csi_len == 3, parser_state_line("pre", &s))
+
+	screen_resize(&s, 4, 40)
+	support.check(t, "the held digits survive the resize",
+		s.state == .CSI_PARAMS && s.csi_len == 3,
+		parser_state_line("post-resize", &s))
+
+	feed_str(&s, "HZ")
+	support.check(t, "'H' is still the final byte of the CUP, not a glyph",
+		s.state == .NORMAL && s.csi_len == 0 &&
+			!screen_contains(&s, "H"),
+		fmt.tprintf("row0='{}' row2='{}' {}", row_of(&s, 0), row_of(&s, 2), parser_state_line("post-feed", &s)))
+	support.eq_i(t, "Z lands at row 2, col 3 (CUP 3;4 against the NEW grid)",
+		int(s.grid[screen_idx(&s, 2, 3)]), int('Z'))
+	support.eq_i(t, "Z did NOT land at column 0 of the top row",
+		int(s.grid[screen_idx(&s, 0, 0)]), int(' '))
+	eq_s_local(t, "the row reads as three blanks then Z", row_of(&s, 2), "   Z")
+}
+
+// CASE 4 — resize lands mid-OSC. This is the leak that matters most: the OSC
+// payload is the WINDOW TITLE, a string that must never appear as content.
+// Pre-fix: `tle:secretcd` on row 0 — the title body plus the text after it.
+@(test)
+screen_resize_mid_osc_never_leaks_the_window_title_onto_the_grid :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 4, 40)
+	feed_str(&s, "ab\x1b]0;ti")
+	support.check(t, "pre-resize the parser is inside the OSC payload",
+		s.state == .OSC, parser_state_line("pre", &s))
+
+	screen_resize(&s, 4, 40)
+	support.check(t, "the resize keeps us inside the OSC — the payload has no grid to leak into yet",
+		s.state == .OSC && s.csi_len == 0,
+		parser_state_line("post-resize", &s))
+
+	feed_str(&s, "tle:secret\x07cd")
+	support.check(t, "the title body is NOT on the grid",
+		!screen_contains(&s, "secret") && !screen_contains(&s, "tle") && !screen_contains(&s, "0;"),
+		fmt.tprintf("row0='{}'", row_of(&s, 0)))
+	support.check(t, "the BEL still terminates the OSC and the text after it renders",
+		s.state == .NORMAL && row_of(&s, 0) == "cd",
+		fmt.tprintf("row0='{}' {}", row_of(&s, 0), parser_state_line("post-feed", &s)))
+	support.eq_i(t, "swallowing an OSC is parsing, not loss — nothing counted as dropped", s.dropped, 0)
+}
+
+// CASE 5 — resize lands between ESC and the charset DESIGNATOR byte.
+// Pre-fix: `Bion` on the row — the designator painted, i.e. the exact smear
+// class ("delete_sess(Bn") this emulator was written to eliminate.
+@(test)
+screen_resize_mid_charset_never_paints_the_designator_byte :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 4, 40)
+	feed_str(&s, "delete_sess")
+	feed_str(&s, "\x1b(")
+	support.check(t, "pre-resize the parser owes exactly one designator byte",
+		s.state == .CHARSET, parser_state_line("pre", &s))
+
+	screen_resize(&s, 4, 40)
+	support.check(t, "the resize keeps the designation pending",
+		s.state == .CHARSET && s.carry_len == 0,
+		parser_state_line("post-resize", &s))
+
+	feed_str(&s, "Bion")
+	support.check(t, "the designator 'B' is consumed by the resize-straddling designation, never painted",
+		!screen_contains(&s, "B") && !screen_contains(&s, "("),
+		fmt.tprintf("row0='{}'", row_of(&s, 0)))
+	support.check(t, "only the three real glyphs render (the grid blanked on resize, so the row is 'ion', not 'Bion')",
+		row_of(&s, 0) == "ion" && utf8_rune_count(row_of(&s, 0)) == 3,
+		fmt.tprintf("row0='{}' runes={}", row_of(&s, 0), utf8_rune_count(row_of(&s, 0))))
+	support.eq_i(t, "and they were parsed, not dropped", s.dropped, 0)
+}
+
+// THE BOUNDS EDGE THE FIX HAS TO ANSWER: a CUP whose coordinates were valid for
+// the OLD size and are out of bounds for the NEW one. That is a bounds
+// question — screen_in_bounds / the put guards — not a parser question, and the
+// answer must be "counted and harmless", never "silent loss" and never a crash.
+// Completing the sequence after the resize is what makes this reachable at all,
+// so both axes get proven here: row out of range, and column out of range.
+@(test)
+screen_resize_out_of_bounds_cup_is_counted_not_corrupting :: proc(t: ^testing.T) {
+	// ── ROW out of range: CUP written for a 10-row screen, grid is now 3. ────
+	s : Screen
+	screen_init(&s, 10, 20)
+	feed_str(&s, "\x1b[9;4")
+	support.check(t, "row 9 is legal while the screen is 10 rows deep",
+		s.state == .CSI_PARAMS && s.csi_len == 3, parser_state_line("pre", &s))
+
+	screen_resize(&s, 3, 20)
+	feed_str(&s, "HNOPE")
+	support.check(t, "the sequence still COMPLETES (it was not voided on suspicion of the bounds)",
+		s.state == .NORMAL && s.csi_len == 0, parser_state_line("post-completion", &s))
+	support.check(t, "the cursor really is off the grid the glyphs were aimed at",
+		s.cy == 8 && s.rows == 3 && !screen_in_bounds(&s, s.cy, s.cx),
+		parser_state_line("aim", &s))
+	support.check(t, "nothing painted anywhere on the grid",
+		!screen_contains(&s, "NOPE") && grid_is_blank(&s),
+		fmt.tprintf("row0='{}' blank={}", row_of(&s, 0), grid_is_blank(&s)))
+	support.eq_i(t, "EVERY glyph that could not land is COUNTED in dropped (no silent loss)",
+		s.dropped, 4)
+
+	// Recovery: the drop must not wedge the emulator.
+	feed_str(&s, "\x1b[1;1Hback")
+	eq_s_local(t, "the next IN-BOUNDS CUP renders normally", row_of(&s, 0), "back")
+	support.eq_i(t, "…and the earlier drops are still counted (the audit survives)", s.dropped, 4)
+
+	// ── COLUMN out of range: CUP written for a 20-col screen, grid is now 10. ─
+	c : Screen
+	screen_init(&c, 3, 20)
+	feed_str(&c, "\x1b[1;18")
+	screen_resize(&c, 3, 10)
+	feed_str(&c, "H")
+	support.check(t, "the completed CUP aims at a column the new grid does not have",
+		c.cx == 17 && c.cols == 10 && !screen_in_bounds(&c, c.cy, c.cx),
+		parser_state_line("col-aim", &c))
+	feed_str(&c, "gone")
+	support.check(t, "the column is what no longer fits, and every glyph lost to it is counted",
+		c.dropped == 4,
+		parser_state_line("col-drop", &c))
+	support.check(t, "…with nothing painted on the narrower grid",
+		grid_is_blank(&c) && !screen_contains(&c, "gone"),
+		fmt.tprintf("row0='{}' blank={}", row_of(&c, 0), grid_is_blank(&c)))
+	feed_str(&c, "\x1b[1;1Hstill_here")
+	eq_s_local(t, "…and the emulator recovers on the narrower grid", row_of(&c, 0), "still_here")
+
+	// ── The IN-BOUNDS half: coordinates valid for BOTH sizes must be untouched
+	// by any of this. A 2;3 CUP is legal before and after 40 -> 10 columns.
+	b : Screen
+	screen_init(&b, 4, 40)
+	feed_str(&b, "\x1b[2;3")
+	screen_resize(&b, 4, 10)
+	feed_str(&b, "Hfine")
+	eq_s_local(t, "a CUP valid on both grids lands the same way after the resize",
+		row_of(&b, 1), "  fine")
+	support.eq_i(t, "…with nothing dropped", b.dropped, 0)
+}
+
+// ── CONTROL 1 — a resize with NO pending escape blanks the grid normally.
+// This is unchanged behaviour; it passes before the fix too, which is the
+// point: preserving parser state must not disturb the ordinary path.
+@(test)
+screen_resize_with_no_pending_escape_still_blanks_normally :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 3, 10)
+	feed_str(&s, "0123456789")
+	feed_str(&s, "\x1b[3;1Habcdefghij")
+	support.check(t, "the control starts from a QUIESCENT parser (so it is not accidentally testing the new path)",
+		s.state == .NORMAL && s.csi_len == 0 && s.carry_len == 0,
+		parser_state_line("pre", &s))
+	eq_s_local(t, "…with content painted on two rows", row_of(&s, 2), "abcdefghij")
+
+	// One more in-bounds glyph so the pre-resize state is a live, mid-frame one
+	// rather than a just-initialised screen.
+	feed_str(&s, "\x1b[2;1Hmid-frame")
+	initial_dropped := s.dropped
+	screen_resize(&s, 2, 5)
+	support.check(t, "the grid blanks exactly as python's `self.grid = [[' ']*cols …]` does",
+		grid_is_blank(&s) && s.rows == 2 && s.cols == 5,
+		fmt.tprintf("blank={} rows={} cols={} row0='{}'", grid_is_blank(&s), s.rows, s.cols, row_of(&s, 0)))
+	support.check(t, "…and the stream side is quiescent, so nothing was carried that need not be",
+		s.state == .NORMAL && s.csi_len == 0 && s.carry_len == 0 && s.dropped == initial_dropped,
+		parser_state_line("post-resize", &s))
+	feed_str(&s, "abcde")
+	eq_s_local(t, "…and the resized grid renders normally afterwards", row_of(&s, 0), "abcde")
+}
+
+// ── CONTROL 2 — a COMPLETE escape sequence entirely before the resize is
+// unaffected by the preservation. Nothing in the parser outlives a completed
+// sequence, and the cursor is geometry state that legitimately re-homes.
+@(test)
+screen_resize_after_a_complete_escape_sequence_is_unaffected :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 4, 40)
+	feed_str(&s, "\x1b[2;7Hdone")
+	eq_s_local(t, "the sequence rendered before the resize", row_of(&s, 1), "      done")
+	support.check(t, "…leaving a completed parser: NORMAL, no parameters pending",
+		s.state == .NORMAL && s.csi_len == 0, parser_state_line("pre", &s))
+
+	initial_dropped := s.dropped
+	screen_resize(&s, 4, 40)
+	support.check(t, "the resize preserved NOTHING from a finished sequence",
+		s.state == .NORMAL && s.csi_len == 0 && s.carry_len == 0 && s.dropped == initial_dropped,
+		parser_state_line("post-resize", &s))
+	support.check(t, "…and blanked its output like any other content",
+		grid_is_blank(&s),
+		fmt.tprintf("row1='{}' blank={}", row_of(&s, 1), grid_is_blank(&s)))
+	feed_str(&s, "more")
+	eq_s_local(t, "the cursor re-homed with the grid: the text lands at 0,0, NOT at the pre-resize CUP",
+		row_of(&s, 0), "more")
+	support.eq_i(t, "…cx proves it", s.cx, 4)
+}
+
+// ── CONTROL 3 — screen_init is still a FULL reset of the parser.
+// This is the guard on the fix itself: init is the CONSTRUCTION path, and a
+// parser that survived from one scenario into the next would be cross-talk
+// between unrelated byte streams — a far worse bug than the one resize needs.
+@(test)
+screen_init_still_full_resets_the_parser_no_stream_crosstalk :: proc(t: ^testing.T) {
+	s : Screen
+	screen_init(&s, 3, 20)
+	// Park the parser mid-CSI *and* strand a UTF-8 lead byte, so both kinds of
+	// in-flight stream state are present at once.
+	stalled := "\x1b[5;\xE2"
+	feed_bytes(&s, transmute([]u8)stalled)
+	support.check(t, "the stream is mid-escape AND mid-glyph",
+		s.state == .CSI_PARAMS && s.csi_len == 2 && s.carry_len == 1,
+		parser_state_line("mid-stream", &s))
+
+	// resize keeps it — that is the fix.
+	screen_resize(&s, 3, 20)
+	support.check(t, "resize preserves it",
+		s.state == .CSI_PARAMS && s.csi_len == 2 && s.carry_len == 1,
+		parser_state_line("post-resize", &s))
+
+	// …but construction wipes it.
+	screen_init(&s, 2, 10)
+	support.check(t, "screen_init resets the parser, the parameter buffer, the carry AND the drop audit",
+		s.state == .NORMAL && s.csi_len == 0 && s.carry_len == 0 && s.dropped == 0 && grid_is_blank(&s),
+		parser_state_line("post-init", &s))
+
+	// And no cross-talk in the observable stream: the 'H' that WOULD have been
+	// the final byte of the dead CUP is now ordinary TEXT.
+	feed_str(&s, "Hx")
+	eq_s_local(t, "a fresh screen over the same variable sees TEXT, not the tail of a stranger's sequence",
+		row_of(&s, 0), "Hx")
+	support.check(t, "…and stayed quiescent",
+		s.state == .NORMAL && s.csi_len == 0 && s.carry_len == 0,
+		parser_state_line("post-fresh-feed", &s))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MINIMUM CASE 2 — charset designation must not smear.
 //
 // This is the python bug, recorded so it cannot come back. `ESC ( B` is a

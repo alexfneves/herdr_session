@@ -99,8 +99,9 @@ Screen :: struct {
 // scratch. None of them has a stream history to keep, and a `carry` that
 // survived from one scenario into the next would be cross-talk between
 // unrelated byte streams — a far worse bug than the one resize needed.
-// Only screen_resize preserves anything, and it preserves exactly the
-// in-flight bytes.
+// Only `screen_resize` preserves anything, and what it preserves is the state of
+// the BYTE STREAM: the pending UTF-8 bytes AND where the escape parser stands
+// inside a sequence.
 screen_init :: proc(s: ^Screen, rows, cols: int) {
 	s.rows = rows
 	s.cols = cols
@@ -142,21 +143,65 @@ screen_init :: proc(s: ^Screen, rows, cols: int) {
 // boundary and screen_resize_mid_glyph_leaves_a_pure_spine_row, both of which
 // fail against the pre-fix code and pass against this.
 //
-// NOTE — THE ADJACENT HAZARD THAT IS STILL HERE, DELIBERATELY UNCHANGED.
-// A resize landing in the middle of an ESCAPE sequence resets `state` to
-// NORMAL and `csi_len` to 0, so the surviving bytes of that sequence decode
-// as TEXT and get painted: mid-CSI leaves `3HAGAIN` on the row, a mid-OSC
-// leaks the window title onto the grid, and a mid-`ESC (` re-creates the
-// charset smear this emulator exists to prevent. Same class, worse blast
-// radius, and NOT fixed here — see the lane report for the probe output and
-// the recommended one-line extension (preserve state/csi_buf/csi_len the same
-// way carry is preserved).
+// THE ESCAPE PARSER IS STREAM STATE TOO, AND ITS RESET WAS THE WORSE HALF.
+//
+// The exact same reasoning covers `state`, `csi_buf` and `csi_len`. What a
+// resize changes is the GRID. It does not change what the next BYTE MEANS. A
+// resize landing inside an escape sequence used to send the parser back to
+// NORMAL with an empty parameter buffer, so the rest of that sequence decoded
+// as TEXT and got painted: mid-CSI left `3HAGAIN` on the row, a mid-OSC leaked
+// the window title onto the grid, and a mid-`ESC (` re-created the very
+// charset smear this emulator exists to prevent — control-sequence bytes as
+// visible content, which is exactly the class of wrong reading that byte-
+// grepping would have produced.
+//
+// WHY PRESERVING IS WHAT A REAL TERMINAL DOES. The parser is a property of the
+// input layer (xterm's state machine, VTE's parser); the grid is the terminal
+// object. SIGWINCH re-shapes the grid and never touches the parser, so a
+// sequence that straddles a resize simply CONTINUES and is evaluated against
+// the NEW geometry. Preserving it is the same call the carry fix made, for the
+// same reason: the bytes are mid-flight, they are not content yet.
+//
+// THE ALTERNATIVE CONSIDERED AND REJECTED — void the pending sequence but
+// SWALLOW it (never paint it, never complete it). That stops the smear and is
+// still wrong. A real terminal DOES complete the sequence, so voiding it drops
+// a positioning verb the app really sent and leaves the cursor at its pre-
+// resize position while the app believes it moved: every following write of
+// that frame lands one cursor-jump off. That positional desync is invisible to
+// the "no literal escape bytes on the grid" check that voiding exists to
+// satisfy, and it corrupts the NEXT frame rather than this one. Completion
+// cannot do that: the sequence means what it meant before the resize, it is
+// just applied to a different grid.
+//
+// AND WHEN THE COMPLETED SEQUENCE NO LONGER FITS? That is a BOUNDS question,
+// not a parser question, and it goes through the guards that already exist. A
+// CUP written for a 10-row screen that completes after a resize to 3 puts the
+// cursor at row 9 of a 3-row grid; `screen_put_cursor`'s guards drop the write
+// and COUNT it in `dropped`, and the next in-bounds CUP renders normally — the
+// same recovery an out-of-bounds CUP with no resize at all already had. Not a
+// crash, not silent loss: see screen_resize_out_of_bounds_cup_*. `dropped` is
+// therefore lifted across the resize too — it is a cumulative audit of the
+// STREAM, not grid content, and wiping it at a resize would delete the very
+// evidence the counter exists to provide.
 screen_resize :: proc(s: ^Screen, rows, cols: int) {
-	carry := s.carry
+	// Lift the whole byte-stream side of the Screen across the reset, field by
+	// field, so a future stream-level field cannot be silently forgotten, then
+	// rebuild the grid from blank.
+	carry     := s.carry
 	carry_len := s.carry_len
+	state     := s.state
+	csi_buf   := s.csi_buf
+	csi_len   := s.csi_len
+	dropped   := s.dropped
+
 	screen_init(s, rows, cols)
-	s.carry = carry
+
+	s.carry     = carry
 	s.carry_len = carry_len
+	s.state     = state
+	s.csi_buf   = csi_buf
+	s.csi_len   = csi_len
+	s.dropped   = dropped
 }
 
 screen_idx :: proc(s: ^Screen, r, c: int) -> int {
@@ -204,6 +249,14 @@ screen_put_cursor :: proc(s: ^Screen, ch: rune) {
 		if w == 2 && s.cx + 1 < s.cols {
 			s.grid[screen_idx(s, s.cy, s.cx + 1)] = ' '
 		}
+	} else {
+		// Column-wise, the same story as the row guard above: this emulator has
+		// no autowrap, so a glyph past the last column is genuinely gone and has
+		// to be COUNTED. Un-counted, "the grid has no room left" and "the
+		// emulator lost a byte" are indistinguishable — which matters most right
+		// after a resize, when a cursor placed by a sequence written for the OLD
+		// width routinely lands past the NEW one.
+		s.dropped += 1
 	}
 	s.cx += w
 	if s.cx > s.cols { s.cx = s.cols }
