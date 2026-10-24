@@ -104,7 +104,17 @@ paint_scene :: proc() {
 		// scene cannot drift from what the product actually draws.
 		ui.frame_rule("hs.case.edit.rule", scene.pal)
 	case .list:
-		ui.list_paint(scene.list, scene.list_rows, scene.l.cols, scene.l.main_rows, scene.pal)
+		// Mirrors `picker_body` in the product (RCH-10 change 1, picker half):
+		// the filter line and its rule are a RULED SURFACE above the list, so the
+		// list gets `main_rows - RULED_SURFACE_ROWS` rows and its first row sits
+		// two rows below MAIN's top. The scene used to paint the list from
+		// `main_y` with no filter chrome at all, which meant the picker's rule
+		// and its row price had NO rendered coverage anywhere — the case was
+		// proving list behaviour against geometry the product never draws.
+		ui.edit_paint(&g_list.filter, "hs.case.list.filter", scene.l.cols-8, scene.pal)
+		ui.frame_rule("hs.case.list.filter.rule", scene.pal)
+		ui.list_paint(scene.list, scene.list_rows, scene.l.cols,
+			scene.l.main_rows - ui.RULED_SURFACE_ROWS, scene.pal)
 	case .sessions_float:
 		ui.sessions_clamp(scene.v, scene.rows, scene.body)
 		ui.sessions_paint(scene.v, scene.rows, scene.l.cols, scene.body, scene.pal)
@@ -1667,10 +1677,14 @@ case_ui_list :: proc() -> bool {
 	defer leave_terminal()
 
 	l := scene.l
-
-	// Two DIFFERENT item types through ONE list, which is the whole point of the
-	// shared implementation: the theme picker and the remote picker are the same
-	// code over different projections.
+	// The picker's list occupies MAIN minus its ruled filter surface, exactly as
+	// `picker_body` lays it out, and every row assertion below derives from
+	// these two values rather than from a literal row number. Before this the
+	// scene handed the list ALL of main_rows and read row `main_y` as the first
+	// list row — geometry the product does not draw, so the picker's rule and
+	// its row price went untested.
+	vis := l.main_rows - ui.RULED_SURFACE_ROWS
+	top := l.main_y + ui.RULED_SURFACE_ROWS
 	themes := make([]string, 4)
 	themes[0] = "gruvbox-dark"
 	themes[1] = "solarized-light"
@@ -1693,6 +1707,20 @@ case_ui_list :: proc() -> bool {
 	scene.list = &g_list
 	scene.list_rows = theme_rows
 	paint_scene()
+
+	// The picker is a ruled surface too: filter line, rule directly under it,
+	// then the list. Asserted once here so the picker's rule is covered by a
+	// rendered row position rather than by trusting the shared helper.
+	check("change 1 (picker): the filter line is painted above the list",
+		trim(interior_of(l.main_y, scene.f.cols)) != "",
+		fmt.tprintf("row {} = '{}'", l.main_y, trim(interior_of(l.main_y, scene.f.cols))))
+	check("change 1 (picker): a full-width rule sits DIRECTLY under the picker filter",
+		rule_at(l.main_y + ui.RULE_ROWS, scene.f.cols),
+		fmt.tprintf("row {} below the picker filter at {}", l.main_y + ui.RULE_ROWS, l.main_y))
+	check("change 1 (picker): the list starts BELOW its rule, not on it",
+		!rule_at(top, scene.f.cols) && top == l.main_y + ui.RULED_SURFACE_ROWS,
+		fmt.tprintf("first list row={} is a rule row? {}", top, rule_at(top, scene.f.cols)))
+
 	check("theme list shows every item with an empty filter",
 		ui.list_count(&g_list) == len(themes),
 		fmt.tprintf("{} shown of {}", ui.list_count(&g_list), len(themes)))
@@ -1721,7 +1749,7 @@ case_ui_list :: proc() -> bool {
 		fmt.tprintf("sel={} (list has {} row)", g_list.sel, ui.list_count(&g_list)))
 
 	sel_bg := paint_attr(g_pal.accent)
-	row_y := l.main_y + i32(g_list.sel) - g_list.scroll
+	row_y := top + i32(g_list.sel) - g_list.scroll
 	check("the selected list row carries the highlight in the cells",
 		cell_at(6, row_y).bg == sel_bg,
 		fmt.tprintf("y={} bg={} want {}", row_y, cell_at(6, row_y).bg, sel_bg))
@@ -1737,7 +1765,7 @@ case_ui_list :: proc() -> bool {
 		ui.list_count(&g_list) == 0, fmt.tprintf("shown={}", ui.list_count(&g_list)))
 	_, none1 := ui.list_pick(&g_list, theme_rows)
 	check("enter on an empty list is a no-op", !none1, fmt.tprintf("picked={}", none1))
-	emptied := trim(interior_of(l.main_y, scene.f.cols))
+	emptied := trim(interior_of(top, scene.f.cols))
 	check("the empty list says so instead of drawing a phantom row",
 		str_contains_ignore_case(emptied, "nothing matches"),
 		fmt.tprintf("row = '{}'", emptied))
@@ -1748,14 +1776,14 @@ case_ui_list :: proc() -> bool {
 	// The scene must point at the NEW row set or the repaint would keep painting
 	// the theme picker over the remote one.
 	scene.list_rows = remote_rows
-	ui.list_select_to(&g_list, 1, l.main_rows)
+	ui.list_select_to(&g_list, 1, vis)
 	paint_scene()
 	r1, ok2 := ui.list_pick(&g_list, remote_rows)
 	check("the same list serves the remote picker", ok2 && r1.id == "dev.example",
 		fmt.tprintf("picked device='{}'", r1.id))
 	check("the remote picker's rows are labelled by the model's label, not the device",
-		str_contains_ignore_case(trim(interior_of(l.main_y+1, scene.f.cols)), "dev-box"),
-		fmt.tprintf("row 1 = '{}'", trim(interior_of(l.main_y+1, scene.f.cols))))
+		str_contains_ignore_case(trim(interior_of(top+1, scene.f.cols)), "dev-box"),
+		fmt.tprintf("row 1 = '{}'", trim(interior_of(top+1, scene.f.cols))))
 	for ch in "loc" {
 		ui.edit_insert_rune(&g_list.filter, ch)
 	}
@@ -1765,11 +1793,11 @@ case_ui_list :: proc() -> bool {
 		ui.list_count(&g_list) == 1, fmt.tprintf("after 'loc' -> {}", ui.list_count(&g_list)))
 	check("when the held row is filtered out the selection is dropped, not moved onto a neighbour",
 		g_list.sel == -1, fmt.tprintf("sel={} (held 'dev.example' is gone)", g_list.sel))
-	ui.list_move(&g_list, 1, l.main_rows)
+	ui.list_move(&g_list, 1, vis)
 	r2, ok3 := ui.list_pick(&g_list, remote_rows)
 	check("selecting the surviving remote gives local", ok3 && r2.id == app.DEVICE_LOCAL,
 		fmt.tprintf("id='{}'", r2.id))
-	dump_rows("picker", 0, l.main_y, scene.f.cols, 4)
+	dump_rows("picker", 0, l.main_y, scene.f.cols, 6)
 	return !any_failed
 }
 
