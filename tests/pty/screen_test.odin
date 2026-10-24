@@ -20,6 +20,7 @@ package pty
 
 import "core:fmt"
 import "core:testing"
+import "core:unicode/utf8"
 
 import support "../support"
 
@@ -115,6 +116,372 @@ screen_split_utf8_three_way_across_three_feeds :: proc(t: ^testing.T) {
 	support.eq_i(t, "the cell holds 世", int(s.grid[screen_idx(&s, 0, 0)]), 0x4E16)
 	support.eq_i(t, "the cell after it is blanked by the wide glyph",
 		int(s.grid[screen_idx(&s, 0, 1)]), int(' '))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MINIMUM CASE 1b — THE CARRY BUFFER MUST SURVIVE A screen_resize.
+//
+// THE DEFECT THESE TESTS WERE WRITTEN AGAINST (harness, not product).
+// `screen_resize` was a bare call to `screen_init`, and `screen_init` zeroes
+// `carry_len`. A resize landing between the LEAD BYTE of a UTF-8 sequence and
+// its continuation bytes therefore THREW THE PARTIAL SEQUENCE AWAY. When the
+// tail arrived it had no lead byte to decode against and landed in the grid as
+// U+FFFD.
+//
+// That is the real shape of the resize_flood failure this lane was sent to
+// chase: `the surviving frame is the FINAL size, not a stale one — spine
+// widths lo=118 hi=118 want 118 (rules=1)`. The width was CORRECT. The row
+// held 115 good `─` glyphs plus 3 U+FFFD, so `rh_is_rule` rejected it and
+// `rh_rule_count` read 1 where the app had drawn 2. The check said "stale
+// frame" about a frame that was fine, because the EMULATOR had eaten bytes the
+// app really wrote.
+//
+// THE RULE THIS ESTABLISHES
+//   A partial UTF-8 sequence belongs to the BYTE STREAM, not to the screen
+//   geometry. Resizing the grid must not consume it, must not reset it, and
+//   must not reorder it. Grid CONTENT legitimately blanks on resize (that
+//   is python's behaviour and it stays — the harness invents no reflow rule);
+//   pending BYTES are not grid content and do not blank with it.
+//
+// Every boundary of every sequence length is covered, because the boundary the
+// flood hits is chosen by frame size and read fragmentation, not by us.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Carry_Glyph :: struct {
+	label : string,
+	want  : rune,
+	bytes : [4]u8,
+	n     : int,
+}
+
+// The bytes are spelled out rather than derived: this is a byte-stream test and
+// the wire form IS the thing under test. 2-, 3- and 4-byte sequences plus the
+// specific 3-byte glyph the flood draws its spine with (U+2500), and an
+// astral-plane 4-byte case, whose boundary can fall at any of THREE positions.
+CARRY_GLYPHS :: []Carry_Glyph{
+	Carry_Glyph{"·  U+00B7  2-byte Latin-1 accent", 0x00B7, [4]u8{0xC2, 0xB7, 0x00, 0x00}, 2},
+	Carry_Glyph{"世  U+4E16  3-byte CJK", 0x4E16, [4]u8{0xE4, 0xB8, 0x96, 0x00}, 3},
+	Carry_Glyph{"─  U+2500  3-byte box drawing (THE FLOOD'S SPINE GLYPH)", 0x2500, [4]u8{0xE2, 0x94, 0x80, 0x00}, 3},
+	Carry_Glyph{"U+1F600  4-byte ASTRAL PLANE (emoji)", 0x1F600, [4]u8{0xF0, 0x9F, 0x98, 0x80}, 4},
+}
+
+feed_bytes :: proc(s: ^Screen, b: []u8) {
+	screen_feed(s, b)
+}
+
+// grid_count_rune scans the LIVE grid (rows x cols), not a rstripped row
+// string, so a U+FFFD cannot hide past the end of what a row accessor shows.
+grid_count_rune :: proc(s: ^Screen, r: rune) -> int {
+	n := 0
+	for row := 0; row < s.rows; row += 1 {
+		for col := 0; col < s.cols; col += 1 {
+			if s.grid[screen_idx(s, row, col)] == r { n += 1 }
+		}
+	}
+	return n
+}
+
+// grid_first_rune locates the first live cell holding `r` so a failure detail
+// says WHERE the corruption is, not merely that there is some.
+grid_first_rune :: proc(s: ^Screen, r: rune) -> (row, col: int) {
+	for row := 0; row < s.rows; row += 1 {
+		for col := 0; col < s.cols; col += 1 {
+			if s.grid[screen_idx(s, row, col)] == r { return row, col }
+		}
+	}
+	return -1, -1
+}
+
+hex_bytes :: proc(b: []u8) -> string {
+	digits := "0123456789ABCDEF"
+	parts : [dynamic]u8
+	defer delete(parts)
+	for i := 0; i < len(b); i += 1 {
+		if i > 0 { append(&parts, ' ') }
+		append(&parts, digits[b[i] >> 4])
+		append(&parts, digits[b[i] & 0x0F])
+	}
+	return copy_string(parts)
+}
+
+// carry_detail puts the whole state on one line: a `rules=1`-style mystery is
+// only debuggable if the counter, the cell and the corruption position are
+// all printed together.
+carry_detail :: proc(tag: string, s: ^Screen, want: rune, cut: int, n: int) -> string {
+	fr, fc := grid_first_rune(s, 0xFFFD)
+	return fmt.tprintf("{} cell(0,0)=U+{} want=U+{} carry_len={} (split at {}/{}) U+FFFD on grid={} first-at=({},{}) rows={} cols={}",
+		tag, cp_name(s.grid[screen_idx(s, 0, 0)]), cp_name(want), s.carry_len, cut, n,
+		grid_count_rune(s, 0xFFFD), fr, fc, s.rows, s.cols)
+}
+
+@(test)
+screen_resize_preserves_utf8_carry_at_every_boundary :: proc(t: ^testing.T) {
+	x_seed := "x"
+	for g in CARRY_GLYPHS {
+		glyph_arr := g.bytes
+		glyph := glyph_arr[0:g.n]
+
+		// ── CONTROL 1 — whole glyph, NO resize. Must be intact. ──────────────
+		c1 : Screen
+		screen_init(&c1, 4, 20)
+		feed_bytes(&c1, glyph)
+		support.check(t, fmt.tprintf("CONTROL 1 {} whole glyph, no resize -> one intact cell", g.label),
+			c1.grid[screen_idx(&c1, 0, 0)] == g.want &&
+				grid_count_rune(&c1, 0xFFFD) == 0 &&
+				c1.carry_len == 0,
+			fmt.tprintf("cell(0,0)=U+{} want=U+{} carry_len={} FFFD={}",
+				cp_name(c1.grid[screen_idx(&c1, 0, 0)]), cp_name(g.want),
+				c1.carry_len, grid_count_rune(&c1, 0xFFFD)))
+
+		for cut := 1; cut < g.n; cut += 1 {
+			head := glyph[0:cut]
+			tail := glyph[cut:g.n]
+
+			// ── CONTROL 2 — split glyph, NO resize. Works today; prove it keeps
+			// working so nobody "fixes" the resize by breaking the feed. ────────
+			c2 : Screen
+			screen_init(&c2, 4, 20)
+			feed_bytes(&c2, head)
+			mid2 := grid_count_rune(&c2, 0xFFFD)
+			pending2 := c2.carry_len
+			feed_bytes(&c2, tail)
+			support.check(t, fmt.tprintf("CONTROL 2 {} split after byte {}/{} with NO resize -> one intact cell", g.label, cut, g.n),
+				c2.grid[screen_idx(&c2, 0, 0)] == g.want &&
+					mid2 == 0 && pending2 == cut &&
+					grid_count_rune(&c2, 0xFFFD) == 0 && c2.carry_len == 0,
+				fmt.tprintf("cell(0,0)=U+{} want=U+{} carry_after_head={} (want {}) FFFD={} carry_len={} head=[{}] tail=[{}]",
+					cp_name(c2.grid[screen_idx(&c2, 0, 0)]), cp_name(g.want), pending2, cut,
+					grid_count_rune(&c2, 0xFFFD), c2.carry_len, hex_bytes(head), hex_bytes(tail)))
+
+			// ── CASE 3 — split glyph WITH a resize across the split. THIS IS THE
+			// DEFECT: pre-fix, the resize drops the held lead byte(s) and the tail
+			// decodes as orphans into U+FFFD. ─────────────────────────────────
+			s : Screen
+			screen_init(&s, 4, 20)
+			// Seed one painted cell first so "the grid blanked" is a measurable
+			// statement rather than an unset-memory coincidence.
+			feed_bytes(&s, transmute([]u8)x_seed)
+			feed_bytes(&s, head)
+			support.check(t, fmt.tprintf("pre-resize {} the held partial paints nothing and FFFDs nothing (split {}/{})", g.label, cut, g.n),
+				grid_count_rune(&s, 0xFFFD) == 0 && s.carry_len == cut && s.grid[screen_idx(&s, 0, 0)] == 'x',
+				carry_detail("pre-resize", &s, g.want, cut, g.n))
+
+			screen_resize(&s, 3, 30)
+			support.check(t, fmt.tprintf("resize blanks GRID CONTENT but not the pending BYTES: {} still holds {} byte(s) of U+{} (split {}/{})", g.label, cut, cp_name(g.want), cut, g.n),
+				s.rows == 3 && s.cols == 30 &&
+					s.grid[screen_idx(&s, 0, 0)] == ' ' &&
+					s.carry_len == cut,
+				carry_detail("post-resize", &s, g.want, cut, g.n))
+
+			feed_bytes(&s, tail)
+			support.check(t, fmt.tprintf("CASE 3 {} split across screen_resize reassembles into ONE cell (split after byte {}/{})", g.label, cut, g.n),
+				s.grid[screen_idx(&s, 0, 0)] == g.want &&
+					grid_count_rune(&s, 0xFFFD) == 0 &&
+					s.carry_len == 0,
+				carry_detail("post-tail", &s, g.want, cut, g.n))
+		}
+	}
+}
+
+// is_spine_row mirrors resize_harness.rh_is_rule EXACTLY (non-blank, and
+// nothing but the 3-byte `─` sequence, byte for byte). It lives here rather
+// than being imported because resize_harness is in another package and its
+// matcher is deliberately NOT loosened: the point of this test is that the
+// emulator produces a row the UNCHANGED matcher accepts.
+is_spine_row :: proc(s: string) -> bool {
+	t := s
+	for len(t) > 0 && t[0] == ' ' { t = t[1:] }
+	for len(t) > 0 && t[len(t) - 1] == ' ' { t = t[:len(t) - 1] }
+	if len(t) == 0 { return false }
+	spine := "\u2500"
+	k := 0
+	for k < len(t) {
+		if k + len(spine) > len(t) { return false }
+		for m := 0; m < len(spine); m += 1 {
+			if t[k + m] != spine[m] { return false }
+		}
+		k += len(spine)
+	}
+	return true
+}
+
+// The same defect seen the way the flood sees it. rh_is_rule accepts a row
+// only if EVERY non-blank cell is the 3-byte `─` sequence, so a single
+// U+FFFD anywhere in the row makes rh_rule_count read one short of what the
+// app painted — which is the flood's "rules=1, width correct, stale frame?"
+// message with nothing stale about it.
+//
+// The grid legitimately BLANKS on resize (that is python's behaviour and it
+// is not changed), so the assertion is stated in the two phases the flood
+// actually produces:
+//
+//   phase A  the glyph that straddled the boundary reassembles into ONE
+//            spine cell, and NOTHING on the grid is U+FFFD;
+//   phase B  the app then repaints the rest of the row, and the finished row
+//            is a PURE rule row of `total` glyphs that rh_is_rule accepts.
+@(test)
+screen_resize_mid_glyph_leaves_a_pure_spine_row :: proc(t: ^testing.T) {
+	spine_wire := "\u2500"
+	spine_bytes := transmute([]u8)spine_wire
+	support.eq_i(t, "the spine glyph is 3 UTF-8 bytes", len(spine_bytes), 3)
+	totals := [3]int{1, 7, 20}
+
+	for cut := 1; cut <= 2; cut += 1 {
+		for total in totals {
+			s : Screen
+			screen_init(&s, 4, 60)
+			// Draw the row, splitting the LAST glyph across the resize boundary —
+			// the ordering a TIOCSWINSZ landing mid-frame produces.
+			for i := 0; i < total - 1; i += 1 { feed_bytes(&s, spine_bytes) }
+			feed_bytes(&s, spine_bytes[0:cut])
+			screen_resize(&s, 5, 60)
+			feed_bytes(&s, spine_bytes[cut:])
+			row := row_of(&s, 0)
+
+			support.check(t, fmt.tprintf("phase A: the spine glyph split after byte {} across a resize reassembles as ONE cell, zero U+FFFD", cut),
+				grid_count_rune(&s, 0xFFFD) == 0 && utf8_rune_count(row) == 1 && is_spine_row(row),
+				fmt.tprintf("row='{}' rune_len={} FFFD={} carry_len={} first-FFFD-at=({},{})",
+					row, utf8_rune_count(row), grid_count_rune(&s, 0xFFFD), s.carry_len,
+					grid_first_rune(&s, 0xFFFD)))
+
+			// Phase B: the app repaints the remainder of the row after the resize.
+			for i := 0; i < total - 1; i += 1 { feed_bytes(&s, spine_bytes) }
+			row = row_of(&s, 0)
+			support.check(t, fmt.tprintf("phase B: the repainted spine of {} is a PURE rule row, zero U+FFFD", total),
+				is_spine_row(row) && grid_count_rune(&s, 0xFFFD) == 0,
+				fmt.tprintf("row='{}' rune_len={} FFFD={}", row, utf8_rune_count(row),
+					grid_count_rune(&s, 0xFFFD)))
+			eq_s_local(t, fmt.tprintf("spine of {} round-trips byte-exact through the resize", total), row, spine_of(total))
+		}
+	}
+}
+
+spine_of :: proc(n: int) -> string {
+	spine_wire := "\u2500"
+	b := transmute([]u8)spine_wire
+	buf : [dynamic]u8
+	for i := 0; i < n; i += 1 {
+		for j := 0; j < len(b); j += 1 { append(&buf, b[j]) }
+	}
+	out := copy_string(buf)
+	delete(buf)
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MINIMUM CASE 1c — THE 4096-BYTE WORKING-BUFFER FLUSH IS A SECOND PLACE A
+// GLYPH CAN BE LOST, AND IT FIRES ON EVERY FULL-SCREEN REPAINT.
+//
+// screen_feed copies the feed into a FEED_CHUNK_CAP-byte stack buffer and
+// flushes it when the buffer fills. Mid-way through ONE feed is therefore a
+// sequence boundary that has nothing to do with where the WRITES were split.
+// Before the fix, that flush handed any unfinished lead bytes to `carry` and
+// then went on decoding the rest of the SAME feed — but `carry` is only
+// prepended at the START of a feed, so those bytes sat there while the
+// continuation bytes further down the buffer decoded as orphans.
+//
+// The result is the flood's signature exactly: a U+FFFD painted into the
+// middle of an otherwise correct row, plus a `carry` left dirty, which then
+// corrupts the NEXT feed as well. This is not the resize bug wearing a
+// different hat — it needs no resize at all. A full termbox frame is larger
+// than FEED_CHUNK_CAP, so every repaint crosses the flush, and whether it
+// lands mid-glyph depends on that frame's byte layout. That is the residual
+// resize_flood flake the carry/resize fix alone did not remove (measured:
+// carry/resize fix only = 2/96 storms still red; this fix added = 0/96).
+//
+// A naive 'A'*N test cannot see this: with no autowrap in this emulator the
+// cursor clamps at cols long before the flush boundary can do damage. The
+// stream has to be CUP-addressed the way a real frame is, which is what
+// build_cup_frame produces.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// build_cup_frame builds a CUP-addressed frame of `rows` rows of `cols` 'A'
+// cells, with ONE `glyph` spliced in so that its bytes straddle the
+// FEED_CHUNK_CAP boundary `cut` bytes into the glyph: the glyph starts at
+// byte FEED_CHUNK_CAP - cut, so `cut` of its bytes sit before the flush and
+// the remainder lands after it. It reports where it actually spliced so the
+// caller can assert the intended cut really was the cut produced.
+build_cup_frame :: proc(glyph: []u8, cut: int, rows, cols: int) -> (buf: [dynamic]u8, spliced_at: int) {
+	buf = make([dynamic]u8, 0, rows * (cols + 16))
+	target := FEED_CHUNK_CAP - cut
+	spliced_at = -1
+	for r := 1; r <= rows; r += 1 {
+		cup := fmt.tprintf("\x1b[{};1H", r)
+		cb := transmute([]u8)cup
+		// Splice only between cells. If `target` ever fell inside the CUP escape
+		// itself the splice would corrupt the escape, not the glyph, so we refuse
+		// to splice there and let the caller see spliced_at != target.
+		for k := 0; k < len(cb); k += 1 { append(&buf, cb[k]) }
+		for c := 0; c < cols; c += 1 {
+			if spliced_at < 0 && len(buf) == target {
+				for j := 0; j < len(glyph); j += 1 { append(&buf, glyph[j]) }
+				spliced_at = target
+				continue
+			}
+			append(&buf, 'A')
+		}
+	}
+	return buf, spliced_at
+}
+
+@(test)
+screen_feed_chunk_boundary_never_strands_a_glyph :: proc(t: ^testing.T) {
+	cases := []Carry_Glyph{
+		Carry_Glyph{"─ U+2500 3-byte spine", 0x2500, [4]u8{0xE2, 0x94, 0x80, 0x00}, 3},
+		Carry_Glyph{"U+1F600 4-byte astral", 0x1F600, [4]u8{0xF0, 0x9F, 0x98, 0x80}, 4},
+	}
+
+	for g in cases {
+		garr := g.bytes
+		glyph := garr[0:g.n]
+		// cut = 1..n-1 are the straddling positions. cut = n is the CONTROL:
+		// the glyph ends exactly ON the boundary, so nothing is split.
+		for cut := 1; cut <= g.n; cut += 1 {
+			frame, spliced_at := build_cup_frame(glyph, cut, 24, 200)
+			tag := "STRADDLE"
+			if cut == g.n { tag = "CONTROL " }
+
+			support.check(t, fmt.tprintf("{} {} frame splices the glyph at the intended offset (cut={})", tag, g.label, cut),
+				spliced_at == FEED_CHUNK_CAP - cut,
+				fmt.tprintf("spliced_at={} want {}", spliced_at, FEED_CHUNK_CAP - cut))
+			support.check(t, fmt.tprintf("{} {} frame is larger than the {}-byte flush so the flush really fires", tag, g.label, FEED_CHUNK_CAP),
+				len(frame) > FEED_CHUNK_CAP,
+				fmt.tprintf("len={} cap={}", len(frame), FEED_CHUNK_CAP))
+
+			s : Screen
+			screen_init(&s, 24, 200)
+			feed_bytes(&s, frame[:])
+
+			fffd := grid_count_rune(&s, 0xFFFD)
+			found := grid_count_rune(&s, g.want)
+			support.check(t, fmt.tprintf("{} {} across the {} flush (cut={}): the glyph is present exactly once", tag, g.label, FEED_CHUNK_CAP, cut),
+				found == 1,
+				fmt.tprintf("count(U+{})={} want 1; U+FFFD={} carry_len={}", cp_name(g.want), found, fffd, s.carry_len))
+			support.check(t, fmt.tprintf("{} {} across the {} flush (cut={}): NOTHING on the grid is U+FFFD", tag, g.label, FEED_CHUNK_CAP, cut),
+				fffd == 0,
+				fmt.tprintf("U+FFFD={} glyph_count={} carry_len={}", fffd, found, s.carry_len))
+			support.check(t, fmt.tprintf("{} {} across the {} flush (cut={}): no bytes left stranded in carry after a COMPLETE feed", tag, g.label, FEED_CHUNK_CAP, cut),
+				s.carry_len == 0,
+				fmt.tprintf("carry_len={} — a non-zero carry after a whole, complete stream is the lead byte(s) the flush never re-prepended", s.carry_len))
+			delete(frame)
+		}
+	}
+}
+
+utf8_rune_count :: proc(s: string) -> int {
+	n := 0
+	b := transmute([]u8)s
+	i := 0
+	for i < len(b) {
+		want := utf8_seq_len(b[i])
+		if want == 0 { n += 1; i += 1; continue }
+		r, consumed := utf8.decode_rune(b[i:])
+		if consumed == 0 { n += 1; i += 1; continue }
+		_ = r
+		n += 1
+		i += consumed
+	}
+	return n
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

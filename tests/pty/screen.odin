@@ -46,6 +46,10 @@ import "core:unicode/utf8"
 MAX_SCREEN_ROWS :: 64
 MAX_SCREEN_COLS :: 256
 
+// FEED_CHUNK_CAP is the size of screen_feed's stack working buffer. Named so
+// the flush boundary and the tests that straddle it agree on what it is.
+FEED_CHUNK_CAP :: 4096
+
 // Esc_State is the parser's position in an escape sequence. The whole point
 // of spelling it out is change (1) above: python's regex could not pause, so
 // a truncated escape dropped bytes.
@@ -88,6 +92,15 @@ Screen :: struct {
 
 // screen_init zeroes and sizes the screen. Grid is pre-blanked so an unread
 // cell reads as ' ' rather than 0, matching python's [[" "]*cols].
+//
+// This stays a FULL reset, including `carry`, and it must: screen_init is the
+// CONSTRUCTION path. Its call sites are `pty_spawn` (tests/pty/pty.odin, one
+// brand-new driver per scenario) and every test that builds a Screen from
+// scratch. None of them has a stream history to keep, and a `carry` that
+// survived from one scenario into the next would be cross-talk between
+// unrelated byte streams — a far worse bug than the one resize needed.
+// Only screen_resize preserves anything, and it preserves exactly the
+// in-flight bytes.
 screen_init :: proc(s: ^Screen, rows, cols: int) {
 	s.rows = rows
 	s.cols = cols
@@ -105,8 +118,45 @@ screen_init :: proc(s: ^Screen, rows, cols: int) {
 // screen_resize replaces the grid, keeping nothing — exactly python's
 // `self.grid = [[" "] * cols for _ in range(rows)]`. Keeping content across a
 // resize would be inventing a reflow rule the harness has no business having.
+//
+// EXCEPT THE BYTES THAT ARE NOT GRID CONTENT YET.
+//
+// `carry` holds a UTF-8 sequence whose tail has not arrived. It belongs to the
+// BYTE STREAM, not to the screen geometry: there is no reflow question to
+// invent a rule for, because it has no cell yet. `screen_init` resets it for
+// good reason — init is the CONSTRUCTION path and a brand-new Screen has no
+// stream history to preserve. A resize is not a construction, it is the same
+// stream continuing over a different grid, so resize takes the pending bytes
+// with it and hands them straight back, same bytes, same order, still
+// incomplete.
+//
+// WHY THE OLD `screen_resize == screen_init` WAS A REAL DEFECT, NOT A CORNER
+// CASE. A TIOCSWINSZ landing between a lead byte and its continuation bytes
+// dropped the lead byte. The continuation then decoded with no lead and painted
+// U+FFFD — one replacement character per orphaned byte, so TWO for the
+// 3-byte `─` split after its lead and THREE for a 4-byte astral glyph split
+// after its lead. resize_flood read that as `rules=1` on a row whose WIDTH
+// was correct: "the surviving frame is the FINAL size, not a stale one" was
+// reported about a frame that was fine, because the EMULATOR had eaten bytes
+// the app really wrote. Proven by screen_resize_preserves_utf8_carry_at_every_
+// boundary and screen_resize_mid_glyph_leaves_a_pure_spine_row, both of which
+// fail against the pre-fix code and pass against this.
+//
+// NOTE — THE ADJACENT HAZARD THAT IS STILL HERE, DELIBERATELY UNCHANGED.
+// A resize landing in the middle of an ESCAPE sequence resets `state` to
+// NORMAL and `csi_len` to 0, so the surviving bytes of that sequence decode
+// as TEXT and get painted: mid-CSI leaves `3HAGAIN` on the row, a mid-OSC
+// leaks the window title onto the grid, and a mid-`ESC (` re-creates the
+// charset smear this emulator exists to prevent. Same class, worse blast
+// radius, and NOT fixed here — see the lane report for the probe output and
+// the recommended one-line extension (preserve state/csi_buf/csi_len the same
+// way carry is preserved).
 screen_resize :: proc(s: ^Screen, rows, cols: int) {
+	carry := s.carry
+	carry_len := s.carry_len
 	screen_init(s, rows, cols)
+	s.carry = carry
+	s.carry_len = carry_len
 }
 
 screen_idx :: proc(s: ^Screen, r, c: int) -> int {
@@ -178,7 +228,7 @@ screen_feed :: proc(s: ^Screen, data: []u8) {
 	// prepended to the NEXT feed. Max pending is one incomplete sequence
 	// (<=3 bytes) plus the new chunk, so the working buffer is sized for
 	// carry + input with a fixed bound.
-	local_cap :: 4096
+	local_cap :: FEED_CHUNK_CAP
 	local : [local_cap]u8
 	li := 0
 	for i := 0; i < s.carry_len; i += 1 {
@@ -191,7 +241,27 @@ screen_feed :: proc(s: ^Screen, data: []u8) {
 		if li >= local_cap {
 			// Flush what we have and continue. Bounded, never unbounded.
 			screen_decode_into(s, local[:li])
-			li = 0
+			// THE FLUSH IS NOT THE END OF THE STREAM. If the flush boundary cut a
+			// multi-byte sequence, decode_into stashed the unfinished lead bytes
+			// in `carry` — but those bytes belong to the MIDDLE of this feed, not
+			// to its end, and nothing prepends them again until the NEXT call. So
+			// the continuation bytes further down `data` would decode as orphans:
+			// U+FFFD painted into an otherwise correct row, and a stale `carry`
+			// that then corrupts whatever comes next. Reclaim the stash to the
+			// head of the working buffer so the sequence continues in order.
+			//
+			// This is the SECOND loss path behind the resize_flood flake: a full
+			// termbox frame is >4096 bytes, so the flush happens on every repaint
+			// and lands mid-glyph whenever the frame's byte layout puts one there.
+			// A plain 'A'*N test cannot see it (no autowrap, so the cursor clamps
+			// before the boundary does any damage); a CUP-addressed frame can.
+			rest := s.carry_len
+			if rest > 0 {
+				for k := 0; k < rest; k += 1 { local[k] = s.carry[k] }
+				s.carry_len = 0
+			}
+			li = rest
+			if li >= local_cap { break } // unreachable: a stash is <=3 bytes
 		}
 		local[li] = data[i]
 		li += 1
