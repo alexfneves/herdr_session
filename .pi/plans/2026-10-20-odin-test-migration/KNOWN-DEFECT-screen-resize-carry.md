@@ -1,7 +1,7 @@
 # pty screen emulator and UTF-8 / escape-state across a resize
 
 **Status: the byte-loss defect described below is FIXED** (`f9573cd`, folded `pty_screen` 73 → 163).
-**Status: a SIBLING defect in the same file is OPEN** — see *Sibling defect* near the bottom.
+**Status: the SIBLING defect is ALSO FIXED** (`97d63b4`, folded into the same row → `pty_screen` 218).
 
 ---
 
@@ -60,31 +60,56 @@ satisfy the matcher **as-is** — the new spine test ships a byte-exact local mi
 
 ---
 
-## OPEN — SIBLING DEFECT: a resize mid-ESCAPE resets parser state, so surviving escape bytes paint as text
+## FIXED — SIBLING DEFECT: a resize mid-ESCAPE reset the parser, painting control bytes as text
 
-Found by the same lane while verifying. **Deliberately not changed** — same class, wider blast radius,
-one-line extension away (preserve `state` / `csi_buf` / `csi_len` exactly as `carry` now is), but it is a
-separate change with its own falsification and should be scheduled rather than tacked on.
+**Fixed by:** the follow-on lane, `97d63b4` (+55 assertions, all in `screen_test`).
 
-| where the resize lands | what the emulator does today |
+Found by the `f9573cd` lane while verifying. Reproduced pre-fix against `37acc76` with the preserved probe:
+
+| where the resize lands | pre-fix behaviour (probe output) |
 |---|---|
-| mid-ESC | `[2;3HWORLD` painted as literal text → `row0='[2;3HWORLD'` |
-| mid-CSI params | `row0='3HAGAIN'` — the parameters paint as text |
-| mid-CSI digit | the CUP is destroyed; `Z` lands at col 0 instead of col 3 |
-| mid-OSC | **window title leaks onto the grid**: `row0='tle:secret cd'` |
-| mid-`ESC (` | `'Bion'` — the exact charset-smear class this emulator exists to prevent |
+| mid-ESC | `post[state=NORMAL]`, `row0='[2;3HWORLD'` |
+| mid-CSI params | `post[csi_len=0]`, `row0='3HAGAIN'` |
+| mid-CSI digit | CUP destroyed — `Z` landed at `(0,1)` instead of `(2,3)` |
+| mid-OSC | **window title on the grid**: `row0='tle:secretcd'` |
+| mid-`ESC (` | `row0='Bion'` — the exact charset smear this emulator exists to prevent |
 
-**Why it matters more than the carry bug:** the carry bug corrupted a glyph. This puts **control-sequence
-bytes on the screen as content** — including an OSC payload (window title). Any suite that drives resizes
-while the app is mid-escape can read a row that never existed, and a mid-OSC leak could surface a string
-in a frame assertion that was never meant to be visible content.
+All five now falsified: each test **fails against pre-fix code and passes after**, with controls that a
+resize with nothing pending still blanks normally, that a resize after a COMPLETE sequence preserves
+nothing, and that `screen_init` remains a full reset.
 
-**Probe preserved by the lane:** `/tmp/csi_probe_preserved_for_dispatch.odin` (`csi_probe_preserved_for_report.odin`
-in the lane report) — reproduce before scheduling.
+### Design decision — preserve (a), not void-and-swallow (b)
 
-**Fix shape:** preserve the escape-parser state across `screen_resize` the same way `carry` is preserved.
-Required falsification per row of the table above, plus the control that a resize with no pending escape
-still blanks normally.
+A resize changes the **grid**, not what the next byte **means**. In a real terminal the parser lives in
+the input layer (xterm's state machine, VTE's parser) and the grid is the terminal object; `SIGWINCH`
+reshapes the grid and never touches the parser, so a straddling sequence continues and is evaluated
+against the **new** geometry — the same argument that carried the `carry` fix.
+
+**(b) was rejected on a concrete failure mode, not a preference:** voiding-but-swallowing does stop the
+smear, but it drops a **positioning verb the app actually sent** — the cursor stays where it was while
+the app believes it moved. Every subsequent write in that frame lands one cursor-jump off: a positional
+desync that is **invisible to the very "no literal escape bytes on the grid" check that voiding exists to
+satisfy**, corrupting the *next* frame instead of this one.
+
+### Out-of-bounds CUP after resize (thought about, not sidestepped)
+
+Completing the sequence makes this reachable, so it is proven on **both axes**:
+- **Row** (CUP `9;4` on a 3-row grid): sequence still completes, nothing paints, **`dropped == 4`** —
+  counted, not silent — and the next in-bounds CUP renders normally.
+- **Column** (CUP `1;18` on a 10-col grid): `cx=17` out of range → **`dropped == 4`**, grid blank,
+  recovers. **This path was silently discarding glyphs before** — the row guard counted, the column guard
+  did not — so `screen_put_cursor` was made to count it. Slightly beyond the literal brief, entirely
+  inside `screen.odin`, required by "no silent data loss".
+- Coordinates valid for **both** sizes are unaffected.
+
+`dropped` itself now **survives resize**: it is a stream-level audit counter, and wiping it on resize
+would delete the evidence the counter exists to provide. Nothing else in the repo reads it.
+
+### Post-fix verification
+
+`pty_width 67 · pty_ffi 27 · pty_screen 218 · pty_driver 52` — no floor dropped, 364 pass / 0 fail.
+5 fresh `resize_flood` runs (40 storms) with **0 failures**, `rules=2` read consistently where the flake
+read `rules=1`.
 
 ---
 
