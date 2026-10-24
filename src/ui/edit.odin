@@ -30,7 +30,7 @@ package ui
 // can be drawn.
 //
 // ── WHY THE CARET IS A CLAY ELEMENT ─────────────────────────────────────────
-// The caret is a real element in the Clay tree (a one-cell Text of '▏'), not a
+// The caret is a real element in the Clay tree (a one-cell Text of '█'), not a
 // tb_set_cell smeared over the layout. That keeps the frame rule — every glyph
 // arrives through Clay -> render.paint — true, keeps the caret clipped by
 // whatever scissor the enclosing section is under, and lets Clay lay the row out
@@ -49,12 +49,13 @@ import tb "../../vendor/termbox2-odin"
 
 import "core:unicode/utf8"
 
-// CARET_GLYPH is a one-cell thin bar: visible on any background and impossible
-// to mistake for a character the user typed.
-CARET_GLYPH :: '▏'
+// CARET_GLYPH is a one-cell full block: it fills the cell it sits on, so it
+// stays visible against any background and cannot be missed the way a one-pixel
+// bar is on a high-DPI terminal.
+CARET_GLYPH :: '█'
 
 // CARET_TEXT is the same glyph as a string, for the text element.
-CARET_TEXT :: "▏"
+CARET_TEXT :: "█"
 
 // EDIT_MAX caps one line of input. Generous for a filter or a session name, and a
 // hard bound on what a single paste can put on screen.
