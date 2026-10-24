@@ -98,6 +98,10 @@ paint_scene :: proc() {
 		ui.sessions_paint(scene.v, shown, scene.l.cols, scene.body, scene.pal)
 	case .edit:
 		ui.edit_paint(scene.e, "hs.case.edit", scene.edit_w, scene.pal)
+		// Mirrors `edit_body` in the product (RCH-10 change 2): the edit field
+		// and the rule directly under it are painted as a PAIR here too, so the
+		// scene cannot drift from what the product actually draws.
+		ui.frame_rule("hs.case.edit.rule", scene.pal)
 	case .list:
 		ui.list_paint(scene.list, scene.list_rows, scene.l.cols, scene.l.main_rows, scene.pal)
 	case .sessions_float:
@@ -619,6 +623,62 @@ case_ui_frame :: proc() -> bool {
 	check("the rule rows on screen are exactly the rule rows the frame lays out",
 		same_rule_set,
 		fmt.tprintf("rendered=[{}] expected=[{}]", rows_csv(seen_rules[:]), rows_csv(want_rules[:])))
+
+	// 2d. RCH-10 CHANGE 2 -- the rule under the single-line EDIT FIELD.
+	//
+	// Asserted from the frame case rather than from ui-edit, because this is a
+	// frame-geometry property (where the rule sits, in rows, relative to the
+	// field it introduces) and ui-edit's own assertion count is pinned
+	// separately by this lane's brief. So the frame case borrows the edit scene
+	// for exactly these checks and then puts its own scene back.
+	//
+	// The failure mode this is aimed at is the one the change exists to kill:
+	// with the divider derived from MAIN's grow box, an edit field that owns one
+	// row of a tall MAIN leaves the divider down by the FOOTER. Asserting the
+	// rule at `main_y + RULE_ROWS` says it sits one row under the field, not
+	// `main_rows` rows under it.
+	ui.edit_init(&g_edit)
+	ui.edit_insert_rune(&g_edit, 'n')
+	scene.mode = .edit
+	scene.e = &g_edit
+	scene.edit_w = l.cols - 4
+	paint_scene()
+	edit_rule_row := l.main_y + ui.RULE_ROWS
+	_, edit_line_content := row_is_rule(l.main_y, cols)
+	check("change 2: the edit field is painted on MAIN's first row",
+		edit_line_content > 0,
+		fmt.tprintf("row {} = '{}'", l.main_y, trim(line_of(l.main_y, cols))))
+	check("change 2: a full-width rule sits DIRECTLY under the edit field",
+		rule_at(edit_rule_row, cols),
+		fmt.tprintf("row {} (field at {}) is a rule row? {}", edit_rule_row, l.main_y,
+			rule_at(edit_rule_row, cols)))
+	check("change 2: the edit rule is under the field, not down by the footer",
+		edit_rule_row < l.rule_bot,
+		fmt.tprintf("edit rule={} footer rule={}", edit_rule_row, l.rule_bot))
+	// The edit surface is a ruled surface: field + rule, priced the same way the
+	// filter surface is, and nothing else on the screen changed.
+	edit_seen := rendered_rule_rows(rows, cols)
+	edit_want: [dynamic]i32
+	append(&edit_want, l.rule_top)
+	append(&edit_want, edit_rule_row)
+	append(&edit_want, l.rule_bot)
+	sort.quick_sort_proc(edit_seen[:], proc(a, b: i32) -> int { return int(a - b) })
+	sort.quick_sort_proc(edit_want[:], proc(a, b: i32) -> int { return int(a - b) })
+	edit_set_ok := len(edit_seen) == len(edit_want)
+	if edit_set_ok {
+		for a, i in edit_seen {
+			if a != edit_want[i] { edit_set_ok = false }
+		}
+	}
+	check("change 2: the edit scene renders exactly one extra rule, under the field",
+		edit_set_ok,
+		fmt.tprintf("rendered=[{}] expected=[{}]", rows_csv(edit_seen[:]), rows_csv(edit_want[:])))
+	// Restore the frame case's own scene so the checks below see what they expect.
+	scene.mode = .sessions
+	scene.v = &g_sessions
+	scene.rows = nil
+	scene.body = 1
+	paint_scene()
 
 	// 5. THE childGap >= 2 INVARIANT. With childGap = 1 the betweenChildren rule
 	//    resolves onto the FOLLOWING section's first row and paints over its

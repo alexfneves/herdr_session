@@ -1167,6 +1167,19 @@ edit_body :: proc(l: ui.Frame_Layout) {
 	w := l.cols - 2
 	if w < 8 { w = 8 }
 	ui.edit_paint(&tui.name_ed, "hs.tui.name.edit", w, &tui.pal)
+	// RCH-10 CHANGE 2 -- the separation line under the name field.
+	//
+	// Same element, same mechanism as the filter's rule. The alternative this
+	// replaces was the spine's own main->footer divider, which is derived from
+	// MAIN's GROW box: in a name state MAIN is one row of editor and the rest is
+	// empty, so the divider landed near the FOOTER -- far below the field, not
+	// under it. A rule whose position is a function of how much empty space the
+	// user happens to have is not a rule under the field.
+	//
+	// No `chrome` row is consumed here: a name state has no table body beneath
+	// the field, so the rule's row is the surface's own price and nothing has
+	// to shrink to pay for it.
+	ui.frame_rule("hs.tui.name.edit.rule", &tui.pal)
 }
 
 // picker_body paints the SAME ui.List for the remote picker and the theme
