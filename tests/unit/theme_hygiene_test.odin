@@ -73,8 +73,18 @@ hygiene_xdg_config_home_did_not_leak :: proc(t: ^testing.T) {
 	bad := snap.bad_leak
 	support.check(t, "XDG_CONFIG_HOME did not leak into the caller",
 		bad == 0 && proc_xdg_matches_start(),
+		// ARITY FIXED (UIP-5). This line had FOUR placeholders and FIVE
+		// arguments — `swaps` was passed twice — so every value from the
+		// second one onward was shifted left and the surplus spilled as
+		// `%!(EXTRA …)`. What that means in practice: `start='1'` on the
+		// ledger was not the start value at all, it was the SWAP COUNT, and
+		// the real start value had been shoved into `now=`. A detail line
+		// whose numbers are not what they claim is worse than no detail line,
+		// which is exactly why the gate fails a suite over a stray marker.
+		// Four placeholders, four arguments now; the asserted condition is
+		// byte-identical to before.
 		fmt.tprintf("leaks={} battery_swaps={} start='{}' now='{}' ('<UNSET>' = genuinely unset)",
-			bad, swaps, swaps, proc_xdg_start_display(), proc_xdg_now_display()))
+			bad, swaps, proc_xdg_start_display(), proc_xdg_now_display()))
 }
 
 // Bound arrays, not inline literals: Odin will not coerce a bare composite literal into a
