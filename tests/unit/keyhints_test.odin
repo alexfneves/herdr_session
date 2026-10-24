@@ -274,14 +274,35 @@ keyhints_span_kinds_map_to_the_dominant_and_muted_roles :: proc(t: ^testing.T) {
 // fails as surely as one vanishing that should have survived.
 @(test)
 keyhints_mode_survival_set_is_exactly_what_the_width_holds :: proc(t: ^testing.T) {
-	widths : [8]int = {120, 100, 80, 60, 40, 30, 20, 10}
 	ks := ui.KEYS_MODE[:]
+	// The eight ordinary widths PLUS every hint's own crossing point and one
+	// cell below it. Sweep only round numbers and the check's resolution is as
+	// coarse as the gap between them: a budget that is one cell too tight is
+	// invisible at 30 when the threshold is 24. Every threshold gets tested ON
+	// the line and one cell off it, so an off-by-one cannot hide between the
+	// round numbers.
+	base_widths : [8]i32 = {120, 100, 80, 60, 40, 30, 20, 10}
+	widths: [dynamic]i32 = {}
+	defer delete(widths)
+	for x in base_widths { append(&widths, x) }
+	for i := 0; i < len(ks); i += 1 {
+		thr := kh_min_width(ks, i)
+		kh_append_width(&widths, thr)
+		if thr > 1 { kh_append_width(&widths, thr - 1) }
+	}
 	for w in widths {
-		line := ui.keys_line(ks, i32(w))
+		line := ui.keys_line(ks, w)
 		pieces := kh_split(line, ui.SEP)
-		want := kh_expected_kept(ks, i32(w))
+		want := kh_expected_kept(ks, w)
 		got := kh_visible_units(pieces[:], ks)
 		mark := kh_marker_shown(pieces[:])
+		// The hard floor of the new format, stated rather than skipped: below
+		// the exit unit's OWN width nothing whole fits at all, and the only
+		// thing the footer can emit is the ellipsised exit unit. That is a
+		// half unit by the rule above, and it is unavoidable — so the width
+		// where the no-half promise stops being keepable is pinned here as a
+		// number instead of being quietly excluded.
+		degenerate := w < ui.footer_unit_cols(ks[len(ks)-1])
 		support.check(t, fmt.tprintf("KEYS_MODE at {} cols keeps exactly {} unit(s)", w, len(want)),
 			kh_same_units(got[:], want[:]),
 			fmt.tprintf("width={} want=[{}] got=[{}] line='{}'",
@@ -290,8 +311,11 @@ keyhints_mode_survival_set_is_exactly_what_the_width_holds :: proc(t: ^testing.T
 		// when something was cut, the single `…` head — which is what makes
 		// the marker's interaction with the split explicit rather than implied.
 		support.check(t, fmt.tprintf("KEYS_MODE at {} cols: pieces == units + marker", w),
-			len(pieces) == len(got) + (mark ? 1 : 0),
-			fmt.tprintf("pieces={} units={} marker={} line='{}'", len(pieces), len(got), mark, line))
+			len(pieces) == len(got) + (mark ? 1 : 0) ||
+				(degenerate && len(got) == 0 && len(pieces) == 1 &&
+					kh_ends_with_ellipsis(pieces[0])),
+			fmt.tprintf("pieces={} units={} marker={} below_the_floor={} line='{}'",
+				len(pieces), len(got), mark, degenerate, line))
 		delete(pieces)
 		delete(want)
 		delete(got)
@@ -358,6 +382,7 @@ keyhints_every_table_honours_the_width_contract :: proc(t: ^testing.T) {
 	blank := ""
 	misplaced := ""
 	double := ""
+	degen := ""
 	tables := ui.all_hint_tables()
 	n_tables := 0
 	for th in tables {
@@ -375,8 +400,26 @@ keyhints_every_table_honours_the_width_contract :: proc(t: ^testing.T) {
 				kh_first(&over, fmt.tprintf("{} at {} cols: '{}' is {} cells",
 					th.name, w, line, ui.text_cols(line)))
 			}
-			if !kh_no_half_unit(line) {
-				kh_first(&half, fmt.tprintf("{} at {} cols: half unit in '{}'", th.name, w, line))
+			// THE NO-HALF DOMAIN IS "EVERY WIDTH THE ATOM CAN FIT", AND THE
+			// FLOOR IS THE EXIT UNIT'S OWN WIDTH — which the inversion MOVED.
+			// The old ctrl-c exit unit was `ctrl-c quit` = 11 cells; `Quit:
+			// ctrl-c` is 12, so the last width at which those tables can show a
+			// whole unit moved up by a cell, and at the 10-column sweep width
+			// they now land in the ellipsize path (`Quit: ctr…`). Same shift for
+			// KEYS_MODE: `esc quit` 8 -> `Quit: esc` 9. Below the floor the
+			// footer's only honest option is the ellipsised exit unit, so that
+			// degradation is asserted as its own case instead of being waved
+			// through: a table that ISN'T showing a whole unit while it could,
+			// or that is NOT the ellipsised exit unit when it can't, both land
+			// here. At MIN_COLS (40) every table is whole by a wide margin.
+			if w >= int(ui.footer_unit_cols(last)) {
+				if !kh_no_half_unit(line) {
+					kh_first(&half, fmt.tprintf("{} at {} cols (exit unit is {} cells): half unit in '{}'",
+						th.name, w, ui.footer_unit_cols(last), line))
+				}
+			} else if !kh_ends_with_ellipsis(line) {
+				kh_first(&degen, fmt.tprintf("{} at {} cols is below the exit unit's own {} cells and the line is neither whole nor ellipsised: '{}'",
+					th.name, w, ui.footer_unit_cols(last), line))
 			}
 			if line == "" {
 				kh_first(&blank, fmt.tprintf("{} at {} cols: blank footer", th.name, w))
@@ -405,8 +448,10 @@ keyhints_every_table_honours_the_width_contract :: proc(t: ^testing.T) {
 		n_tables > 0 && lost == "", fmt.tprintf("first loss: '{}'", lost))
 	support.check(t, "and none overflows its width at any of the 8 widths", over == "",
 		fmt.tprintf("first overflow: '{}'", over))
-	support.check(t, "and none shows a half unit at any width", half == "",
+	support.check(t, "and none shows a half unit at any width its exit unit can fit", half == "",
 		fmt.tprintf("first half: '{}'", half))
+	support.check(t, "and below that floor the line is the ellipsised exit unit (the moved floor is asserted, not skipped)",
+		degen == "", fmt.tprintf("first breach: '{}'", degen))
 	support.check(t, "and none goes blank while it has hints", blank == "",
 		fmt.tprintf("first blank: '{}'", blank))
 	support.check(t, "and the front-cut marker only ever heads the line", misplaced == "",
@@ -437,6 +482,12 @@ keyhints_half_unit_predicate_falsifies :: proc(t: ^testing.T) {
 	// An ellipsised unit: this `…` trails the text, it is not the cut marker.
 	support.check(t, "the predicate FAILS on an ellipsised unit",
 		!kh_no_half_unit("Quit:…"), fmt.tprintf("kh_half_unit_count('Quit:…')={}", kh_half_unit_count("Quit:…")))
+	// A unit whose KEY was shaved by the ellipsize. Description and seam are
+	// intact, so a seam-only rule waves it through: `Quit: e…` is `esc` worn
+	// down to `e`, a binding the user cannot press. This case is why a piece
+	// carrying `…` is disqualifying whatever else it looks like.
+	support.check(t, "the predicate FAILS on a unit whose key was shaved by the ellipsize",
+		!kh_no_half_unit("Quit: e…"), fmt.tprintf("kh_half_unit_count('Quit: e…')={}", kh_half_unit_count("Quit: e…")))
 	// A whole unit glued to a fragment on its right.
 	support.check(t, "the predicate FAILS when the fragment is on the right",
 		!kh_no_half_unit("Theme: t | At"),
@@ -651,12 +702,36 @@ kh_half_unit_count :: proc(line: string) -> int {
 // starts at the seam is a bare key with its description cut away.
 kh_is_whole_unit :: proc(p: string) -> bool {
 	b := transmute([]u8)(p)
+	// The ellipsis belongs ONLY to the cut marker (which never reaches here — it
+	// is skipped as its own piece). A `…` inside a unit piece means THAT piece
+	// was truncated, whatever else it looks like: `Quit: e…` has a description,
+	// a seam and a non-space byte after it, and its key is `esc` shaved down
+	// to `e`. Without this clause the seam rule alone cannot see a truncated
+	// key, because the first letter of the key survives.
+	if kh_contains_utf8_ellipsis(b) { return false }
 	i := kh_index_of_bytes(b, ": ")
 	if i <= 0 { return false } // absent, or the description was cut away
 	for j := i + 2; j < len(b); j += 1 {
 		if b[j] != ' ' { return true }
 	}
 	return false // ": " with nothing but space after it: no key
+}
+
+kh_contains_utf8_ellipsis :: proc(b: []u8) -> bool {
+	// U+2026 HORIZONTAL ELLIPSIS in UTF-8 is E2 80 A6.
+	for i := 0; i + 2 < len(b); i += 1 {
+		if b[i] == 0xE2 && b[i+1] == 0x80 && b[i+2] == 0xA6 { return true }
+	}
+	return false
+}
+
+// kh_ends_with_ellipsis recognises the truncated tail of the degenerate
+// ellipsised-exit-unit line.
+kh_ends_with_ellipsis :: proc(s: string) -> bool {
+	b := transmute([]u8)(s)
+	if len(b) < 3 { return false }
+	i := len(b) - 3
+	return b[i] == 0xE2 && b[i+1] == 0x80 && b[i+2] == 0xA6
 }
 
 kh_index_of_bytes :: proc(b: []u8, needle: string) -> int {
@@ -819,6 +894,13 @@ kh_split :: proc(s: string, sep: string) -> [dynamic]string {
 
 kh_starts_with :: proc(s, prefix: string) -> bool {
 	return kh_starts_with_at(s, prefix)
+}
+
+// kh_append_width adds a width unless it is already in the set (the thresholds
+// overlap each other and the round numbers).
+kh_append_width :: proc(ws: ^[dynamic]i32, w: i32) {
+	for x in ws^ { if x == w { return } }
+	append(ws, w)
 }
 
 kh_starts_with_at :: proc(s, prefix: string) -> bool {
