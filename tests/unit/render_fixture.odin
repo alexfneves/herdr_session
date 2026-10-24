@@ -72,7 +72,18 @@ RENDER_C_HILITE : clay.Color = clay.Color{40, 90, 200, 255}
 RENDER_FRAME_W   :: 44
 RENDER_FRAME_H   :: 12
 RENDER_FRAME_PAD :: 1
-RENDER_FRAME_GAP :: 2 // must be >= 2: see the childGap trap noted in render_border
+// RENDER_FRAME_GAP is this FIXTURE's childGap, not the product's. It is 2
+// because this picture deliberately exercises Clay's `betweenChildren`
+// divider path, which needs a gap to place its rule in (at 1 the rule lands on
+// the next child's first row — the trap `render_border` documents).
+//
+// It therefore does NOT mirror src/ui/frame.odin's FRAME_GAP any more: RCH-10
+// change 6 moved the product's spine off betweenChildren onto dedicated
+// one-row rule elements and set the root childGap to 0. The two constants now
+// describe different things on purpose — if you are here looking for the reason
+// the numbers differ, that is it, and if you change one do NOT assume the other
+// should follow.
+RENDER_FRAME_GAP :: 2
 
 // render_build_frame is the standard picture: a bordered panel, one left-aligned
 // text row, one centred row containing wide glyphs, one right-aligned row. That

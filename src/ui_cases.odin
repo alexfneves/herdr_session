@@ -27,6 +27,7 @@ package main
 import ui "./ui"
 import app "./app"
 import render "./render"
+import termhandoff "./terminal"
 import clay "../clay-odin"
 import termbox2 "../vendor/termbox2-odin"
 
@@ -569,7 +570,8 @@ case_ui_frame :: proc() -> bool {
 		}
 	}
 	// 2. THE DIVIDERS ARE STILL THERE, and since there is no border and no pad,
-	//    they span the FULL terminal width.
+	//    they span the FULL terminal width -- asserted BY ROW POSITION, never by
+	//    which Clay internal produced them (D-N).
 	rule_top_n := count_glyph_in_row(l.rule_top, cols, '─')
 	rule_bot_n := count_glyph_in_row(l.rule_bot, cols, '─')
 	check("divider between HEADER and MAIN spans the full width",
@@ -580,6 +582,58 @@ case_ui_frame :: proc() -> bool {
 		fmt.tprintf("row {} holds {} horizontal glyphs (need {})", l.rule_bot, rule_bot_n, cols))
 	check("the two dividers are on different rows",
 		l.rule_bot != l.rule_top, fmt.tprintf("rule rows {} and {}", l.rule_top, l.rule_bot))
+
+	// 2-CHANGE-6. THE BLANK ROW IS GONE AT *BOTH* SPINE BOUNDARIES.
+	//
+	// This is the half of the fix a screenshot of the top of the terminal would
+	// never show, so it is asserted explicitly rather than by symmetry-with-the-
+	// top. The old spine derived each rule from the gap it shared with its
+	// neighbours, which cost one BLANK row on each side of each line: the state
+	// word sat on row 1, a wasted row sat on row 2, the rule painted on row 3.
+	// Same shape at the bottom, one row above the footer.
+	//
+	// Asserted on the RENDERED grid, on the rows `l` claims, in both directions:
+	//  * the row directly under the last header row IS the rule (not blank), so
+	//    nothing was left between the state word and the line under it;
+	//  * the row directly above the footer IS the rule (not blank), which is
+	//    the bottom boundary handled the same way as the top one;
+	//  * and neither rule row holds content, so closing the blank row did not
+	//    push a line onto a glyph -- the failure the old gap was there to stop.
+	header_last := l.header_y + ui.HEADER_ROWS - 1
+	check("change 6: the row directly under the state word is the rule, not a blank row",
+		l.rule_top == header_last + 1 && rule_at(l.rule_top, cols),
+		fmt.tprintf("last header row={} rule_top={} blank row under the state word? {}",
+			header_last, l.rule_top, row_is_blank(header_last + 1, cols)))
+	check("change 6: the row directly above the footer is the rule, not a blank row",
+		l.footer_y == l.rule_bot + ui.RULE_ROWS && rule_at(l.rule_bot, cols),
+		fmt.tprintf("rule_bot={} footer_y={} blank row above the footer? {}",
+			l.rule_bot, l.footer_y, row_is_blank(l.rule_bot + 1, cols)))
+	check("change 6: MAIN starts immediately under its rule (no stranded row)",
+		l.main_y == l.rule_top + ui.RULE_ROWS,
+		fmt.tprintf("rule_top={} main_y={}", l.rule_top, l.main_y))
+
+	// 2-CHANGE-6b. THE ROW BUDGET CLOSES EXACTLY. If a row is being eaten or
+	// invented by the new spine this sum is off, at any size: once for the
+	// terminal the case actually painted, and once at the smallest terminal the
+	// resize tier lets through (terminal.MIN_ROWS), where the frame falls back to
+	// the notice path and an off-by-one would show as a clipped or duplicated row.
+	budget_ok := 2*ui.FRAME_PAD + ui.HEADER_ROWS + ui.RULE_ROWS + l.main_rows + ui.RULE_ROWS + ui.FOOTER_ROWS == rows
+	check("change 6: header + rule + main + rule + footer sums to the terminal height",
+		budget_ok,
+		fmt.tprintf("2*{} + {} + {} + {} + {} + {} != {}", ui.FRAME_PAD, ui.HEADER_ROWS, ui.RULE_ROWS,
+			l.main_rows, ui.RULE_ROWS, ui.FOOTER_ROWS, rows))
+	min_l := ui.frame_layout(cols, termhandoff.MIN_ROWS)
+	min_sum := ui.HEADER_ROWS + ui.RULE_ROWS + min_l.main_rows + ui.RULE_ROWS + ui.FOOTER_ROWS
+	check("change 6: at MIN_ROWS the budget still closes and MAIN is not empty",
+		min_sum == termhandoff.MIN_ROWS && min_l.main_rows > 0,
+		fmt.tprintf("rows={} main_rows={} sum={}", termhandoff.MIN_ROWS, min_l.main_rows, min_sum))
+	// Filter shown at MIN_ROWS: the ruled filter surface plus the column header
+	// must still leave the table at least one row, or the smallest legal terminal
+	// would show a rule and no table.
+	check("change 6: at MIN_ROWS with the filter shown the table still has rows",
+		min_l.main_rows - ui.sessions_chrome(true) >= 1,
+		fmt.tprintf("main_rows={} chrome={} -> body={}", min_l.main_rows,
+			ui.sessions_chrome(true), min_l.main_rows - ui.sessions_chrome(true)))
 
 	// 2b. RCH-10 CHANGE 1 -- the rule directly under the filter.
 	//
@@ -680,19 +734,24 @@ case_ui_frame :: proc() -> bool {
 	scene.body = 1
 	paint_scene()
 
-	// 5. THE childGap >= 2 INVARIANT. With childGap = 1 the betweenChildren rule
-	//    resolves onto the FOLLOWING section's first row and paints over its
-	//    content. This is the assertion that fails loudly if FRAME_GAP is lowered.
+	// 5. NO CONTENT SHARES A RULE ROW — the guard the old "DO NOT LOWER
+	// FRAME_GAP" comment was protecting, RESTATED for the new mechanism rather
+	// than deleted with it.
+	//
+	// Under the old spine this was a claim about FRAME_GAP: at childGap 1 the
+	// betweenChildren rule resolved onto the next section's first row and
+	// painted over its content, so the gap had to stay >= 2. Under change 6
+	// there is no rule living in a gap at all, so the same property is checked
+	// against EVERY rule row the screen actually renders — the spine pair plus
+	// each ruled surface's own rule — instead of against a hardcoded pair of
+	// constants. That is what makes it the guard rather than the comment: if
+	// anyone re-adds `betweenChildren` to ROOT without raising FRAME_GAP back to
+	// >= 2, or lets a rule land on a glyph by any other route, this fails.
 	clean := true
-	clean_why := "both rule rows are pure rule"
-	i := 0
-	for i < 2 {
-		ry := l.rule_top
-		if i == 1 {
-			ry = l.rule_bot
-		}
-		cx := i32(1)
-		for cx < cols-1 {
+	clean_why := "every rendered rule row is pure rule"
+	for ry, _ in seen_rules {
+		cx := i32(0)
+		for cx < cols {
 			ch := glyph_at(cx, ry)
 			if ch != 0 && ch != ' ' && !is_rule_glyph(ch) {
 				clean = false
@@ -702,7 +761,9 @@ case_ui_frame :: proc() -> bool {
 			}
 			cx += 1
 		}
-		i += 1
+		if !clean {
+			break
+		}
 	}
 	check("no content shares a rule row (childGap >= 2 invariant)", clean, clean_why)
 

@@ -3,35 +3,47 @@ package ui
 // ============================================================================
 // ui.frame — the outer layout, owned by Clay (T5.1)
 //
-// The frame is the top-to-bottom spine: Header (2 rows: title + state) / Main
-// (grows) / Footer (1 row), inside a root element sized to exactly the terminal.
+// The frame is the top-to-bottom spine, FIVE elements stacked inside a root
+// sized to exactly the terminal, with the root's childGap at 0 so nothing is
+// inserted between them:
 //
-// ONE Clay feature draws every line the user sees, so nothing is hand-painted:
-// the root carries `border.width.betweenChildren = 1` and NOTHING else —
-// left/right/top/bottom stay 0. That emits exactly two RECTANGLE commands, the
-// dividers Header|Main and Main|Footer, in the border colour, and no outer box.
-// render.paint turns a 1-cell-thick rule into a light glyph through tb_linestyle,
-// so "a rule between each section" is Clay geometry end to end and application
-// code never emits a box glyph.
+//   Header   HEADER_ROWS (2)  title + state word
+//   rule     RULE_ROWS   (1)  RULE_TOP_ID   header -> main
+//   Main     grows            the caller's surface
+//   rule     RULE_ROWS   (1)  RULE_BOT_ID   main -> footer
+//   Footer   FOOTER_ROWS (1)
+//
+// Nothing is hand-painted: each line is the bottom border of a dedicated
+// RULE_ROWS-tall element (frame_rule), laid out by Clay like any other child,
+// and render.paint turns a 1-cell-thick border side into a light glyph through
+// tb_linestyle. "A rule between each section" is Clay geometry end to end and
+// application code never emits a box glyph.
 //
 // ── RCH-1: NO OUTER BORDER (docs: 50-requirement-changes.md) ───────────────
-// The app is bounded only by the terminal edges. `BorderAll(1)` is what drew the
-// box, so it is gone rather than recoloured, and FRAME_PAD dropped to 0 with it:
-// the border allowance was 2 columns and 2 rows, and the content now uses them.
-// The dividers are unaffected because they were never part of the box — they come
-// from the section container's own betweenChildren width.
+// The app is bounded only by the terminal edges. `BorderAll(1)` is what drew
+// the box, so it is gone rather than recoloured, and FRAME_PAD dropped to 0
+// with it: the border allowance was 2 columns and 2 rows, and the content now
+// uses them. ROOT still sets no left/right/top/bottom border width; the only
+// border anywhere on ROOT is the bottom side of a rule element.
 //
-// ── WHY childGap IS 2 AND MUST STAY 2 ───────────────────────────────────────
-// clay.c places a betweenChildren rule at
+// ── THE RULE MECHANISM CHANGED (RCH-10 changes 1, 2, 6) ────────────────────
+// Every rule used to come from ROOT's `border.width.betweenChildren`, which
+// clay.c places at
 //
 //     rule_y = child_top - floor(childGap / 2) - floor(betweenChildren / 2)
 //
-// and BOTH halves are integer divisions in C. With childGap = 1 that resolves to
-// `child_top - 0 - 0`: the rule lands ON the following section's first row and
-// paints over its content. childGap = 2 puts the rule exactly one row above the
-// next child — it hugs the section it introduces without ever touching a glyph.
-// This is a hard invariant, not a style choice; the `ui-frame` case asserts that
-// every rule row is free of content.
+// That formula is why FRAME_GAP had to be 2 (at childGap 1 the rule resolves
+// onto the next section's first row and paints over its content) and it is why
+// the frame wasted a blank row on each side of every line: the gap had to be
+// big enough to park the rule in. Deriving a line's position from a knob that
+// also moves content is also what put the main->footer divider far below a
+// one-row edit field, since it followed MAIN's GROW box rather than the field.
+//
+// Dedicated rule elements carry their position in the layout instead of
+// borrowing it from a gap: they land where the child list says, cannot be moved
+// by a gap, cannot land on a glyph, and are one row wide so the row budget can
+// see them. FRAME_GAP's own comment states the guard that replaced the old
+// "DO NOT LOWER" one — read it before touching that constant.
 //
 // ── GEOMETRY IS PREDICTED, THEN CHECKED AGAINST CLAY ────────────────────────
 // A view needs its usable cell box BEFORE EndLayout (Clay only computes layout
@@ -65,21 +77,58 @@ import "core:unicode/utf8"
 FRAME_PAD :: 0 // RCH-1: there is no outer border to keep content clear of.
 	           // This used to be 1 as the border allowance; with the box gone the
 	           // freed 2x2 belongs to the content. Rules span the full width.
-FRAME_GAP :: 2 // childGap — see the >= 2 invariant above. DO NOT LOWER.
+FRAME_GAP :: 0 // ROOT childGap — 0 since RCH-10 change 6. REWRITE OF THE OLD
+	           // "DO NOT LOWER" GUARD, and it must be read before touching this:
+	           //
+	           //  * THE OLD HAZARD WAS REAL. The spine's dividers used to come
+	           //    from ROOT's `border.width.betweenChildren`, and Clay puts
+	           //    such a rule at
+	           //        rule_y = child_top - floor(childGap/2) - floor(between/2)
+	           //    so at between=1, childGap=1 it resolves onto the FOLLOWING
+	           //    section's FIRST ROW and `draw_rule` fills those cells with
+	           //    the border colour -- painting over the content. childGap=2
+	           //    parked it in the gap instead. That is the invariant the old
+	           //    comment pinned, and lowering the gap used to corrupt content.
+	           //
+	           //  * WHY 0 IS SAFE NOW, AND ONLY NOW. Change 6 removed
+	           //    `betweenChildren` from ROOT entirely and moved every divider
+	           //    onto a dedicated RULE_ROWS-tall child element (frame_rule).
+	           //    There is no longer a rule that lives in the gap, so there is
+	           //    no gap for it to need. The rows the old mechanism wasted on
+	           //    either side of the line are back in the content budget.
+	           //
+	           //  * THE GUARD, RESTATED FOR THE NEW ARRANGEMENT. This may stay 0
+	           //    only while BOTH hold: (a) ROOT carries no
+	           //    `border.width.betweenChildren`, and (b) every rule in the
+	           //    frame is a dedicated RULE_ROWS element in ROOT's child list.
+	           //    If you re-add `betweenChildren` to ROOT you MUST raise this
+	           //    back to >= 2 in the same commit, or the re-added rule lands
+	           //    on a content row. `no content shares a rule row` and
+	           //    `the rule rows on screen are exactly the rule rows the frame
+	           //    lays out` in ui-frame are what catch either half being
+	           //    wrong -- keep them, they are the guard, not this comment.
 // HEADER_ROWS is 2 since the state moved up out of the footer: row 1 is the
 // title, row 2 the current state, both centred. Everything downstream of this
 // constant (frame_layout's rule_top / main_y / main_rows / footer_y) follows it,
 // which is why the smallest supported terminal (MIN_ROWS = 10, terminal/resize) leaves
-// main_rows = 10 - (0 + 2 + 2 + 2 + 1 + 0) = 3 > 0 rather than underflowing.
+// main_rows = 10 - (0 + 2 + 1 + 1 + 1 + 0) = 5 > 0 rather than underflowing.
 HEADER_ROWS :: 2
 FOOTER_ROWS :: 1
-RULE_ROWS :: 1 // a betweenChildren rule occupies exactly one cell row
+RULE_ROWS :: 1 // a dedicated rule element is exactly one cell row tall
 
 ROOT_ID :: "hs.frame.root"
 HEADER_ID :: "hs.frame.header"
 MAIN_ID :: "hs.frame.main"
 FOOTER_ID :: "hs.frame.footer"
 FOOTER_HINTS_ID :: "hs.frame.footer.hints"
+
+// The two spine boundaries, as dedicated elements rather than as a rule derived
+// from a shared gap. RCH-10 change 6 requires BOTH ends handled the same way --
+// a top boundary that closes its blank row while the bottom one keeps its is
+// half a fix, and it is the half a screenshot of the top of the terminal would
+// never show.
+RULE_TOP_ID :: "hs.frame.rule.top" // header -> main
+RULE_BOT_ID :: "hs.frame.rule.bot" // main -> footer
 
 // RULED_SURFACE_ROWS is the price of a RULED SURFACE: one row of content with
 // a dedicated rule element directly underneath it. The filter line and the
@@ -91,8 +140,8 @@ RULED_SURFACE_ROWS :: 1 + RULE_ROWS
 // frame_rule draws one dedicated rule: an element exactly RULE_ROWS tall whose
 // ONLY decoration is a 1-cell bottom border in the palette's border colour.
 //
-// The reason a dedicated element exists rather than another use of Clay's
-// `betweenChildren` fill-rect is placement. A betweenChildren rule is
+// This is the mechanism RCH-10 replaces Clay's `betweenChildren` fill-rect
+// with, and the reason it exists is placement. A betweenChildren rule is
 // positioned by Clay from the gap it shares with its neighbours
 // (`rule_y = child_top - floor(childGap/2) - floor(between/2)`), so its row
 // is a function of a knob that also moves content -- which is why closing the
@@ -119,6 +168,29 @@ frame_rule :: proc(id: string, pal: ^Palette) {
 // Frame_Layout is the cell box the frame hands to its sections. Every field is
 // absolute (terminal coordinates) so a view can assert against a back-buffer
 // position without re-deriving anything.
+// Frame_Layout is the cell box the frame hands to its sections. Every field is
+// absolute (terminal coordinates) so a view can assert against a back-buffer
+// position without re-deriving anything.
+//
+// The spine is FIVE ROOT children stacked with ROOT childGap = 0 (RCH-10
+// change 6), and each one occupies exactly the rows named here:
+//
+//   HEADER      HEADER_ROWS    rows 0..1              title + state word
+//   RULE_TOP    RULE_ROWS      row  2                 header -> main
+//   MAIN        main_rows      rows 3..(3+main_rows-1)
+//   RULE_BOT    RULE_ROWS      row  3+main_rows       main -> footer
+//   FOOTER      FOOTER_ROWS    last row
+//
+// The budget closes exactly, which is the identity the paper pass checked first:
+//
+//   HEADER_ROWS + RULE_ROWS + main_rows + RULE_ROWS + FOOTER_ROWS
+//     = 2 + 1 + (rows-5) + 1 + 1 = rows                        (Q.E.D.)
+//
+// `rule_bot` is derived UPWARD (main_y + main_rows) and the footer is derived
+// from the bottom of the screen, and the two are equal only because the budget
+// closes. That is deliberate: if a future edit breaks the identity, the two
+// derivations disagree and a rule/row assertion fails, instead of both silently
+// moving together and eating a row nobody charged.
 Frame_Layout :: struct {
 	cols : i32, // usable columns (full terminal width since RCH-1)
 	header_y : i32,
@@ -133,10 +205,14 @@ frame_layout :: proc(cols, rows: i32) -> Frame_Layout {
 	l := Frame_Layout{}
 	l.cols = cols - 2*FRAME_PAD
 	l.header_y = FRAME_PAD
-	l.rule_top = FRAME_PAD + HEADER_ROWS + FRAME_GAP - 1
-	l.main_y = FRAME_PAD + HEADER_ROWS + FRAME_GAP
-	l.main_rows = rows - (FRAME_PAD + HEADER_ROWS + FRAME_GAP + FRAME_GAP + FOOTER_ROWS + FRAME_PAD)
-	l.rule_bot = l.main_y + l.main_rows + FRAME_GAP - 1
+	// One upward chain, each link one constant wide. Read top to bottom the five
+	// children's rows are visible as an accumulation; nothing here is a magic
+	// offset and nothing here is derived from FRAME_GAP (change 6 removed the
+	// gap's role in placing rules, so the row budget names RULE_ROWS directly).
+	l.rule_top = FRAME_PAD + HEADER_ROWS
+	l.main_y = l.rule_top + RULE_ROWS
+	l.main_rows = rows - (FRAME_PAD + HEADER_ROWS + RULE_ROWS + RULE_ROWS + FOOTER_ROWS + FRAME_PAD)
+	l.rule_bot = l.main_y + l.main_rows
 	l.footer_y = rows - FRAME_PAD - FOOTER_ROWS
 	if l.cols < 0 {
 		l.cols = 0
@@ -559,7 +635,17 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 	}
 	clay.BeginLayout()
 
-	// ── ROOT: fixed to the terminal, bordered, rules between every section ──
+	// ── ROOT: fixed to the terminal, NO border, NO childGap ──────────────
+	// RCH-10 change 6: ROOT no longer carries `border.width.betweenChildren`
+	// and its childGap is 0. The dividers are now dedicated RULE_ROWS children
+	// (RULE_TOP_ID / RULE_BOT_ID, opened below), which own their own row
+	// instead of borrowing one from a gap. That is what closes the blank line
+	// that used to sit between the state word and the rule under it, at both
+	// ends of the spine.
+	//
+	// ROOT still sets no left/right/top/bottom border: RCH-1 removed the outer
+	// box and nothing here puts it back. `backgroundColor = pal.bg` is the only
+	// decoration, and it is a flat fill behind everything, not a painted cell.
 	clay._OpenElementWithId(clay.ID(ROOT_ID))
 	clay.ConfigureOpenElement(clay.ElementDeclaration{
 		layout = clay.LayoutConfig{
@@ -572,12 +658,6 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 			layoutDirection = clay.LayoutDirection.TopToBottom,
 		},
 		backgroundColor = pal.bg,
-		// ONLY betweenChildren is set. Any non-zero left/right/top/bottom here
-		// would redraw the outer box that RCH-1 removed.
-		border = clay.BorderElementConfig{
-			color = pal.border,
-			width = clay.BorderWidth{betweenChildren = 1},
-		},
 	})
 
 	// ── HEADER: the title on row 1, the state on row 2, both centred ──────
@@ -606,6 +686,12 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 	clay.Text(ellipsize(f.state, inner), clay.TextElementConfig{textColor = pal.header_fg})
 	clay._CloseElement()
 
+	// ── THE HEADER -> MAIN RULE, a row of its own, immediately under the
+	//    state word. There is deliberately nothing between the two: the blank
+	//    line that used to sit here was the gap the betweenChildren rule needed,
+	//    and change 6 removed the need for it. ──────────────────────────────
+	frame_rule(RULE_TOP_ID, pal)
+
 	// ── MAIN: left OPEN for the caller ──
 	clay._OpenElementWithId(clay.ID(MAIN_ID))
 	clay.ConfigureOpenElement(clay.ElementDeclaration{
@@ -627,6 +713,13 @@ frame_close :: proc(p: ^Painter, f: ^Frame) -> render.Stats {
 		pal = &DEFAULT_PALETTE
 	}
 	clay._CloseElement() // MAIN
+	// ── THE MAIN -> FOOTER RULE. Same element, same helper, same position in
+	//    the stack as RULE_TOP has below the header ── the bottom boundary is
+	//    handled identically to the top one, which is the symmetry RCH-10
+	//    change 6 demands. Before this the footer sat FRAME_GAP rows below MAIN's
+	//    last row with a blank line in between, exactly mirroring (and equally
+	//    wasting) the row this change removed at the top. ──────────────────────
+	frame_rule(RULE_BOT_ID, pal)
 	frame_footer(f, pal)
 	clay._CloseElement() // ROOT
 	cmds := clay.EndLayout(0)
