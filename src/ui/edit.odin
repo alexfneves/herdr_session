@@ -30,11 +30,43 @@ package ui
 // can be drawn.
 //
 // ── WHY THE CARET IS A CLAY ELEMENT ─────────────────────────────────────────
-// The caret is a real element in the Clay tree (a one-cell Text of '█'), not a
-// tb_set_cell smeared over the layout. That keeps the frame rule — every glyph
-// arrives through Clay -> render.paint — true, keeps the caret clipped by
+// The caret is a real element in the Clay tree (a container holding one Text),
+// not a tb_set_cell smeared over the layout. That keeps the frame rule — every
+// glyph arrives through Clay -> render.paint — true, keeps the caret clipped by
 // whatever scissor the enclosing section is under, and lets Clay lay the row out
 // as [prefix][caret][suffix] like any other row.
+//
+// ── THE CARET OVERLAYS THE CHARACTER IT SITS ON (IT IS NOT AN EXTRA CELL) ────
+// The caret is drawn OVER the glyph it precedes. The caret element is exactly as
+// wide as that glyph (1 cell for a narrow rune, 2 for a wide CJK/emoji rune) and
+// paints THAT CHARACTER — the real one, from the buffer — in `caret_fg` on
+// `caret_bg`. The prefix and the suffix do not paint it again: every glyph in
+// the field is drawn exactly once. Consequences:
+//
+//   * moving the caret left/right reflows NOTHING. The text after the caret does
+//     not slide a cell right when the caret enters the field, and sliding back
+//     and forth cannot shuffle the row.
+//   * the whole painted field is `text_cols(buffer)` cells wide, plus exactly
+//     ONE extra cell only when the caret sits at the END of the buffer — where
+//     there is no glyph to overlay, so the caret paints CARET_GLYPH ('█') and
+//     owns that cell outright.
+//   * the caret element is `edit_caret_cell`'s cell, i.e. where the real
+//     terminal cursor lands, which is why "the caret is a real Clay element
+//     carrying its own background" still has to hold.
+//
+// WHY THE GLYPH IS PAINTED AND NEVER LEFT TO THE TERMINAL'S CURSOR
+//
+// The terminal cursor is kept BLINKING (DECSCUSR `ESC[3 q`) — a hard product
+// requirement — and an inverted-cell blink spends half its cycle inverting the
+// cell the cursor is on. If the caret cell instead held a bare block and relied
+// on the terminal's own cursor overlay to reveal the character underneath, that
+// character would VANISH for half of every blink. So the character is painted
+// into the caret cell by Clay and is visible in BOTH blink states: with the
+// blink off you see the glyph in `caret_fg` on `caret_bg`; with the blink on
+// the terminal INVERTS that same cell and the glyph is still there, knocked out
+// in the other colour. Removing the glyph to paint a bare block, or trusting
+// the cursor overlay to bring it back, breaks the blink requirement and is the
+// thing this paragraph exists to prevent.
 //
 // ── WHY A FIXED BUFFER ───────────────────────────────────────────────────────
 // Editing means inserting and deleting in the middle, and `delete(arr[i:j])` on a
@@ -53,7 +85,9 @@ import "core:unicode/utf8"
 
 // CARET_GLYPH is a one-cell full block: it fills the cell it sits on, so it
 // stays visible against any background and cannot be missed the way a one-pixel
-// bar is on a high-DPI terminal.
+// bar is on a high-DPI terminal. It is painted ONLY where there is nothing to
+// overlay — the caret at the END of the buffer. Mid-field, the caret paints the
+// real character under it instead (see the overlay note above).
 CARET_GLYPH :: '█'
 
 // CARET_TEXT is the same glyph as a string, for the text element.
@@ -331,11 +365,21 @@ edit_width :: proc(e: ^Edit) -> i32 {
 }
 
 // Edit_View is everything needed to draw one line of editor inside `width`
-// cells. `scroll` is the left-hand cut in DISPLAY COLUMNS, chosen so the caret
-// cell always lands inside the window.
+// cells. `scroll` is the left-hand cut in DISPLAY COLUMNS, chosen so the WHOLE
+// caret overlay — both cells of it, when it sits on a wide rune — always lands
+// inside the window.
+//
+// The three pieces tile the visible row with no gaps and no overlaps:
+//
+//   [prefix][  overlay, painted by the caret element  ][suffix]
+//
+// `overlay` is the character the caret sits on and is drawn EXACTLY ONCE, by
+// the caret. It is not part of `prefix` or `suffix`.
 Edit_View :: struct {
 	prefix : string, // visible text before the caret
-	suffix : string, // visible text after the caret
+	overlay : string, // the glyph the caret sits ON; "" at end of buffer
+	overlay_cols : i32, // cells the caret element occupies — NEVER 0 (1 at end)
+	suffix : string, // visible text AFTER the overlay
 	caret_x : i32, // caret column WITHIN the window (0..width-1)
 	scroll : i32, // columns cut off the left
 }
@@ -348,10 +392,37 @@ edit_view :: proc(e: ^Edit, width: i32) -> Edit_View {
 	caret_col := edit_caret_col(e)
 	full := edit_width(e)
 
-	// Scroll only when we must: the caret cell stays inside [0, width-1].
+	// The caret claims exactly the cells of the glyph it sits on. At end of
+	// buffer there is no glyph: it paints CARET_GLYPH and costs one cell, which
+	// is the ONLY case where the field is one cell wider than the text.
+	ov_bytes : int = 0
+	ov_cols : i32 = 1
+	if e.caret < e.len {
+		r, n := utf8.decode_rune_in_string(string(e.buf[e.caret:e.len]))
+		if n > 0 && r != utf8.RUNE_ERROR {
+			w := cell_cols(r)
+			if w < 1 {
+				w = 1
+			}
+			ov_bytes = n
+			ov_cols = w
+			v.overlay = string(e.buf[e.caret : e.caret+n])
+		} else {
+			// Undecodable byte under the caret: the block stands in for it over
+			// the single cell that byte itself measured, so the column arithmetic
+			// still adds up against edit_width().
+			ov_bytes = 1
+			ov_cols = 1
+		}
+	}
+	v.overlay_cols = ov_cols
+
+	// Scroll only when we must: the caret's WHOLE overlay stays inside
+	// [0, width-1] — a 2-cell overlay near the right edge scrolls one cell
+	// further than a 1-cell one would, so its second cell is never orphaned.
 	scroll: i32 = 0
-	if caret_col >= width {
-		scroll = caret_col - width + 1
+	if caret_col+ov_cols > width {
+		scroll = caret_col + ov_cols - width
 	}
 	// Never scroll past the end of the text, so a shrinking terminal can never
 	// reveal columns that do not exist.
@@ -362,6 +433,12 @@ edit_view :: proc(e: ^Edit, width: i32) -> Edit_View {
 	if scroll > max_scroll {
 		scroll = max_scroll
 	}
+	// A window narrower than the overlaid rune cannot fit the rune at all; never
+	// report a negative caret, just let the window's own edge clip the tail of
+	// the overlay. The caret's REPORTED cell (its first) is still inside.
+	if scroll > caret_col {
+		scroll = caret_col
+	}
 	if scroll < 0 {
 		scroll = 0
 	}
@@ -371,14 +448,14 @@ edit_view :: proc(e: ^Edit, width: i32) -> Edit_View {
 		prefix_full = string(e.buf[0:e.caret])
 	}
 	suffix_full := ""
-	if e.caret < e.len {
-		suffix_full = string(e.buf[e.caret:e.len])
+	if e.caret+ov_bytes < e.len {
+		suffix_full = string(e.buf[e.caret+ov_bytes : e.len])
 	}
 
 	v.scroll = scroll
 	v.caret_x = caret_col - scroll
 	v.prefix = window_cols(prefix_full, scroll, v.caret_x)
-	rest := width - v.caret_x - 1
+	rest := width - v.caret_x - ov_cols
 	if rest < 0 {
 		rest = 0
 	}
@@ -386,16 +463,22 @@ edit_view :: proc(e: ^Edit, width: i32) -> Edit_View {
 	return v
 }
 
-// edit_paint draws one line of editor as [prefix][caret][suffix]. All three are
-// ordinary Clay elements, so the caret obeys whatever scissor the enclosing
-// section is under.
+// edit_paint draws one line of editor as [prefix][caret overlay][suffix]. All
+// three are ordinary Clay elements, so the caret obeys whatever scissor the
+// enclosing section is under.
+//
+// The caret element's width is v.overlay_cols — the display width of the glyph
+// it sits on — and the glyph it paints is that glyph (CARET_TEXT only at end of
+// buffer). The overlaid character is drawn HERE and nowhere else, so the row
+// never contains it twice and never loses it.
 //
 // The caret is its OWN element rather than bare text, for two reasons:
 //
 //  * it carries its own background. The caret is a PAIR — a `caret_fg` glyph
 //    knocked out of a `caret_bg` block — and a bare text element has no
 //    background of its own. The block has to be a container whose
-//    backgroundColor is the caret's cell.
+//    backgroundColor is the caret's cell, and that container is what spans all
+//    `overlay_cols` cells of a wide rune.
 //  * the caller can find it. Clay records the box it gave the caret; once the
 //    frame is laid out edit_caret_cell reads that box back and the real
 //    terminal cursor is aimed at the cell Clay itself chose. Nothing predicts
@@ -420,17 +503,28 @@ edit_paint :: proc(e: ^Edit, id: string, width: i32, pal: ^Palette) {
 		cid := clay.ID_LOCAL(CARET_ID_LABEL)
 		e.caret_id = cid
 		e.caret_laid_out = true
+		// The caret paints the character it sits on. At end of buffer there is
+		// none, so it paints the block. Either way the glyph is IN the cell, so
+		// it survives the blink in both states.
+		caret_text := v.overlay
+		if len(caret_text) == 0 {
+			caret_text = CARET_TEXT
+		}
+		caret_cols := v.overlay_cols
+		if caret_cols < 1 {
+			caret_cols = 1
+		}
 		if clay.UI(cid)({
 			layout = clay.LayoutConfig{
 				sizing = clay.Sizing{
-					width  = clay.SizingFixed(1),
+					width  = clay.SizingFixed(f32(caret_cols)),
 					height = clay.SizingFixed(1),
 				},
 				layoutDirection = clay.LayoutDirection.LeftToRight,
 			},
 			backgroundColor = pal.caret_bg,
 		}) {
-			clay.Text(CARET_TEXT, clay.TextElementConfig{textColor = pal.caret_fg})
+			clay.Text(caret_text, clay.TextElementConfig{textColor = pal.caret_fg})
 		}
 		if len(v.suffix) > 0 {
 			clay.Text(v.suffix, clay.TextElementConfig{textColor = pal.fg})
