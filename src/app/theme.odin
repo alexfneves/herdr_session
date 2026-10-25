@@ -70,6 +70,15 @@ package app
 // single `caret` slot is a fg for a bare glyph, not a block with a background),
 // and a readable state word ON the accent bar.
 //
+// FOUR of those six are authored per theme. TWO of them — `run_hl` and `stop_hl`
+// — are NOT authored at all and are UNSET (0) in every theme literal in `THEMES`
+// below. They are derived at `ui.palette_of` time from four slots the theme
+// already had to author (`running`, `stopped`, `accent`, `sel_fg`) by one rule,
+// `theme_hl_pair_kept`, documented in full at its own section below. That is
+// what "treat the theme as an array of colours and let elements point at it"
+// means for these two roles: nobody picks a highlight colour for one state word
+// in one theme, so it cannot be wrong in one theme.
+//
 // WHY TWO HIGHLIGHT ROLES AND NOT ONE (ORCH D-M corrected by ACK-1) — the
 // original decision asked for a single `state_hl` (13 -> 18). That version is
 // WRONG and is not what this palette ships: with one colour, a selected RUNNING
@@ -80,6 +89,19 @@ package app
 // same mechanical cost, so the total is 19 and NOT 18. The deviation from the
 // 18 in D-M is deliberate and is recorded here as well as in the worker report.
 //
+// ONE MORE WAY TO FLATTEN, AND IT IS NOW THE FORBIDDEN ONE. Two distinct role
+// names are necessary but not sufficient: if `run_hl` is given the SAME colour
+// as `sel_fg`, the state word is a different ROLE from the bar text and the
+// same PIXELS anyway. Six of the ten shipped themes did exactly that
+// (`run_hl = sel_fg` = "the loudest thing on a bright bar"), and the user's
+// complaint was precisely that a selected row's `running` looked like every
+// other highlighted character. `run_hl == sel_fg` is therefore not a legitimate
+// styling choice any more: `theme_hl_pair_kept` must return a colour at least
+// `THEME_HL_FLOOR_TEXT` (1.6:1) away from `sel_fg`, and
+// `roles_highlight_pair_is_never_the_bar_text_colour` proves it for every theme.
+// Any comment anywhere in this repo that calls `run_hl == sel_fg` deliberate is
+// describing the bug, not the design.
+//
 // # DEFAULT IS gruvbox-dark (D4)
 //
 // `catppuccin-latte` ships and is selectable — the user asked for it by name —
@@ -89,6 +111,7 @@ package app
 // ============================================================================
 
 import "core:fmt"
+import "core:math"
 import "base:runtime"
 import "core:strings"
 
@@ -123,8 +146,8 @@ Palette :: struct {
 	desc_fg  : u32, // the DESCRIPTION token — muted relative to key_fg
 	caret_bg : u32, // background of the cell the caret sits on
 	caret_fg : u32, // the caret glyph itself
-	run_hl   : u32, // the "running" word WHILE its row is selected
-	stop_hl  : u32, // the "stopped" word WHILE its row is selected
+	run_hl   : u32, // the "running" word WHILE its row is selected — UNSET BY DESIGN, derived by `theme_hl_pair_kept`
+	stop_hl  : u32, // the "stopped" word WHILE its row is selected — UNSET BY DESIGN, derived by `theme_hl_pair_kept`
 }
 
 // PALETTE_SLOTS names the count the smoke suite asserts on. Adding a slot to
@@ -135,26 +158,38 @@ Palette :: struct {
 // caret_bg, caret_fg, run_hl, stop_hl). It is NOT 18: see the ACK-1 note in the
 // header — a single shared highlight role would make selected-running and
 // selected-stopped indistinguishable.
+//
+// Two of those 19 (run_hl, stop_hl) are counted as SLOTS but are never
+// AUTHORED — they are derived, and `theme_set_test` asserts they are 0 in every
+// literal while asserting the derived value fills them. The slot still has to
+// exist, because the view layer still has to reference it.
 PALETTE_SLOTS :: 19
 
 // theme_slot_or resolves a slot that a theme may leave unset.
 //
-// Every shipped theme fills every slot and `theme_set_test` proves it, so this
-// cannot rescue a typo in the table — it covers the case the table cannot:
-// a theme added later that does not bother to fill a role it does not care
-// about. A 0x000000 in a slot means "this theme never chose a colour here" (0 is
-// never a shipped semantic colour; `theme_set_test` treats it as a gap for the
-// same reason), and `fallback` is the nearest EXISTING role — a colour the theme
-// did choose. That is the fallback D-H asks for: an incomplete theme degrades to
-// a colour someone picked, never to an unchosen one.
+// Every shipped theme fills every AUTHORED slot and `theme_set_test` proves it,
+// so this cannot rescue a typo in the table — it covers the case the table
+// cannot: a theme added later that does not bother to fill a role it does not
+// care about. A 0x000000 in a slot means "this theme never chose a colour here"
+// (0 is never a shipped semantic colour; `theme_set_test` treats it as a gap for
+// the same reason), and `fallback` is the nearest EXISTING role — a colour the
+// theme did choose. That is the fallback D-H asks for: an incomplete theme
+// degrades to a colour someone picked, never to an unchosen one.
 //
-// The pairing for each RCH-10 role is the role it visually substitutes for:
+// The pairing for each role is the role it visually substitutes for:
 //   key_fg -> fg        (the key is still body text, just not emphasised)
 //   desc_fg -> dim      (descriptions were already `dim`)
 //   caret_bg -> caret   (the caret colour was always the caret's colour)
 //   caret_fg -> bg      (glyph over a block: the block's own page colour)
-//   run_hl -> running   (the unselected live-state colour)
-//   stop_hl -> stopped  (the unselected dormant-state colour)
+//
+// `run_hl` / `stop_hl` are DELIBERATELY absent from this list. They used to be
+// here as `run_hl -> running` / `stop_hl -> stopped`, and that pass-through was
+// the mechanism that let the bug ship: falling back to the unselected state
+// colour is what painted the state word in a colour with nothing saying "this is
+// the highlighted version, and it is a DIFFERENT colour from the bar text".
+// Those two roles are computed by `theme_hl_pair_kept`, which is a strictly
+// stronger guarantee than "fall back to something", so `ui.palette_of` does not
+// call this proc for them.
 theme_slot_or :: proc(hex: u32, fallback: u32) -> u32 {
 	if (hex & 0xffffff) == 0 { return fallback }
 	return hex
@@ -174,6 +209,394 @@ theme_rgb :: proc(hex: u32) -> (r, g, b: u8) {
 // theme_hex renders a palette entry back as the six-digit form the sources use.
 theme_hex :: proc(hex: u32) -> string {
 	return fmt.tprintf("#%06x", hex & 0xffffff)
+}
+
+//-----------------------------------------------------------------------------
+// WCAG 2.1 luminance and contrast — IN THE PRODUCT, NOT JUST IN THE TESTS
+//-----------------------------------------------------------------------------
+//
+// This maths used to live only inside tests/unit/theme_roles_uip2_test.odin, which
+// is fine while it is only a measuring stick. It is no longer only a measuring
+// stick: the highlight roles are now DERIVED with it (see `theme_hl_pair_kept`
+// below), so the number that ships would be produced by the product module and
+// judged by a second, hand-copied implementation in the test file. Two copies of
+// a formula are two chances to disagree, and the disagreement would show up as a
+// test that cannot see the bug it is meant to catch.
+//
+// So the one implementation lives here and the test file delegates to it.
+
+// theme_srgb_to_linear inverts the sRGB transfer function. The linear segment
+// near black is part of the standard, not a shortcut: skipping it mis-ranks dark
+// colours, which is exactly the region this module's derivations work in.
+theme_srgb_to_linear :: proc(c: u8) -> f64 {
+	s := f64(c) / 255.0
+	if s <= 0.03928 { return s / 12.92 }
+	return math.pow((s + 0.055) / 1.055, 2.4)
+}
+
+// theme_luma is WCAG relative luminance — NOT perceived brightness by
+// averaging channels. The weights are the Rec. 709 ones the standard names.
+theme_luma :: proc(hex: u32) -> f64 {
+	r, g, b := theme_rgb(hex)
+	return 0.2126 * theme_srgb_to_linear(r) +
+	       0.7152 * theme_srgb_to_linear(g) +
+	       0.0722 * theme_srgb_to_linear(b)
+}
+
+// theme_contrast_lumina is the ratio from two already-computed luminances. It
+// exists so a search that reuses a luminance a hundred times does not pay for
+// two `pow` calls per candidate per comparison.
+theme_contrast_lumina :: proc(a, b: f64) -> f64 {
+	la := a + 0.05
+	lb := b + 0.05
+	if la > lb { return la / lb }
+	return lb / la
+}
+
+// theme_contrast is the WCAG 2.1 ratio between two palette entries, always
+// >= 1 and symmetric by construction.
+theme_contrast :: proc(a, b: u32) -> f64 {
+	return theme_contrast_lumina(theme_luma(a), theme_luma(b))
+}
+
+//-----------------------------------------------------------------------------
+// THE DERIVED HIGHLIGHT PAIR — run_hl / stop_hl
+//-----------------------------------------------------------------------------
+//
+// WHY THESE TWO SLOTS ARE COMPUTED AND NOT AUTHORED
+//
+// The design directive this replaces: "treat the themes as an ARRAY of colours;
+// every element points at a number of that array; you don't figure out colours
+// individually for each theme". `run_hl` / `stop_hl` are the two slots where
+// per-theme authoring had already gone wrong: six of the ten shipped themes had
+// run_hl set to the SAME hex as sel_fg, so the selected row painted its state
+// word in the bar's own text colour and the running/stopped distinction
+// disappeared at exactly the moment the row was highlighted. A hand-authored
+// value can be wrong in ten places; a derivation is wrong or right once.
+//
+// So a theme authors `running`, `stopped`, `accent` and `sel_fg` — which it
+// already had to author anyway — and the highlight pair is derived from those by
+// ONE rule that is identical for every theme and for any theme added later.
+//
+// THE RULE IN ONE SENTENCE
+//
+//   Blend each state colour toward black or toward white by the SMALLEST amount
+//   that leaves the two words legible on the bar, clearly different from the
+//   bar's own text, clearly different from EACH OTHER, and still recognisably
+//   the colour they started as.
+//
+// WHY THE SEARCH IS JOINT AND NOT ONE ROLE AFTER THE OTHER
+//
+// The obvious shape is sequential: derive run_hl against {sel_fg}, then derive
+// stop_hl against {sel_fg, run_hl}. It does not work, and measurably so. The
+// least-mixing answer for run_hl on its own lands at the TOP of the range that
+// is still legible on the bar, which is the worst possible place to leave the
+// other role: the band left over for stop_hl shrinks to a width of about
+// 0.0007 in luminance, which the 1/64 blend grid cannot land in (it needed a
+// grid of roughly 400 to hit it by luck). gruvbox-dark is exactly that case:
+// sequential gives run_hl=0x626314 and then no stop_hl exists at all, and the
+// prescribed "maximise contrast on the bar" fallback returns 0x000000 — pure
+// black, zero spread, 1.28 against sel_fg, i.e. the unchosen-colour sentinel
+// painted into the UI.
+//
+// Minimising t_run + t_stop SUBJECT TO ALL CONSTRAINTS AT ONCE is what lets the
+// pair sit where both halves survive. It costs nothing: 129 candidates per role,
+// 16,641 pairs, arithmetic on cached luminances.
+//
+// WHY THE ON-BAR FLOOR FOR THESE TWO ROLES IS 2.0 AND NOT 2.5
+//
+// NOT a widened threshold — a geometric impossibility at 2.5, stated here so
+// the constant reads as reasoned.
+//
+// Fix the bar and the bar's text. A colour is allowed only if it clears
+// `floor_bar` against `accent` AND `floor_distinct` against `sel_fg`. Both
+// constraints are functions of luminance alone, so the allowed set is an
+// interval (at most two) of luminance, and the MOST contrast two allowed colours
+// can have with each other is fixed by that interval:
+//
+//     allowed:  L <= (Lbar + 0.05)/floor_bar - 0.05      (legible, dark side)
+//               L >= floor_distinct*(Lsel + 0.05) - 0.05 (distinct from sel_fg)
+//     =>  max mutual = [(Lbar + 0.05)/floor_bar] / [floor_distinct*(Lsel + 0.05)]
+//                   = contrast(accent, sel_fg) / (floor_bar * floor_distinct)
+//
+// Requiring that to reach floor_distinct itself needs
+//
+//     contrast(accent, sel_fg) >= floor_bar * floor_distinct^2 = 2.5 * 2.56 = 6.4
+//
+// catppuccin-frappe ships accent=0xca9ee6 and sel_fg=0x292c3c, which measure
+// contrast 6.280. The allowed interval is [0.07158, 0.14089] and the largest
+// ratio inside it is 1.569 — under the 1.6 the pair must hold. No two colours
+// of any hue can satisfy 2.5-on-bar + 1.6-vs-text + 1.6-mutual on that bar.
+// Not "we could not find any": the interval does not contain any. That is
+// why the derived pair carries its own floor; at 2.0 the same identity needs
+// contrast(accent, sel_fg) >= 5.12 and every shipped arrangement clears it.
+//
+// FLOOR_ON_BAR = 2.5 in the test file is UNCHANGED and stays authoritative for
+// every other slot (the caret block, the footer pair, the page). Only these two
+// derived roles move, and only as far as the geometry forces.
+//
+// WHAT EACH CONSTRAINT IS FOR
+//
+//   on_bar  >= THEME_HL_FLOOR_ON_BAR  the word can be read off the bar at all
+//   text    >= THEME_HL_FLOOR_TEXT     THE USER'S RULE: the state word is not
+//                                    one of the other highlighted characters
+//   mutual  >= THEME_HL_FLOOR_MUTUAL  a selected RUNNING row is not a selected
+//                                    STOPPED row (RCH-10 change 5)
+//   hue     >= THEME_HL_MIN_SPREAD +  the blend did not grind the state colour
+//           channel order intact    into "a dark colour"; green still reads green
+//
+// IF NOTHING IS FEASIBLE
+//
+// The function says so (`feasible = false`) and names the constraint that bound,
+// with the number it reached. The candidate is still chosen from the pool whose
+// hue survived, so the fallback can never hand back pure black, a zero-spread
+// grey, or anything that collides with the 0x000000 "nobody chose this" sentinel.
+// The test suite is then RED with the theme and the binding constraint named.
+// Silent degradation of the state colour is worse than a red suite: it is the
+// bug this whole change exists to remove.
+//-----------------------------------------------------------------------------
+
+// THEME_HL_MIX_STEPS is the blend grid: t = 0, 1/N, …, 1 toward black and the
+// same toward white, `t = 0` (the base unchanged) being a legal answer. 64 and
+// not 32 because the feasible band is thin — see the note above on why the
+// sequential version needed a grid of ~400 to land in it by accident; 64 is
+// where the joint search lands in it on purpose, and 129 candidates per role is
+// free.
+THEME_HL_MIX_STEPS :: 64
+
+// THEME_HL_CANDIDATES: one base candidate at t=0 plus two directions for every
+// other step. Sized by the grid so the search needs no allocator.
+THEME_HL_CANDIDATES :: THEME_HL_MIX_STEPS*2 + 1
+
+// THEME_HL_MAX_OTHERS bounds the "must stay away from these colours" list. The
+// product passes one (sel_fg); the tests pass up to three.
+THEME_HL_MAX_OTHERS :: 3
+
+// The derived pair's floors. `theme_roles_uip2_test` asserts these exact
+// numbers so a silent edit here cannot out-argue the proof above.
+THEME_HL_FLOOR_ON_BAR :: f64(2.0)
+THEME_HL_FLOOR_TEXT   :: f64(1.6)
+THEME_HL_FLOOR_MUTUAL :: f64(1.6)
+THEME_HL_MIN_SPREAD   :: 8
+
+// theme_hl_mix_channel is the per-channel blend: round(x*(1-t) + y*t).
+theme_hl_mix_channel :: proc(x, y: u32, t: f64) -> u32 {
+	return u32(math.round(f64(x) * (1.0 - t) + f64(y) * t))
+}
+
+// theme_hl_mix blends two colours, one step at a time. `t = 0` returns the base
+// unchanged, which is a legal answer to the derivation and is kept that way.
+theme_hl_mix :: proc(c, e: u32, t: f64) -> u32 {
+	r := theme_hl_mix_channel((c >> 16) & 0xff, (e >> 16) & 0xff, t)
+	g := theme_hl_mix_channel((c >> 8) & 0xff, (e >> 8) & 0xff, t)
+	b := theme_hl_mix_channel(c & 0xff, e & 0xff, t)
+	return (r << 16) | (g << 8) | b
+}
+
+// theme_hl_channel reads channel i (0=R, 1=G, 2=B) of a palette entry.
+theme_hl_channel :: proc(hex: u32, i: int) -> i32 {
+	if i == 0 { return i32((hex >> 16) & 0xff) }
+	if i == 1 { return i32((hex >> 8) & 0xff) }
+	return i32(hex & 0xff)
+}
+
+// theme_hl_spread is max-channel minus min-channel: the crude but honest "is
+// there any colour left in this" measure. A blend toward black or white scales
+// the spread by (1-t), so the spread is a direct read on how much of the base
+// colour the mix kept.
+theme_hl_spread :: proc(hex: u32) -> i32 {
+	mx := theme_hl_channel(hex, 0)
+	mn := theme_hl_channel(hex, 0)
+	for i in 1..=2 {
+		v := theme_hl_channel(hex, i)
+		if v > mx { mx = v }
+		if v < mn { mn = v }
+	}
+	return mx - mn
+}
+
+// theme_hl_hue_kept is the "still recognisably its own colour" test:
+//
+//   * every pairwise channel ORDER the base had is still there, and every pair
+//     the base drew level is still level — a blend toward black or white cannot
+//     flip an order, but rounding can collapse a near-tie, and a collapsed tie
+//     is a lost piece of the hue, so it is rejected rather than excused;
+//   * the spread has not been mixed away below `min_spread`.
+theme_hl_hue_kept :: proc(cand, base: u32, min_spread: i32) -> bool {
+	for i in 0..=2 {
+		for j := i + 1; j <= 2; j += 1 {
+			cb := theme_hl_channel(base, i) - theme_hl_channel(base, j)
+			cc := theme_hl_channel(cand, i) - theme_hl_channel(cand, j)
+			if cb == 0 {
+				if cc != 0 { return false }
+			} else if cc * cb <= 0 {
+				return false
+			}
+		}
+	}
+	return theme_hl_spread(cand) >= min_spread
+}
+
+// Theme_Hl_Cand is one blend of one base colour with every number the pair
+// search compares cached, so the inner loop is arithmetic only.
+Theme_Hl_Cand :: struct {
+	hex      : u32,
+	t        : f64,
+	lum      : f64,
+	sprd     : i32,
+	on_bar   : f64, // contrast against the highlight bar
+	text_min : f64, // worst contrast against the colours it must stay clear of
+	hue_ok   : bool,
+	self_ok  : bool, // on_bar, text_min and hue all clear their floors
+}
+
+// Theme_Hl_Pair is the answer: the two derived roles, plus whether they were
+// actually derivable under the floors and, if they were not, what stopped us.
+Theme_Hl_Pair :: struct {
+	run_hl   : u32,
+	stop_hl  : u32,
+	feasible : bool,
+	binding  : string, // "" when feasible
+}
+
+// theme_hl_fill_candidates builds one role's blend ladder: t = 0 (the base
+// itself) then both directions for every step, with the contrasts, the spread
+// and the floor verdicts computed once per candidate. `others` is the set of
+// colours this role must stay distinguishable from — the bar's own text, in the
+// product. No allocator: the ladder is sized by THEME_HL_CANDIDATES.
+theme_hl_fill_candidates :: proc(dst: ^[THEME_HL_CANDIDATES]Theme_Hl_Cand,
+                               base, bar: u32, others: []u32,
+                               floor_bar, floor_distinct: f64,
+                               min_spread: i32) -> int {
+	bar_lum := theme_luma(bar)
+	oth_lum : [THEME_HL_MAX_OTHERS]f64
+	for o, k in others { oth_lum[k] = theme_luma(o) }
+
+	n := 0
+	for i in 0..=THEME_HL_MIX_STEPS {
+		t := f64(i) / f64(THEME_HL_MIX_STEPS)
+		for d in 0..=1 {
+			if i == 0 && d == 1 { continue } // t =0 is the base; do it once
+			e: u32 = 0x000000
+			if d == 1 { e = 0xffffff }
+			c := &dst[n]
+			c.hex = theme_hl_mix(base, e, t)
+			c.t = t
+			c.lum = theme_luma(c.hex)
+			c.sprd = theme_hl_spread(c.hex)
+			c.on_bar = theme_contrast_lumina(c.lum, bar_lum)
+			c.text_min = f64(1.0e18)
+			for k in 0..<len(others) {
+				v := theme_contrast_lumina(c.lum, oth_lum[k])
+				if v < c.text_min { c.text_min = v }
+			}
+			c.hue_ok = theme_hl_hue_kept(c.hex, base, min_spread)
+			c.self_ok = c.on_bar >= floor_bar && c.hue_ok
+			if len(others) > 0 { c.self_ok = c.self_ok && c.text_min >= floor_distinct }
+			n += 1
+		}
+	}
+	return n
+}
+
+// theme_hl_pair_kept is THE derivation. The block comment above the constants
+// states what it guarantees and why the search is joint.
+theme_hl_pair_kept :: proc(run_base, stop_base, bar: u32, others: []u32,
+                          floor_bar, floor_distinct, floor_mutual: f64,
+                          min_spread: i32) -> Theme_Hl_Pair {
+	assert(len(others) <= THEME_HL_MAX_OTHERS,
+	       "theme_hl_pair_kept: more `others` than THEME_HL_MAX_OTHERS")
+
+	run_c : [THEME_HL_CANDIDATES]Theme_Hl_Cand
+	stop_c : [THEME_HL_CANDIDATES]Theme_Hl_Cand
+	n_run := theme_hl_fill_candidates(&run_c, run_base, bar, others,
+	                                 floor_bar, floor_distinct, min_spread)
+	n_stop := theme_hl_fill_candidates(&stop_c, stop_base, bar, others,
+	                                  floor_bar, floor_distinct, min_spread)
+
+	// ── pass 1: least TOTAL mixing among the pairs that clear everything ──
+	// Minimising the sum is what makes this joint: a role is allowed to mix MORE
+	// than it would have on its own if that is what leaves the other role a
+	// place to sit. `peak` breaks ties toward the pair that does not hammer one
+	// role while leaving the other untouched.
+	best_t := f64(1.0e18)
+	best_peak := f64(1.0e18)
+	found := false
+	ri, si := 0, 0
+	for a in 0..<n_run {
+		if !run_c[a].self_ok { continue }
+		for b in 0..<n_stop {
+			if !stop_c[b].self_ok { continue }
+			if theme_contrast_lumina(run_c[a].lum, stop_c[b].lum) < floor_mutual { continue }
+			sum := run_c[a].t + stop_c[b].t
+			peak := run_c[a].t
+			if stop_c[b].t > peak { peak = stop_c[b].t }
+			if sum < best_t - 1.0e-9 ||
+			   (math.abs(sum - best_t) < 1.0e-9 && peak < best_peak) {
+				found = true
+				best_t, best_peak, ri, si = sum, peak, a, b
+			}
+		}
+	}
+	if found {
+		return Theme_Hl_Pair{run_c[ri].hex, stop_c[si].hex, true, ""}
+	}
+
+	// ── pass 2: no pair clears every floor — degrade LOUDLY ──────────────
+	// Hue-kept candidates only, in BOTH roles, so the fallback can never hand
+	// back pure black, a zero-spread grey, or a value that reads as the
+	// 0x000000 "nobody chose this" sentinel. Of those, take the pair whose
+	// WORST normalised margin is the largest — as close to every floor as the
+	// geometry allows — and name the one that bound, with the number reached.
+	best_min := f64(-1.0)
+	best_label := ""
+	for a in 0..<n_run {
+		if !run_c[a].hue_ok { continue }
+		for b in 0..<n_stop {
+			if !stop_c[b].hue_ok { continue }
+			mu := theme_contrast_lumina(run_c[a].lum, stop_c[b].lum)
+			m := run_c[a].on_bar / floor_bar
+			lab := "on_bar(run)"
+			vb := stop_c[b].on_bar / floor_bar
+			if vb < m { m, lab = vb, "on_bar(stop)" }
+			if len(others) > 0 {
+				vt := run_c[a].text_min / floor_distinct
+				if vt < m { m, lab = vt, "vs_sel_fg(run)" }
+				vt = stop_c[b].text_min / floor_distinct
+				if vt < m { m, lab = vt, "vs_sel_fg(stop)" }
+			}
+			vm := mu / floor_mutual
+			if vm < m { m, lab = vm, "mutual" }
+			sum := run_c[a].t + stop_c[b].t
+			if m > best_min + 1.0e-9 || (math.abs(m - best_min) < 1.0e-9 && sum < best_t) {
+				best_min, best_t, best_label, ri, si = m, sum, lab, a, b
+			}
+		}
+	}
+	if best_min < 0 {
+		// Not one candidate kept its hue in at least one role: that base colour
+		// is too flat to survive any legible position on this bar. Return the
+		// least hue-destroyed candidate of each role and say so.
+		for a in 0..<n_run {
+			if run_c[a].sprd > run_c[ri].sprd { ri = a }
+		}
+		for b in 0..<n_stop {
+			if stop_c[b].sprd > stop_c[si].sprd { si = b }
+		}
+		best_label = fmt.tprintf("hue: no candidate of either role keeps spread >= {}", min_spread)
+	}
+	return Theme_Hl_Pair{run_c[ri].hex, stop_c[si].hex, false,
+	                    fmt.tprintf("{} bound at {:.3f}x its floor", best_label, best_min)}
+}
+
+// theme_hl_pair_of is the product's own view of the rule: the pair for a
+// palette, with the shipped floors. `ui.palette_of` calls this and so does the
+// test that proves the roles are derived rather than authored — one call, one
+// set of floors, no chance for the two to drift.
+theme_hl_pair_of :: proc(p: Palette) -> Theme_Hl_Pair {
+	return theme_hl_pair_kept(p.running, p.stopped, p.accent, []u32{p.sel_fg},
+	                          THEME_HL_FLOOR_ON_BAR, THEME_HL_FLOOR_TEXT,
+	                          THEME_HL_FLOOR_MUTUAL, THEME_HL_MIN_SPREAD)
 }
 
 //-----------------------------------------------------------------------------
@@ -215,6 +638,11 @@ resolve_kind_label :: proc(k: Resolve_Kind) -> string {
 // used here was: every value present in scout-nix-packaging.md §f with a cited
 // upstream file, a coherent 13-slot mapping, and both required names.
 //
+// You will not find `run_hl` or `stop_hl` in any of the literals below. That is
+// the point: those two are derived (see `theme_hl_pair_kept`), so a theme
+// cannot get them wrong and a new theme does not have to choose them. Every
+// other slot is authored here from its cited upstream colour.
+//
 // Aliases are deliberately NARROW: they exist so a hand-edited config written
 // with the flavour word ("latte") rather than the canonical id still resolves.
 // The picker's filter is a substring match over the canonical names, so
@@ -247,8 +675,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0xa89984, // fg4 — muted against the key
 			caret_bg  = 0xfe8019, // orange — == caret, the block the glyph sits in
 			caret_fg  = 0x1d2021, // dark0_hard — the glyph knocked out of the block
-			run_hl    = 0x1d2021, // dark0_hard — loudest thing on a bright bar
-			stop_hl   = 0x504945, // dark2 — dormant grey on the bar, not the same colour
 		},
 	},
 
@@ -274,8 +700,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x928374, // mid gray — muted against the key
 			caret_bg  = 0xaf3a03, // dark orange — == caret
 			caret_fg  = 0xfbf1c7, // light0 — the glyph knocked out of the block
-			run_hl    = 0xfbf1c7, // light0 — loudest on the dark-yellow bar
-			stop_hl   = 0x3c3836, // dark1 — near-black, opposite end of the bar
 		},
 	},
 
@@ -313,8 +737,6 @@ THEMES : [10]Theme = {
 			// colour pairs with peach above it. Blue gives 4.3:1. Deviation flagged.
 			caret_bg  = 0x1e66f5, // blue
 			caret_fg  = 0xeff1f5, // base
-			run_hl    = 0xeff1f5, // base — loudest on the mauve bar
-			stop_hl   = 0xbcc0cc, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -339,8 +761,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x838ba7, // overlay1 — muted against the key
 			caret_bg  = 0xef9f76, // peach — == caret
 			caret_fg  = 0x232634, // crust — the glyph knocked out of the block
-			run_hl    = 0x232634, // crust — loudest on the light-mauve bar
-			stop_hl   = 0x51576d, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -365,8 +785,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x8087a2, // overlay1 — muted against the key
 			caret_bg  = 0xf5a97f, // peach — == caret
 			caret_fg  = 0x181926, // crust — the glyph knocked out of the block
-			run_hl    = 0x181926, // crust — loudest on the light-mauve bar
-			stop_hl   = 0x494d64, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -391,8 +809,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x7f849c, // overlay1 — muted against the key
 			caret_bg  = 0xfab387, // peach — == caret
 			caret_fg  = 0x11111b, // crust — the glyph knocked out of the block
-			run_hl    = 0x11111b, // crust — loudest on the light-mauve bar
-			stop_hl   = 0x45475a, // surface1 — quiet grey, still above the floor
 		},
 	},
 
@@ -418,8 +834,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x565f89, // comment — muted against the key
 			caret_bg  = 0xff9e64, // orange — == caret
 			caret_fg  = 0x0c0e14, // bg_crust — the glyph knocked out of the block
-			run_hl    = 0x0c0e14, // bg_crust — loudest on the blue bar
-			stop_hl   = 0x3b4261, // fg_gutter — quiet grey, still above the floor
 		},
 	},
 
@@ -445,8 +859,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x5e81ac, // nord10 — muted against the key
 			caret_bg  = 0xd08770, // nord12 — == caret
 			caret_fg  = 0x2e3440, // nord0 — the glyph knocked out of the block
-			run_hl    = 0x2e3440, // nord0 — loudest on the frost bar
-			stop_hl   = 0x4c566a, // nord3 — the theme's own dormant grey
 		},
 	},
 
@@ -474,8 +886,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x586e75, // base01 — muted against the key
 			caret_bg  = 0xcb4b16, // orange — == caret
 			caret_fg  = 0x002b36, // base03 — the glyph knocked out of the block
-			run_hl    = 0x002b36, // base03 — the dark end of the blue bar
-			stop_hl   = 0xeee8d5, // base2 — the light end: nothing flattens these
 		},
 	},
 
@@ -500,8 +910,6 @@ THEMES : [10]Theme = {
 			desc_fg   = 0x839496, // base0 — muted against the key
 			caret_bg  = 0xcb4b16, // orange — == caret
 			caret_fg  = 0xfdf6e3, // base3 — the glyph knocked out of the block
-			run_hl    = 0xfdf6e3, // base3 — the light end of the blue bar
-			stop_hl   = 0x073642, // base02 — the dark end: nothing flattens these
 		},
 	},
 }

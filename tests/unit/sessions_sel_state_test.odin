@@ -13,15 +13,29 @@ package unit
 // column exists to say. The fix gives the selected row its own PAIR —
 // `run_hl` / `stop_hl` — per-cell.
 //
-// WHY THE ASSERTION IS run-vs-stop AND NOT anything-vs-sel_fg
+// WHY BOTH run-vs-stop AND state-vs-sel_fg ARE ASSERTED (AND WHY THE OLD
+// COMMENT SAYING OTHERWISE WAS WRONG)
 //
-// Tempting: "assert the state cell is not the row colour". That is WRONG and
-// would fail on a correct palette — several shipped themes deliberately set
-// run_hl to the same value as sel_fg ("the loudest thing on a bright bar",
-// src/app/theme.odin:250). The requirement is not "differs from the bar text";
-// it is "a selected RUNNING row does not look like a selected STOPPED row".
-// Every assertion below therefore compares the RUNNING cell against the STOPPED
-// cell. The `sel_fg` comparison is never used as a discriminator.
+// An earlier version of this header argued that comparing the state cell against
+// the row colour "is WRONG and would fail on a correct palette — several
+// shipped themes deliberately set run_hl to the same value as sel_fg (the
+// loudest thing on a bright bar)". THAT CLAIM DESCRIBES THE BUG, NOT THE
+// DESIGN, and it is now deleted on purpose. Six of ten themes did set run_hl ==
+// sel_fg, and the user's complaint about exactly that is what this change
+// exists to fix: a selected row whose state word is the bar's own text colour
+// is a selected row whose state has been deleted, however nicely the role is
+// named. `run_hl == sel_fg` is not a legitimate styling choice any more.
+//
+// So both comparisons are made, and they are not redundant:
+//
+//   * run-vs-stop says a selected RUNNING row does not look like a selected
+//     STOPPED row (RCH-10 change 5);
+//   * state-vs-device-cell (which is painted sel_fg) says the state word does
+//     not look like the rest of the highlighted text — the user's rule, seen
+//     in the back buffer rather than in the palette.
+//
+// A palette could satisfy the first and fail the second (that is exactly the
+// state the shipped table was in), which is why neither is dropped.
 //
 // WHY PER-CELL, AND WHY TWO PAINTS
 //
@@ -165,6 +179,100 @@ sel_paint_frame :: proc(rows: []app.Session, sel_idx: int, pal: ^ui.Palette) -> 
 
 sel_attr :: proc(c: clay.Color) -> tb.Attr {
 	return render.attr_painted(c)
+}
+
+// ── THE OTHER REQUIREMENT: on the bar, the state word is not bar text ─────
+
+@(test)
+sel_state_highlight_is_not_the_bar_text_in_the_back_buffer :: proc(t: ^testing.T) {
+	// The user's complaint came from a screenshot, not from a palette table:
+	// `running` on a selected row looked like every other character on the
+	// highlight bar. `sel_state_no_theme_flattens_running_into_stopped` proves
+	// the two STATE words differ; it would still pass if BOTH of them equalled
+	// sel_fg. This test closes that gap where it was observed — in the cells the
+	// renderer actually decided, comparing the state cell against a NEIGHBOURING
+	// cell of the same selected row (the device column), which is painted
+	// sel_fg and is the "other highlighted text" the user meant.
+	//
+	// Swept over every shipped theme, because one theme slipping through is
+	// exactly what happened before.
+	if !render_session(t, "sel-state-vs-bar-text") { return }
+
+	rows := sel_fixture_rows()
+	defer delete(rows)
+
+	n := app.theme_count()
+	support.check(t, "the sweep covers every shipped theme", n > 0,
+		fmt.tprintf("app.theme_count() = {}", n))
+
+	same_as_bar := 0
+	not_the_role := 0
+	too_close := 0
+	detail := ""
+	for i := 0; i < n; i += 1 {
+		th := app.theme_at(i)
+		pal := ui.palette_of(th)
+		sel_attr_hex := clay_hex(pal.sel_fg)
+
+		f_run := sel_paint_frame(rows, 0, &pal)
+		f_stop := sel_paint_frame(rows, 1, &pal)
+		if !f_run.found || !f_stop.found {
+			same_as_bar += 1
+			detail = fmt.tprintf("{} {}; state word not locatable — cannot prove anything", detail, th.name)
+			continue
+		}
+
+		// (1) the state cell's ink differs from the same row's other cells
+		if f_run.run.fg == f_run.run_dev.fg {
+			same_as_bar += 1
+			detail = fmt.tprintf("{} {}; selected RUNNING's state cell fg == the device cell fg (0x{:08X}) — the state word IS bar text",
+				detail, th.name, u32(f_run.run.fg))
+		}
+		if f_stop.stop.fg == f_stop.stop_dev.fg {
+			same_as_bar += 1
+			detail = fmt.tprintf("{} {}; selected STOPPED's state cell fg == the device cell fg (0x{:08X})", detail, th.name, u32(f_stop.stop.fg))
+		}
+
+		// (2) the device cell really IS sel_fg, so (1) is a comparison against
+		// the bar text and not against some third colour that happens to differ
+		sel := sel_attr(pal.sel_fg)
+		if f_run.run_dev.fg != sel {
+			not_the_role += 1
+			detail = fmt.tprintf("{} {}; device cell fg=0x{:08X} but sel_fg=0x{:08X} — the control against which (1) was judged is not sel_fg",
+				detail, th.name, u32(f_run.run_dev.fg), u32(sel))
+		}
+
+		// (3) not merely different, but far enough apart to see: the derived
+		// role is underwritten by >= 1.6 against sel_fg, checked on the value
+		// that was actually painted.
+		run_hl := clay_hex(pal.run_hl)
+		stop_hl := clay_hex(pal.stop_hl)
+		if app.theme_contrast(run_hl, sel_attr_hex) < app.THEME_HL_FLOOR_TEXT ||
+		   app.theme_contrast(stop_hl, sel_attr_hex) < app.THEME_HL_FLOOR_TEXT {
+			too_close += 1
+			detail = fmt.tprintf("{} {}; run vs sel_fg={:.3f} stop vs sel_fg={:.3f} (floor {:.2f})",
+				detail, th.name,
+				app.theme_contrast(run_hl, sel_attr_hex),
+				app.theme_contrast(stop_hl, sel_attr_hex),
+				app.THEME_HL_FLOOR_TEXT)
+		}
+
+		// (4) and the cell IS the derived role, so (1) is a statement about
+		// the derivation and not about an unrelated colour in the cell
+		if f_run.run.fg != sel_attr(pal.run_hl) || f_stop.stop.fg != sel_attr(pal.stop_hl) {
+			not_the_role += 1
+			detail = fmt.tprintf("{} {}; state cell fg=0x{:08X}/0x{:08X} but derived roles are 0x{:08X}/0x{:08X}",
+				detail, th.name, u32(f_run.run.fg), u32(f_stop.stop.fg),
+				u32(sel_attr(pal.run_hl)), u32(sel_attr(pal.stop_hl)))
+		}
+	}
+
+	support.check(t, "on a SELECTED row the state cell's fg != the device cell's fg (sel_fg) — every theme",
+		same_as_bar == 0, fmt.tprintf("{} violation(s){}", same_as_bar, detail))
+	support.check(t, "…and the comparison was made against sel_fg / the derived role itself",
+		not_the_role == 0, fmt.tprintf("{} control failure(s){}", not_the_role, detail))
+	support.check(t, "…with the derived role at least 1.6:1 off sel_fg, not one quantum off",
+		too_close == 0, fmt.tprintf("{} too-close theme(s){}", too_close, detail))
 }
 
 // ── THE requirement ────────────────────────────────────────────────────────

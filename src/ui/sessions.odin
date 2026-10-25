@@ -41,9 +41,18 @@ package ui
 // word does not, because it carries information the row colour cannot: whether
 // the session is up. Forcing `sel_fg` there made a selected RUNNING row and a
 // selected STOPPED row render IDENTICALLY, which flattened the one thing that
-// column exists to say. Selected rows therefore use the highlight PAIR
-// `run_hl` / `stop_hl` — the two roles UIP-2 derived to stay legible ON the
-// accent bar and to stay distinguishable from EACH OTHER. See `sess_paint_row`.
+// column exists to say.
+//
+// Under selection the state word therefore uses the highlight PAIR `run_hl` /
+// `stop_hl`. BOTH of those are DERIVED, not authored and not "the theme's hex
+// for the highlighted case": `app.theme_hl_pair_kept` computes them from the
+// theme's own `running` / `stopped` / `accent` / `sel_fg` such that each word
+// is legible on the bar, at least 1.6:1 away from the bar's own text (`sel_fg`)
+// so it is NOT one of the other highlighted characters, at least 1.6:1 away
+// from the other state word, and still recognisably the colour it started as.
+// A theme cannot get this wrong and a new theme does not have to choose it.
+// The view's job stops at referencing the ROLES. See `sess_paint_row`, and the
+// proof of why the pair must be derived jointly in `src/app/theme.odin`.
 //
 // ── SHRINK NEVER LOSES THE SELECTION ────────────────────────────────────────
 // sessions_clamp runs every frame with the current visible row count: scroll is
@@ -328,12 +337,19 @@ sess_paint_row :: proc(row: app.Session, cols: Sessions_Columns, is_sel: bool, p
 		// ── the state word: four combinations, never flattened ────────────
 		// RCH-10 change 5. `running` / `stopped` are palette roles in BOTH
 		// selection states (T6.2 "no gaps"), and the selected pair is the
-		// highlight variant of the same distinction rather than the row's own
+		// DERIVED highlight of the same distinction rather than the row's own
 		// `sel_fg`:
 		//
 		//                 not selected      selected
-		//   running       pal.running       pal.run_hl
-		//   stopped       pal.stopped     pal.stop_hl
+		//   running       pal.running       pal.run_hl   (derived)
+		//   stopped       pal.stopped     pal.stop_hl   (derived)
+		//
+		// `pal.run_hl` / `pal.stop_hl` come out of `app.theme_hl_pair_kept`
+		// via `ui.palette_of` — no theme authors them, and each is guaranteed
+		// to sit away from `sel_fg` as well as away from its partner. "Away from
+		// the other state word" alone was never enough: that is exactly how six
+		// shipped themes ended up with run_hl == sel_fg, a distinct role and an
+		// identical pixel.
 		//
 		// The previous shape was `state_fg := fg; if !is_sel { running/stopped }`,
 		// i.e. while a row was selected the state word took the ROW's colour and
