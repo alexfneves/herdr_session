@@ -1505,9 +1505,12 @@ case_ui_edit :: proc() -> bool {
 	check("typing past the edge scrolls the window; caret still inside",
 		sv2.caret_x < small && sv2.scroll > 0,
 		fmt.tprintf("caret_x={} scroll={} text='{}'", sv2.caret_x, sv2.scroll, ui.edit_text(&g_edit)))
-	vis := ui.text_cols(sv2.prefix) + 1 + ui.text_cols(sv2.suffix)
+	vis := ui.text_cols(sv2.prefix) + sv2.overlay_cols + ui.text_cols(sv2.suffix)
 	check("the visible slice never exceeds the window width",
 		vis <= small, fmt.tprintf("visible cells {} <= window {}", vis, small))
+	check("…and the WHOLE caret overlay fits the window (both cells of a wide rune)",
+		sv2.overlay_cols >= 1 && sv2.caret_x+sv2.overlay_cols <= small,
+		fmt.tprintf("caret_x={} overlay_cols={} window={}", sv2.caret_x, sv2.overlay_cols, small))
 
 	// 6. Rune-wise caret movement: left/right land on rune boundaries, so a
 	//    display column always exists for the caret.
@@ -1584,6 +1587,60 @@ case_ui_edit :: proc() -> bool {
 	check("typing at a caret parked mid-field inserts AT the caret",
 		ui.edit_text(&g_edit) == "a世b😀Xc",
 		fmt.tprintf("buffer='{}' caret_col={}", ui.edit_text(&g_edit), ui.edit_caret_col(&g_edit)))
+
+	// 8. THE CARET OVERLAYS THE CHARACTER IT SITS ON; IT IS NOT AN EXTRA CELL.
+	//
+	// Parked mid-field, the caret cell must carry the REAL character, painted
+	// in caret_fg on caret_bg — never a bare block that pushes the tail of the
+	// line one cell right. Painting it (rather than leaving it to the terminal's
+	// blinking cursor) is what keeps the character visible in BOTH blink states.
+	//   buffer here: "a世b😀Xc", caret just after the 'X'.
+	ui.edit_left(&g_edit) // caret ON the 'X'
+	overlay := ui.edit_view(&g_edit, scene.edit_w)
+	paint_scene()
+	ocx := edit_x0 + ui.edit_caret_col(&g_edit)
+	check("…the view reports the character under the caret as the overlay",
+		overlay.overlay == "X" && overlay.overlay_cols == 1,
+		fmt.tprintf("overlay='{}' cols={}", overlay.overlay, overlay.overlay_cols))
+	check("…the caret cell paints THAT CHARACTER, not the block",
+		glyph_at(ocx, edit_y) == 'X' && rune(cell_at(ocx, edit_y).ch) != ui.CARET_GLYPH,
+		fmt.tprintf("cell({},{}) = {}", ocx, edit_y, glyph_name(glyph_at(ocx, edit_y))))
+	check("…painted in the caret pair (caret_fg on caret_bg), so it still reads as a caret",
+		cell_at(ocx, edit_y).fg == caret_fg_attr && cell_at(ocx, edit_y).bg == caret_bg_attr,
+		fmt.tprintf("fg=0x{:08X} want 0x{:08X} bg=0x{:08X} want 0x{:08X}",
+			u32(cell_at(ocx, edit_y).fg), u32(caret_fg_attr),
+			u32(cell_at(ocx, edit_y).bg), u32(caret_bg_attr)))
+	check("…and the character after the caret did NOT shift right by one cell",
+		glyph_at(ocx+overlay.overlay_cols, edit_y) == 'c',
+		fmt.tprintf("right of the overlay = {}",
+			glyph_name(glyph_at(ocx+overlay.overlay_cols, edit_y))))
+	blocks := 0
+	xx := edit_x0
+	for xx < edit_x0+scene.edit_w {
+		if rune(cell_at(xx, edit_y).ch) == ui.CARET_GLYPH {
+			blocks += 1
+		}
+		xx += 1
+	}
+	check("…no block glyph is painted anywhere in the field while the caret is mid-field",
+		blocks == 0, fmt.tprintf("{} block glyph(s) in the field row", blocks))
+	// …and the same with a 2-cell rune under the caret: both of its cells belong
+	// to the caret, and nothing past them moved.
+	ui.edit_left(&g_edit) // caret ON the 2-cell emoji
+	wide := ui.edit_view(&g_edit, scene.edit_w)
+	paint_scene()
+	wcx := edit_x0 + ui.edit_caret_col(&g_edit)
+	check("…a 2-cell rune under the caret is overlaid whole (2 cells, not split)",
+		wide.overlay_cols == 2 && glyph_at(wcx, edit_y) == '😀',
+		fmt.tprintf("overlay='{}' cols={} glyph={}", wide.overlay, wide.overlay_cols,
+			glyph_name(glyph_at(wcx, edit_y))))
+	check("…its second cell carries the caret background (the caret covers both)",
+		cell_at(wcx+1, edit_y).bg == caret_bg_attr && rune(cell_at(wcx+1, edit_y).ch) != 'X',
+		fmt.tprintf("tail='{}' bg=0x{:08X} want 0x{:08X}",
+			glyph_name(rune(cell_at(wcx+1, edit_y).ch)), u32(cell_at(wcx+1, edit_y).bg), u32(caret_bg_attr)))
+	check("…and the rune after the 2-cell overlay sits exactly where it always did",
+		glyph_at(wcx+2, edit_y) == 'X',
+		fmt.tprintf("two cells right of the overlay = {}", glyph_name(glyph_at(wcx+2, edit_y))))
 
 	dump_rows("edit field", 0, edit_y, cols, 1)
 	return !any_failed
