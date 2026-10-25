@@ -188,10 +188,21 @@ case_theme_set :: proc() -> bool {
 	check("no duplicate theme names", dups == 0, fmt.tprintf("{} duplicate(s)", dups))
 
 	// SLOT COVERAGE. A slot left at 0x000000 means a widget silently paints
-	// with a colour nobody chose — the "gap" this check exists to prevent.
+	// with a colour nobody chose - the "gap" this check exists to prevent.
 	// None of the shipped palettes uses pure black as a semantic colour, so
 	// zero == unset is a sound reading here (and the count is asserted too, so
 	// adding a slot without filling it cannot slip past).
+	//
+	// run_hl / stop_hl ARE NOT AUTHORABLE, and this case says so rather than
+	// contradicting the design: they are left 0 in every literal and computed
+	// at ui.palette_of time by app.theme_hl_pair_kept. They are therefore
+	// checked in the OPPOSITE direction - a non-zero value there is the
+	// failure, because it means somebody put a hand-picked highlight back into
+	// a theme. The 17 authored slots keep the original gap rule untouched, and
+	// tests/unit/theme_roles_uip2_test.odin is what proves the derivation
+	// actually fills the two derived slots. (The unit suite is the authority;
+	// this case mirrors it so the two cannot disagree about what the table is
+	// supposed to look like.)
 	slot_names := [app.PALETTE_SLOTS]string{
 		"bg", "fg", "dim", "border", "header_fg", "accent", "sel_fg", "caret",
 		"float_bg", "float_fg", "err_fg", "running", "stopped",
@@ -201,6 +212,7 @@ case_theme_set :: proc() -> bool {
 		app.PALETTE_SLOTS == 19, fmt.tprintf("{}", app.PALETTE_SLOTS))
 
 	gaps := 0
+	authored_derived := 0
 	for i in 0..<n {
 		t := app.theme_at(i)
 		slots := [app.PALETTE_SLOTS]u32{
@@ -211,18 +223,27 @@ case_theme_set :: proc() -> bool {
 			t.pal.run_hl, t.pal.stop_hl,
 		}
 		for s, k in slots {
+			derived := k == app.PALETTE_SLOTS-1 || k == app.PALETTE_SLOTS-2
 			if (s & 0xff000000) != 0 {
 				gaps += 1
 				say(fmt.tprintf("    BAD: %s.%s has bits above the RGB field: %x",
 					t.name, slot_names[k], s))
+			} else if derived {
+				if (s & 0xffffff) != 0 {
+					authored_derived += 1
+					say(fmt.tprintf("    AUTHORED: %s.%s = %x - must stay 0 and be derived",
+						t.name, slot_names[k], s))
+				}
 			} else if (s & 0xffffff) == 0 {
 				gaps += 1
 				say(fmt.tprintf("    GAP: {}.{} is unset (0x000000)", t.name, slot_names[k]))
 			}
 		}
 	}
-	check("every theme fills all 19 slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair/highlights)",
+	check("every theme fills all 17 AUTHORED slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair)",
 		gaps == 0, fmt.tprintf("{} gap(s) across {} themes", gaps, n))
+	check("and leaves both DERIVED highlight slots unset for the derivation",
+		authored_derived == 0, fmt.tprintf("{} hand-authored highlight(s)", authored_derived))
 
 	// Text must never be the same colour as its own background: a palette where
 	// fg == bg is unreadable and no glyph-level check would catch it.

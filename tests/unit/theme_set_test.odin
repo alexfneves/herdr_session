@@ -90,12 +90,31 @@ theme_set_every_theme_fills_every_slot :: proc(t: ^testing.T) {
 	// as a semantic colour, so zero == unset is a sound reading here — and the
 	// slot count is asserted separately, so adding a slot without filling it
 	// cannot slip past.
+	//
+	// THE TWO DERIVED SLOTS ARE EXEMPT, AND THAT IS STATED RATHER THAN HIDDEN.
+	// run_hl and stop_hl are UNSET in every literal BY CONSTRUCTION: they are
+	// computed at `ui.palette_of` time by `app.theme_hl_pair_kept` from
+	// running/stopped/accent/sel_fg. Treating them as gaps here would be
+	// asserting the exact opposite of the design. The exemption is not a
+	// loss of teeth either, because:
+	//
+	//   * this test still fails on a gap in ANY of the other 17 slots, and
+	//     still fails if a theme AUTHORS a run_hl/stop_hl value (checked
+	//     below, in the opposite direction);
+	//   * `roles_highlight_pair_is_derived_not_authored` in
+	//     theme_roles_uip2_test proves the derived value actually fills them,
+	//     so "unset in the literal" cannot be used as an excuse for "unpainted".
+	//
+	// The derived slot INDICES are named, not string-matched, so renaming a
+	// slot cannot silently move the exemption onto a different field.
+	DERIVED_SLOTS :: 2
 	slot_names := [app.PALETTE_SLOTS]string{
 		"bg", "fg", "dim", "border", "header_fg", "accent", "sel_fg", "caret",
 		"float_bg", "float_fg", "err_fg", "running", "stopped",
 		"key_fg", "desc_fg", "caret_bg", "caret_fg", "run_hl", "stop_hl",
 	}
 	gaps := 0
+	authored_derived := 0
 	detail := ""
 	for i := 0; i < app.theme_count(); i += 1 {
 		th := app.theme_at(i)
@@ -107,19 +126,32 @@ theme_set_every_theme_fills_every_slot :: proc(t: ^testing.T) {
 			th.pal.run_hl, th.pal.stop_hl,
 		}
 		for s, k in slots {
+			derived := k == app.PALETTE_SLOTS - 1 || k == app.PALETTE_SLOTS - 2
 			if (s & 0xff000000) != 0 {
 				gaps += 1
-				detail = fmt.tprintf("{} {};{}.{} has bits above the RGB field {:08x}",
-					detail, "BAD:", th.name, slot_names[k], s)
+				detail = fmt.tprintf("{} BAD:{}{}.{} has bits above the RGB field {:08x}",
+					detail, th.name, slot_names[k], s)
+			} else if derived {
+				// The exemption, asserted in the enforcing direction: these two
+				// must be UNSET. A non-zero here is a hand-authored highlight.
+				if (s & 0xffffff) != 0 {
+					authored_derived += 1
+					detail = fmt.tprintf("{} {}{}.{} is AUTHORED ({:06x}); it must stay 0 and be derived",
+						detail, th.name, slot_names[k], s)
+				}
 			} else if (s & 0xffffff) == 0 {
 				gaps += 1
-				detail = fmt.tprintf("{} GAP:{}.{} is unset (0x000000)", detail, th.name, slot_names[k])
+				detail = fmt.tprintf("{} GAP:{}{}.{} is unset (0x000000)", detail, th.name, slot_names[k])
 			}
 		}
 	}
 	support.check(t,
-		"every theme fills all 19 slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair/highlights)",
+		"every theme fills all 17 AUTHORED slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair)",
 		gaps == 0, fmt.tprintf("{} gap(s) across {} themes{}", gaps, app.theme_count(), detail))
+	support.check(t,
+		fmt.tprintf("and leaves both DERIVED slots ({} of {} per theme) unset for the derivation", DERIVED_SLOTS, app.PALETTE_SLOTS),
+		authored_derived == 0,
+		fmt.tprintf("{} hand-authored highlight(s){}", authored_derived, detail))
 }
 
 @(test)

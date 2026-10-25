@@ -275,6 +275,17 @@ Palette :: struct {
 // decision: paint, or don't" (render/renderer.odin:133) and a themed colour is
 // always meant to paint.
 palette_of :: proc(t: app.Theme) -> Palette {
+	// run_hl / stop_hl are the two slots that are COMPUTED, not mapped. The
+	// theme authors `running`, `stopped`, `accent` and `sel_fg` — every one of
+	// them a slot it already had to choose — and the highlight pair is derived
+	// from those four by one rule that is the same for every theme and for any
+	// theme added later. `app.theme_hl_pair_kept` carries the proof of why the
+	// search is joint and why these two roles alone carry a 2.0 on-bar floor.
+	//
+	// `t.pal.run_hl` / `t.pal.stop_hl` are deliberately NOT read: they are
+	// UNSET in every theme literal, and `roles_highlight_pair_is_derived_not_
+	// authored` turns red if anyone puts a per-theme hex back.
+	hl := app.theme_hl_pair_of(t.pal)
 	return Palette{
 		bg        = clay_colour(t.pal.bg),
 		fg        = clay_colour(t.pal.fg),
@@ -289,16 +300,17 @@ palette_of :: proc(t: app.Theme) -> Palette {
 		err_fg    = clay_colour(t.pal.err_fg),
 		running   = clay_colour(t.pal.running),
 		stopped   = clay_colour(t.pal.stopped),
-		// The six RCH-10 roles go through `theme_slot_or`, so a theme that
-		// leaves one unset degrades to the nearest colour IT chose instead of to
-		// black-by-zero. Every shipped theme fills all six, so on today's table
-		// the fallback is inert; it exists for the theme someone adds later.
+		// Four of the six RCH-10 roles go through `theme_slot_or`, so a theme
+		// that leaves one unset degrades to the nearest colour IT chose instead
+		// of to black-by-zero. The last two are derived above and do NOT use the
+		// fallback: their whole point is that the value is computed from roles
+		// the theme did choose.
 		key_fg    = clay_colour(app.theme_slot_or(t.pal.key_fg, t.pal.fg)),
 		desc_fg   = clay_colour(app.theme_slot_or(t.pal.desc_fg, t.pal.dim)),
 		caret_bg  = clay_colour(app.theme_slot_or(t.pal.caret_bg, t.pal.caret)),
 		caret_fg  = clay_colour(app.theme_slot_or(t.pal.caret_fg, t.pal.bg)),
-		run_hl    = clay_colour(app.theme_slot_or(t.pal.run_hl, t.pal.running)),
-		stop_hl   = clay_colour(app.theme_slot_or(t.pal.stop_hl, t.pal.stopped)),
+		run_hl    = clay_colour(hl.run_hl),
+		stop_hl   = clay_colour(hl.stop_hl),
 	}
 }
 
@@ -329,16 +341,31 @@ DEFAULT_PALETTE : Palette = Palette{
 	err_fg    = clay.Color{222, 96, 88, 255},
 	running   = clay.Color{120, 190, 120, 255},
 	stopped   = clay.Color{110, 114, 122, 255},
-	// The six RCH-10 roles, filled like every other slot: this stand-in must
-	// not paint an undefined colour either. run_hl/stop_hl are far apart on
-	// purpose (crust-dark vs a mid slate) so even the stand-in cannot flatten
-	// a selected running row into a selected stopped one.
+	// The four authored RCH-10 roles are filled like every other slot: this
+	// stand-in must not paint an undefined colour either.
 	key_fg    = clay.Color{232, 202, 120, 255},
 	desc_fg   = clay.Color{110, 114, 122, 255},
 	caret_bg  = clay.Color{222, 172, 84, 255},
 	caret_fg  = clay.Color{16, 20, 28, 255},
-	run_hl    = clay.Color{236, 236, 236, 255},
-	stop_hl   = clay.Color{120, 132, 156, 255},
+	// ── run_hl / stop_hl: PINNED OUTPUT OF THE SAME DERIVATION ─────────
+	// These are NOT hand-picked. They are what `app.theme_hl_pair_of` returns
+	// for this stand-in's own accent/sel_fg/running/stopped — which at these
+	// channels is `t = 0` for both roles, i.e. `running` and `stopped`
+	// unchanged, because the stand-in's bar is dark enough that the state
+	// colours are already legible on it, distinct from its sel_fg, and
+	// distinct from each other.
+	//
+	// They are written out because Odin will not evaluate a procedure in a
+	// global initialiser (only constant expressions), so the compute cannot
+	// happen here. `roles_default_pair_matches_the_derivation` in
+	// tests/unit/theme_roles_uip2_test.odin re-runs the derivation against
+	// these very channels and fails with the exact channels to re-pin if the
+	// literal ever stops matching — so the pin cannot silently drift, which is
+	// the only thing the "computed, not authored" guarantee needs in a global.
+	// The "no hex literal in src/ui/*" scan is why these are decimal channels
+	// and not 0xRRGGBB; see D-H in the same file.
+	run_hl    = clay.Color{120, 190, 120, 255}, // == running, derived at t=0
+	stop_hl   = clay.Color{110, 114, 122, 255},  // == stopped, derived at t=0
 }
 
 // ── footer vocabulary ──────────────────────────────────────────────────────
