@@ -217,7 +217,6 @@ sel_state_highlight_is_not_the_bar_text_in_the_back_buffer :: proc(t: ^testing.T
 	for i := 0; i < n; i += 1 {
 		th := app.theme_at(i)
 		pal := ui.palette_of(th)
-		sel_attr_hex := clay_hex(pal.sel_fg)
 
 		f_run := sel_paint_frame(rows, 0, &pal)
 		f_stop := sel_paint_frame(rows, 1, &pal)
