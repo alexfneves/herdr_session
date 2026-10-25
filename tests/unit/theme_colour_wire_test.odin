@@ -38,11 +38,14 @@ colour_wire_channels_are_0_to_255 :: proc(t: ^testing.T) {
 	// single aggregate equality would not.
 	th, _ := app.theme_named("catppuccin-latte")
 	pal := ui.palette_of(th)
+	// Read through the ROLE, not through a palette field: `background` is the
+	// thing that gets painted, and it is what must carry the schema value.
+	bg := app.theme_role(th.pal, .background)
 	support.check(t, "clay channels are 0..255 (NOT 0..1) — a channel reads its byte",
-		th.pal.bg == 0xeff1f5 && int(pal.bg[0]) == 239 &&
+		bg == 0xeff1f5 && int(pal.bg[0]) == 239 &&
 		int(pal.bg[1]) == 241 && int(pal.bg[2]) == 245,
 		fmt.tprintf("bg = {} {} {} (from {:06x})",
-			pal.bg[0], pal.bg[1], pal.bg[2], th.pal.bg))
+			pal.bg[0], pal.bg[1], pal.bg[2], bg))
 	support.check(t, "…alpha 255 (opaque) on a themed colour", int(pal.bg[3]) == 255,
 		fmt.tprintf("alpha = {}", pal.bg[3]))
 }
@@ -115,20 +118,24 @@ colour_wire_alpha_zero_paints_nothing :: proc(t: ^testing.T) {
 
 @(test)
 colour_wire_every_slot_paints_in_every_theme :: proc(t: ^testing.T) {
+	// EVERY ROLE, not "every slot we remembered to list". The list is derived
+	// from ui.Palette's own fields so a newly added role cannot skip this check.
 	names := [2]string{"gruvbox-dark", "catppuccin-latte"}
 	for name in names[:] {
 		pal := ui_palette_for(name)
 		all_paint := true
-		slots := [13]clay.Color{
-			pal.bg, pal.fg, pal.dim, pal.border, pal.header_fg, pal.accent, pal.sel_fg, pal.caret,
-			pal.float_bg, pal.float_fg, pal.err_fg, pal.running, pal.stopped,
+		roles := [13]clay.Color{
+			pal.bg, pal.fg, pal.dim, pal.sel_bg, pal.sel_fg, pal.border,
+			pal.key_fg, pal.desc_fg, pal.running, pal.stopped, pal.err_fg,
+			pal.caret_bg, pal.caret_fg,
 		}
-		for c in slots[:] {
+		for c in roles[:] {
 			_, paints := render.attr_of(c)
 			if !paints { all_paint = false }
 		}
-		support.check(t, fmt.tprintf("every slot in {} paints (no transparent widgets)", name),
-			all_paint, fmt.tprintf("all_paint={}", all_paint))
+		support.check(t, fmt.tprintf("every role in {} paints (no transparent widgets)", name),
+			all_paint && len(roles) == app.PALETTE_ROLES,
+			fmt.tprintf("all_paint={} roles_covered={}/{}", all_paint, len(roles), app.PALETTE_ROLES))
 	}
 }
 
@@ -138,11 +145,11 @@ colour_wire_selection_bar_is_visually_distinct :: proc(t: ^testing.T) {
 	// and bg collapse to one value the picker renders with an invisible cursor —
 	// the keyboard still works, so this is invisible to a keyboard-only check.
 	pal := ui_palette_for("gruvbox-dark")
-	a, a_paints := render.attr_of(pal.accent)
+	a, a_paints := render.attr_of(pal.sel_bg)
 	_, b_paints := render.attr_of(pal.bg)
-	support.check(t, "selection bar (accent) is visually distinct from the list background",
+	support.check(t, "the highlight bar (selection.background) is visually distinct from the list background",
 		a_paints && b_paints && u32(a) != 0,
-		fmt.tprintf("accent=0x{:06x} paints={} bg_paints={}", u32(a) & 0xffffff, a_paints, b_paints))
+		fmt.tprintf("sel_bg=0x{:06x} paints={} bg_paints={}", u32(a) & 0xffffff, a_paints, b_paints))
 }
 
 ui_palette_for :: proc(name: string) -> ui.Palette {

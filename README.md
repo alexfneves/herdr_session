@@ -358,8 +358,57 @@ Switch with `t` — pick from the list, `Enter` applies it and writes it to
 `catppuccin` and `catppuccin-latte` all land on the same theme, and an unknown
 name falls back to the default with a warning rather than failing.
 
-Add a theme by adding one entry to the theme table in `src/app/theme.odin`; every
-colour is a named field on a palette, not an inline hex.
+### The palette is a schema mirror, not a hand-picked set
+
+Every shipped theme is a **verbatim mirror of the alacritty `colors.*` schema** —
+22 values, nothing added, nothing derived:
+
+| Group | Values |
+|---|---|
+| `primary` | `foreground`, `background` |
+| `cursor` | `cursor`, `text` |
+| `selection` | `text`, `background` |
+| `normal` | `black red green yellow blue magenta cyan white` |
+| `bright` | `black red green yellow blue magenta cyan white` |
+
+Each theme in `src/app/theme.odin` carries exactly those 22 values, copied from
+the upstream file vendored under `.pi/plans/theme-sources/`, and
+`tests/unit/theme_vendored_schema_test.odin` checks the compiled values against
+the vendored file key-for-key, with the file pinned by byte length and sha256.
+**Hex values are never adjusted for contrast.** If a value differs from upstream,
+the test goes red.
+
+### Roles
+
+Nothing is painted from a raw hex. A view asks for a **role** and the role
+resolves to a schema value (`src/app/theme.odin`, `theme_role_source`):
+
+| Role | Schema value | Used for |
+|---|---|---|
+| `background` | `primary.background` | page fill |
+| `text` | `primary.foreground` | body text |
+| `secondary` | `bright.black` | headers, placeholders, dim |
+| `hl_bg` | `selection.background` | selection bar fill |
+| `hl_text` | `selection.text` | selection bar text |
+| `border` | `bright.white` | between-children rule |
+| `footer_key` | `primary.foreground` | footer key glyphs |
+| `footer_desc` | `bright.black` | footer descriptions |
+| `running` | `normal.green` | the state word, in both states |
+| `stopped` | `normal.red` | the state word, in both states |
+| `error` | `bright.red` | error frames and messages |
+| `caret_bg` | `cursor.cursor` | caret cell fill |
+| `caret_glyph` | `cursor.text` | caret glyph |
+
+22 schema values, 13 roles: several values serve more than one role and some
+schema values are carried without a role. The selected row keeps
+`normal.green` / `normal.red` painted **on top of** `selection.background` —
+the theme supplies the distinctness of running from stopped, the product does
+not manufacture it.
+
+Add a theme by adding one entry to the theme table in `src/app/theme.odin`
+copied from its upstream schema file, and vendoring that file under
+`.pi/plans/theme-sources/` with its sha256 recorded in
+`tests/unit/theme_vendored_schema_test.odin`.
 
 ---
 

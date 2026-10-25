@@ -225,42 +225,39 @@ frame_layout :: proc(cols, rows: i32) -> Frame_Layout {
 
 // ── palette ────────────────────────────────────────────────────────────────
 
-// colour builds an OPAQUE clay.Color. Alpha 0 means "do not paint this cell" and
-// is the only meaning alpha has in this codebase — never an identity marker.
-// Palette is the colour contract between the app and the view layer.
-// Palette is the view layer's semantic colour contract. A widget references a
-// ROLE, never a hex value, so a theme swap changes this struct's contents and
-// no widget file changes (that is the whole point of T6.2).
+// Palette is the view layer's semantic colour contract: the 13 ROLES, and
+// nothing else. A widget references a role, never a hex value, and never a
+// schema key either — the only path from a theme to a painted pixel is
+// `app.theme_role(palette, ROLE)`, resolved through the role table in
+// `src/app/theme.odin`.
 //
-// Every field must be supplied by every theme. `app.PALETTE_SLOTS` counts them
-// and the theme smoke case asserts the two counts agree, so adding a role here
-// without filling it in every palette fails the build of evidence rather than
-// painting one widget with a zero (transparent) colour.
+// THE SHAPE IS NOT FREE — IT IS THE ROLE TABLE. One field per role, exactly
+// `app.PALETTE_ROLES` (13) of them, and `roles_are_exactly_the_role_table`
+// in tests/unit/theme_roles_test.odin asserts the field names against
+// `app.theme_role_names()` one-for-one. That is what makes "no UI element can
+// reach a colour without going through a role" a checked property rather than
+// a house style: a new field that is not a role fails the build of evidence,
+// and a role that no view uses is visible as an unused field rather than a
+// silent gap.
+//
+// Deleted with the schema rework (see the app.theme header for why):
+// `accent` (the schema has no accent — the highlight bar IS
+// `selection.background`), `header_fg`, `float_bg`, `float_fg`, `caret`,
+// `run_hl` and `stop_hl`.
 Palette :: struct {
-	bg : clay.Color, // terminal background
-	fg : clay.Color, // default text
-	dim : clay.Color, // secondary text: column headers, placeholders
-	border : clay.Color, // outer border + betweenChildren rules
-	header_fg : clay.Color,
-	accent : clay.Color, // selection bar background
-	sel_fg : clay.Color, // text drawn ON the selection bar
-	caret : clay.Color,
-	float_bg : clay.Color,
-	float_fg : clay.Color,
-	err_fg : clay.Color,
-	running : clay.Color, // a session that is up
-	stopped : clay.Color, // a session that is not
-
-	// ── RCH-10: the six roles added on top of the original thirteen ────
-	// Mirrored from `app.Palette` by name. `err_fg` above is the error text;
-	// these are the footer's two foregrounds, the caret's colour PAIR, and the
-	// state word's colour while its row is selected. All theme-resolved.
-	key_fg : clay.Color, // the KEY token in a footer hint (AD-1.2)
-	desc_fg : clay.Color, // the DESCRIPTION token, muted vs key_fg
-	caret_bg : clay.Color, // background of the cell the caret sits on
-	caret_fg : clay.Color, // the caret glyph itself
-	run_hl : clay.Color, // "running" WHILE its row is selected
-	stop_hl : clay.Color, // "stopped" WHILE its row is selected
+	bg     : clay.Color, // role: background             <- primary.background
+	fg     : clay.Color, // role: primary text           <- primary.foreground
+	dim    : clay.Color, // role: secondary text         <- bright.black
+	sel_bg : clay.Color, // role: highlighted row bg     <- selection.background
+	sel_fg : clay.Color, // role: highlighted row text   <- selection.text
+	border : clay.Color, // role: border / between-children rules <- bright.white
+	key_fg : clay.Color, // role: footer KEY token       <- primary.foreground (AD-1.2)
+	desc_fg : clay.Color, // role: footer DESCRIPTION    <- bright.black
+	running : clay.Color, // role: running               <- normal.green
+	stopped : clay.Color, // role: stopped               <- normal.red
+	err_fg : clay.Color, // role: error                  <- bright.red
+	caret_bg : clay.Color, // role: caret background      <- cursor.cursor
+	caret_fg : clay.Color, // role: caret glyph           <- cursor.text
 }
 
 // ── the ONE place a theme becomes a palette ───────────────────────────────
@@ -274,44 +271,37 @@ Palette :: struct {
 // Alpha is 255 for every slot by construction: "alpha drives exactly one
 // decision: paint, or don't" (render/renderer.odin:133) and a themed colour is
 // always meant to paint.
+// palette_of resolves the 13 roles of one theme into clay colours. EVERY field
+// goes through `app.theme_role`, which is the role table; nothing here reads a
+// `Palette` field directly and nothing here computes a colour.
 palette_of :: proc(t: app.Theme) -> Palette {
-	// run_hl / stop_hl are the two slots that are COMPUTED, not mapped. The
-	// theme authors `running`, `stopped`, `accent` and `sel_fg` — every one of
-	// them a slot it already had to choose — and the highlight pair is derived
-	// from those four by one rule that is the same for every theme and for any
-	// theme added later. `app.theme_hl_pair_kept` carries the proof of why the
-	// search is joint and why these two roles alone carry a 2.0 on-bar floor.
-	//
-	// `t.pal.run_hl` / `t.pal.stop_hl` are deliberately NOT read: they are
-	// UNSET in every theme literal, and `roles_highlight_pair_is_derived_not_
-	// authored` turns red if anyone puts a per-theme hex back.
-	hl := app.theme_hl_pair_of(t.pal)
 	return Palette{
-		bg        = clay_colour(t.pal.bg),
-		fg        = clay_colour(t.pal.fg),
-		dim       = clay_colour(t.pal.dim),
-		border    = clay_colour(t.pal.border),
-		header_fg = clay_colour(t.pal.header_fg),
-		accent    = clay_colour(t.pal.accent),
-		sel_fg    = clay_colour(t.pal.sel_fg),
-		caret     = clay_colour(t.pal.caret),
-		float_bg  = clay_colour(t.pal.float_bg),
-		float_fg  = clay_colour(t.pal.float_fg),
-		err_fg    = clay_colour(t.pal.err_fg),
-		running   = clay_colour(t.pal.running),
-		stopped   = clay_colour(t.pal.stopped),
-		// Four of the six RCH-10 roles go through `theme_slot_or`, so a theme
-		// that leaves one unset degrades to the nearest colour IT chose instead
-		// of to black-by-zero. The last two are derived above and do NOT use the
-		// fallback: their whole point is that the value is computed from roles
-		// the theme did choose.
-		key_fg    = clay_colour(app.theme_slot_or(t.pal.key_fg, t.pal.fg)),
-		desc_fg   = clay_colour(app.theme_slot_or(t.pal.desc_fg, t.pal.dim)),
-		caret_bg  = clay_colour(app.theme_slot_or(t.pal.caret_bg, t.pal.caret)),
-		caret_fg  = clay_colour(app.theme_slot_or(t.pal.caret_fg, t.pal.bg)),
-		run_hl    = clay_colour(hl.run_hl),
-		stop_hl   = clay_colour(hl.stop_hl),
+		bg       = clay_colour(app.theme_role(t.pal, .background)),
+		fg       = clay_colour(app.theme_role(t.pal, .text)),
+		dim      = clay_colour(app.theme_role(t.pal, .secondary)),
+		sel_bg   = clay_colour(app.theme_role(t.pal, .hl_bg)),
+		sel_fg   = clay_colour(app.theme_role(t.pal, .hl_text)),
+		border   = clay_colour(app.theme_role(t.pal, .border)),
+		key_fg   = clay_colour(app.theme_role(t.pal, .footer_key)),
+		desc_fg  = clay_colour(app.theme_role(t.pal, .footer_desc)),
+		running  = clay_colour(app.theme_role(t.pal, .running)),
+		stopped  = clay_colour(app.theme_role(t.pal, .stopped)),
+		err_fg   = clay_colour(app.theme_role(t.pal, .error)),
+		caret_bg = clay_colour(app.theme_role(t.pal, .caret_bg)),
+		caret_fg = clay_colour(app.theme_role(t.pal, .caret_glyph)),
 	}
+}
+
+// default_palette is the stand-in for "there is no theme yet", and it is NOT a
+// second palette: it IS `THEME_DEFAULT_NAME`, resolved through the same
+// `palette_of` path every theme takes. The old `DEFAULT_PALETTE` was a
+// hand-authored set of channels that no theme produced and no test could
+// derive; a hand-authored fallback is exactly the kind of invented colour the
+// schema rework removed. Because it is a lookup it also cannot drift from the
+// table — and Odin forbids a contextful call in a global initialiser, which is
+// why this is a proc and not a const.
+default_palette :: proc() -> Palette {
+	return palette_of(app.theme_default())
 }
 
 // clay_colour is the 0xRRGGBB -> 0..255x3 step. Kept separate so the comment
@@ -319,53 +309,6 @@ palette_of :: proc(t: app.Theme) -> Palette {
 clay_colour :: proc(hex: u32) -> clay.Color {
 	r, g, b := app.theme_rgb(hex)
 	return clay.Color{c.float(r), c.float(g), c.float(b), 255}
-}
-
-// DEFAULT_PALETTE is a plain dark stand-in so Phase 5 renders honestly before
-// T6.2 supplies real terminalcolors.com palettes.
-// DEFAULT_PALETTE is the pre-theme stand-in, kept for a nil/absent theme so no
-// code path can paint with zeroed colours. It is NOT a theme and is not in the
-// picker; app.theme.THEME_DEFAULT_NAME (gruvbox-dark) is what a fresh install
-// gets.
-DEFAULT_PALETTE : Palette = Palette{
-	bg        = clay.Color{16, 20, 28, 255},
-	fg        = clay.Color{204, 200, 184, 255},
-	dim       = clay.Color{110, 114, 122, 255},
-	border    = clay.Color{68, 74, 88, 255},
-	header_fg = clay.Color{230, 226, 208, 255},
-	accent    = clay.Color{40, 66, 110, 255},
-	sel_fg    = clay.Color{236, 236, 236, 255},
-	caret     = clay.Color{222, 172, 84, 255},
-	float_bg  = clay.Color{26, 30, 40, 255},
-	float_fg  = clay.Color{220, 216, 200, 255},
-	err_fg    = clay.Color{222, 96, 88, 255},
-	running   = clay.Color{120, 190, 120, 255},
-	stopped   = clay.Color{110, 114, 122, 255},
-	// The four authored RCH-10 roles are filled like every other slot: this
-	// stand-in must not paint an undefined colour either.
-	key_fg    = clay.Color{232, 202, 120, 255},
-	desc_fg   = clay.Color{110, 114, 122, 255},
-	caret_bg  = clay.Color{222, 172, 84, 255},
-	caret_fg  = clay.Color{16, 20, 28, 255},
-	// ── run_hl / stop_hl: PINNED OUTPUT OF THE SAME DERIVATION ─────────
-	// These are NOT hand-picked. They are what `app.theme_hl_pair_of` returns
-	// for this stand-in's own accent/sel_fg/running/stopped — which at these
-	// channels is `t = 0` for both roles, i.e. `running` and `stopped`
-	// unchanged, because the stand-in's bar is dark enough that the state
-	// colours are already legible on it, distinct from its sel_fg, and
-	// distinct from each other.
-	//
-	// They are written out because Odin will not evaluate a procedure in a
-	// global initialiser (only constant expressions), so the compute cannot
-	// happen here. `roles_default_pair_matches_the_derivation` in
-	// tests/unit/theme_roles_uip2_test.odin re-runs the derivation against
-	// these very channels and fails with the exact channels to re-pin if the
-	// literal ever stops matching — so the pin cannot silently drift, which is
-	// the only thing the "computed, not authored" guarantee needs in a global.
-	// The "no hex literal in src/ui/*" scan is why these are decimal channels
-	// and not 0xRRGGBB; see D-H in the same file.
-	run_hl    = clay.Color{120, 190, 120, 255}, // == running, derived at t=0
-	stop_hl   = clay.Color{110, 114, 122, 255},  // == stopped, derived at t=0
 }
 
 // ── footer vocabulary ──────────────────────────────────────────────────────
@@ -619,7 +562,10 @@ painter_stop :: proc(p: ^Painter) {
 // mode" to exit, and therefore no way to get stuck in one.
 paint_notice :: proc(p: ^Painter, cols, rows: i32, pal: ^Palette, msg: string) -> render.Stats {
 	colors: ^Palette = pal
-	if colors == nil { colors = &DEFAULT_PALETTE }
+	if colors == nil {
+		fb := default_palette()
+		colors = &fb
+	}
 	// Keep the whole message on one line and inside the terminal: at these sizes
 	// wrapping would push the tail off-screen and read as corruption.
 	text := ellipsize(msg, cols)
@@ -658,7 +604,8 @@ paint_notice :: proc(p: ^Painter, cols, rows: i32, pal: ^Palette, msg: string) -
 frame_open :: proc(p: ^Painter, f: ^Frame) {
 	pal := f.pal
 	if pal == nil {
-		pal = &DEFAULT_PALETTE
+		fb := default_palette()
+		pal = &fb
 	}
 	clay.BeginLayout()
 
@@ -709,8 +656,8 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 			childAlignment = clay.ChildAlignment{x = .Center},
 		},
 	})
-	clay.Text(ellipsize(f.title, inner), clay.TextElementConfig{textColor = pal.header_fg})
-	clay.Text(ellipsize(f.state, inner), clay.TextElementConfig{textColor = pal.header_fg})
+	clay.Text(ellipsize(f.title, inner), clay.TextElementConfig{textColor = pal.fg})
+	clay.Text(ellipsize(f.state, inner), clay.TextElementConfig{textColor = pal.fg})
 	clay._CloseElement()
 
 	// ── THE HEADER -> MAIN RULE, a row of its own, immediately under the
@@ -737,7 +684,8 @@ frame_open :: proc(p: ^Painter, f: ^Frame) {
 frame_close :: proc(p: ^Painter, f: ^Frame) -> render.Stats {
 	pal := f.pal
 	if pal == nil {
-		pal = &DEFAULT_PALETTE
+		fb := default_palette()
+		pal = &fb
 	}
 	clay._CloseElement() // MAIN
 	// ── THE MAIN -> FOOTER RULE. Same element, same helper, same position in
@@ -778,7 +726,7 @@ frame_footer :: proc(f: ^Frame, pal: ^Palette) {
 		if rest_w > inner {
 			rest_w = inner
 		}
-		clay.Text(ellipsize(f.rest, rest_w), clay.TextElementConfig{textColor = pal.accent})
+		clay.Text(ellipsize(f.rest, rest_w), clay.TextElementConfig{textColor = pal.fg})
 		room := inner - rest_w - 1
 		if room > 0 {
 			footer_hints(f.keys, room, pal)

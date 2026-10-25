@@ -223,7 +223,7 @@ list_paint_row :: proc(row: Picker_Row, avail: i32, is_sel: bool, pal: ^Palette,
 	bg := clay.Color{}
 	fg := pal.fg
 	if is_sel {
-		bg = pal.accent
+		bg = pal.sel_bg
 		fg = pal.sel_fg
 	}
 	// label takes the left, detail the right; together they must fit `avail`.

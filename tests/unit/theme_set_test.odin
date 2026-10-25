@@ -80,91 +80,96 @@ theme_set_no_duplicate_names :: proc(t: ^testing.T) {
 
 @(test)
 theme_set_palette_slot_count :: proc(t: ^testing.T) {
-	support.eq_i(t, "PALETTE_SLOTS matches ui.Palette's field count", app.PALETTE_SLOTS, 19)
+	// PALETTE_SLOTS is the count of COLOUR VALUES in the mirrored schema:
+	// primary(2) + cursor(2) + selection(2) + normal(8) + bright(8) = 22.
+	// It used to be 19, and the two numbers are not comparable — 19 counted
+	// hand-authored semantic slots (two of which were not authored at all but
+	// computed), 22 counts the schema's values. The derivation is asserted
+	// three ways so a stale number cannot survive:
+	//
+	//   * against the literal 22,
+	//   * against len(Palette_Key) — the enumeration the count is derived from,
+	//   * against the key table `palette_keys()` actually returns.
+	//
+	// And the ROLE count is asserted to be a DIFFERENT number: the role table
+	// and the schema are not the same list, and a change that made them equal
+	// would mean someone collapsed one into the other.
+	KEYS :: 2 + 2 + 2 + 8 + 8
+	support.eq_i(t, "PALETTE_SLOTS is the mirrored schema's value count", app.PALETTE_SLOTS, KEYS)
+	support.eq_i(t, "…which is len(Palette_Key) — the derivation, not a guess",
+		app.PALETTE_SLOTS, len(app.Palette_Key))
+	support.eq_i(t, "…and the key table really is that long",
+		app.PALETTE_SLOTS, len(app.palette_keys()))
+	support.eq_i(t, "PALETTE_ROLES is the role table's size", app.PALETTE_ROLES, 13)
+	support.check(t, "…roles are NOT slots (schema keys != UI roles)",
+		app.PALETTE_ROLES != app.PALETTE_SLOTS,
+		fmt.tprintf("roles={} keys={}", app.PALETTE_ROLES, app.PALETTE_SLOTS))
+	support.check(t, "…and the old 19-slot shape is gone, not re-labelled",
+		app.PALETTE_SLOTS != 19, fmt.tprintf("{}", app.PALETTE_SLOTS))
 }
 
 @(test)
-theme_set_every_theme_fills_every_slot :: proc(t: ^testing.T) {
-	// SLOT COVERAGE. A slot left at 0x000000 means a widget silently paints
-	// with a colour nobody chose. None of the shipped palettes uses pure black
-	// as a semantic colour, so zero == unset is a sound reading here — and the
-	// slot count is asserted separately, so adding a slot without filling it
-	// cannot slip past.
+theme_set_every_theme_carries_every_schema_key :: proc(t: ^testing.T) {
+	// SCHEMA COVERAGE. Every one of the 22 values must be present in every
+	// theme. A value left at 0x000000 means a widget silently paints with a
+	// colour nobody chose (0 is also the termbox "terminal default" sentinel,
+	// so a hole here is invisible in the worst sense), and a value with bits
+	// above the RGB field is not a colour at all.
 	//
-	// THE TWO DERIVED SLOTS ARE EXEMPT, AND THAT IS STATED RATHER THAN HIDDEN.
-	// run_hl and stop_hl are UNSET in every literal BY CONSTRUCTION: they are
-	// computed at `ui.palette_of` time by `app.theme_hl_pair_kept` from
-	// running/stopped/accent/sel_fg. Treating them as gaps here would be
-	// asserting the exact opposite of the design. The exemption is not a
-	// loss of teeth either, because:
-	//
-	//   * this test still fails on a gap in ANY of the other 17 slots, and
-	//     still fails if a theme AUTHORS a run_hl/stop_hl value (checked
-	//     below, in the opposite direction);
-	//   * `roles_highlight_pair_is_derived_not_authored` in
-	//     theme_roles_uip2_test proves the derived value actually fills them,
-	//     so "unset in the literal" cannot be used as an excuse for "unpainted".
-	//
-	// The derived slot INDICES are named, not string-matched, so renaming a
-	// slot cannot silently move the exemption onto a different field.
-	DERIVED_SLOTS :: 2
-	slot_names := [app.PALETTE_SLOTS]string{
-		"bg", "fg", "dim", "border", "header_fg", "accent", "sel_fg", "caret",
-		"float_bg", "float_fg", "err_fg", "running", "stopped",
-		"key_fg", "desc_fg", "caret_bg", "caret_fg", "run_hl", "stop_hl",
-	}
+	// There is no exemption list in this test. The previous version exempted two
+	// slots because they were DERIVED; with the schema mirror nothing is derived,
+	// so nothing is exempt and the rule is simply "all 220 values, every theme".
 	gaps := 0
-	authored_derived := 0
+	wide := 0
 	detail := ""
 	for i := 0; i < app.theme_count(); i += 1 {
 		th := app.theme_at(i)
-		slots := [app.PALETTE_SLOTS]u32{
-			th.pal.bg, th.pal.fg, th.pal.dim, th.pal.border, th.pal.header_fg,
-			th.pal.accent, th.pal.sel_fg, th.pal.caret, th.pal.float_bg,
-			th.pal.float_fg, th.pal.err_fg, th.pal.running, th.pal.stopped,
-			th.pal.key_fg, th.pal.desc_fg, th.pal.caret_bg, th.pal.caret_fg,
-			th.pal.run_hl, th.pal.stop_hl,
-		}
-		for s, k in slots {
-			derived := k == app.PALETTE_SLOTS - 1 || k == app.PALETTE_SLOTS - 2
+		for k in app.palette_keys() {
+			s := app.theme_slot(th.pal, k)
 			if (s & 0xff000000) != 0 {
-				gaps += 1
+				wide += 1
 				detail = fmt.tprintf("{} BAD:{}{}.{} has bits above the RGB field {:08x}",
-					detail, th.name, slot_names[k], s)
-			} else if derived {
-				// The exemption, asserted in the enforcing direction: these two
-				// must be UNSET. A non-zero here is a hand-authored highlight.
-				if (s & 0xffffff) != 0 {
-					authored_derived += 1
-					detail = fmt.tprintf("{} {}{}.{} is AUTHORED ({:06x}); it must stay 0 and be derived",
-						detail, th.name, slot_names[k], s)
-				}
+					detail, th.name, app.palette_key_name(k), s)
 			} else if (s & 0xffffff) == 0 {
 				gaps += 1
-				detail = fmt.tprintf("{} GAP:{}{}.{} is unset (0x000000)", detail, th.name, slot_names[k])
+				detail = fmt.tprintf("{} GAP:{}{}.{} is unset (0x000000)",
+					detail, th.name, app.palette_key_name(k))
 			}
 		}
 	}
 	support.check(t,
-		"every theme fills all 17 AUTHORED slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair)",
+		"every theme carries all 22 schema values (none unset)",
 		gaps == 0, fmt.tprintf("{} gap(s) across {} themes{}", gaps, app.theme_count(), detail))
 	support.check(t,
-		fmt.tprintf("and leaves both DERIVED slots ({} of {} per theme) unset for the derivation", DERIVED_SLOTS, app.PALETTE_SLOTS),
-		authored_derived == 0,
-		fmt.tprintf("{} hand-authored highlight(s){}", authored_derived, detail))
+		"…and none of them has bits outside the RGB field",
+		wide == 0, fmt.tprintf("{} overflow(s){}", wide, detail))
 }
 
 @(test)
 theme_set_text_is_never_its_own_background :: proc(t: ^testing.T) {
-	// A palette where fg == bg is unreadable and no glyph-level check catches it.
+	// A role pair that resolves to the same colour is unreadable and no
+	// glyph-level check catches it. Asserted on the RESOLVED roles, which is
+	// what is painted — not on palette fields, which is what used to be authored.
+	//
+	// This is the narrow, always-true slice. The wider "is every role legible on
+	// what it is painted over" question is answered honestly (and with
+	// failures) in `role_contrast_matrix_is_recorded` in theme_roles_test.odin;
+	// this pair is the one that must hold in literally every palette.
 	invisible := 0
+	detail := ""
 	for i := 0; i < app.theme_count(); i += 1 {
 		p := app.theme_at(i).pal
-		if p.fg == p.bg { invisible += 1 }
-		if p.sel_fg == p.accent { invisible += 1 } // the selection bar's text
+		if app.theme_role(p, .text) == app.theme_role(p, .background) {
+			invisible += 1
+			detail = fmt.tprintf("{} {}: text == background", detail, app.theme_at(i).name)
+		}
+		if app.theme_role(p, .hl_text) == app.theme_role(p, .hl_bg) {
+			invisible += 1
+			detail = fmt.tprintf("{} {}: hl_text == hl_bg", detail, app.theme_at(i).name)
+		}
 	}
-	support.check(t, "text is never its own background colour", invisible == 0,
-		fmt.tprintf("{} invisible pair(s)", invisible))
+	support.check(t, "no theme makes its text its own background", invisible == 0,
+		fmt.tprintf("{} invisible pair(s){}", invisible, detail))
 }
 
 @(test)

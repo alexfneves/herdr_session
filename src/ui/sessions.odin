@@ -31,28 +31,33 @@ package ui
 // re-sorting and a shrinking terminal all change indices, and the plan's
 // cancel/delete rule is "if it is still there, keep it selected". Resolving the
 // identity against the current rows gives the row index at paint time, and the
-// highlight is an explicit backgroundColor the view chose (pal.accent) with its
-// matching foreground (pal.sel_fg). The renderer is NOT asked to blend a tint —
-// Phase 2 left overlay blending as a no-op, so a highlight that relied on it
-// would silently be nothing.
+// highlight is an explicit backgroundColor the view chose (pal.sel_bg, which
+// is the theme's `selection.background`) with its matching foreground
+// (pal.sel_fg). The renderer is NOT asked to blend a tint — Phase 2 left
+// overlay blending as a no-op, so a highlight that relied on it would silently
+// be nothing.
 //
-// THE STATE COLUMN IS THE ONE EXCEPTION TO `sel_fg` (RCH-10 change 5). A row's
-// device / timestamp / name cells all take `sel_fg` under selection; the state
-// word does not, because it carries information the row colour cannot: whether
-// the session is up. Forcing `sel_fg` there made a selected RUNNING row and a
-// selected STOPPED row render IDENTICALLY, which flattened the one thing that
-// column exists to say.
+// THE STATE COLUMN KEEPS ITS OWN COLOUR OVER THE HIGHLIGHT (RCH-12).
+// A row's device / timestamp / name cells all take `sel_fg` under selection;
+// the state word does not. It paints `pal.running` or `pal.stopped` — the
+// theme's `normal.green` / `normal.red` — ON TOP OF the highlight, in both
+// selection states. A selected RUNNING row therefore does not look like a
+// selected STOPPED row, which is the one thing that column exists to say.
 //
-// Under selection the state word therefore uses the highlight PAIR `run_hl` /
-// `stop_hl`. BOTH of those are DERIVED, not authored and not "the theme's hex
-// for the highlighted case": `app.theme_hl_pair_kept` computes them from the
-// theme's own `running` / `stopped` / `accent` / `sel_fg` such that each word
-// is legible on the bar, at least 1.6:1 away from the bar's own text (`sel_fg`)
-// so it is NOT one of the other highlighted characters, at least 1.6:1 away
-// from the other state word, and still recognisably the colour it started as.
-// A theme cannot get this wrong and a new theme does not have to choose it.
-// The view's job stops at referencing the ROLES. See `sess_paint_row`, and the
-// proof of why the pair must be derived jointly in `src/app/theme.odin`.
+// It used to be that the selected pair was DERIVED (a blend search that moved
+// the state colour until it was legible on the bar). That derivation is gone:
+// the theme supplies the distinctness of green-from-red and we do not
+// manufacture it. `tests/unit/theme_roles_test.odin` verifies that these two
+// colours clear the legibility floor over `selection.background` for all ten
+// themes; where a theme's own values are weak, that is reported, not painted
+// over.
+//
+// Under selection the state word therefore keeps `pal.running` / `pal.stopped`
+// exactly as it does unselected. There is no second, highlighted version of the
+// state colour: no derived pair, no per-theme "highlighted running" hex, no
+// blend. A theme cannot get the selected case wrong because there is nothing
+// separate to get wrong, and a new theme does not have to choose anything. The
+// view's job stops at referencing the ROLES. See `sess_paint_row`.
 //
 // ── SHRINK NEVER LOSES THE SELECTION ────────────────────────────────────────
 // sessions_clamp runs every frame with the current visible row count: scroll is
@@ -316,7 +321,7 @@ sess_paint_row :: proc(row: app.Session, cols: Sessions_Columns, is_sel: bool, p
 	bg := clay.Color{} // alpha 0 == paint nothing; the frame's bg shows through
 	fg := pal.fg
 	if is_sel {
-		bg = pal.accent
+		bg = pal.sel_bg
 		fg = pal.sel_fg
 	}
 	// Unique id per row: Clay requires unique ids within a frame.
@@ -334,38 +339,24 @@ sess_paint_row :: proc(row: app.Session, cols: Sessions_Columns, is_sel: bool, p
 	}) {
 		paint_cell(ellipsize(row.device, cols.device), cols.device, fg)
 		paint_cell(ellipsize(app.ts_display(row.ts), cols.ts), cols.ts, fg)
-		// ── the state word: four combinations, never flattened ────────────
-		// RCH-10 change 5. `running` / `stopped` are palette roles in BOTH
-		// selection states (T6.2 "no gaps"), and the selected pair is the
-		// DERIVED highlight of the same distinction rather than the row's own
-		// `sel_fg`:
+		// ── the state word: its own colour, selected or not ────────────────
+		// RCH-12. `running` / `stopped` are palette roles in BOTH selection
+		// states, and selection does not change which one is used:
 		//
-		//                 not selected      selected
-		//   running       pal.running       pal.run_hl   (derived)
-		//   stopped       pal.stopped     pal.stop_hl   (derived)
+		//                 not selected    selected
+		//   running       pal.running     pal.running   (over pal.sel_bg)
+		//   stopped       pal.stopped     pal.stopped   (over pal.sel_bg)
 		//
-		// `pal.run_hl` / `pal.stop_hl` come out of `app.theme_hl_pair_kept`
-		// via `ui.palette_of` — no theme authors them, and each is guaranteed
-		// to sit away from `sel_fg` as well as away from its partner. "Away from
-		// the other state word" alone was never enough: that is exactly how six
-		// shipped themes ended up with run_hl == sel_fg, a distinct role and an
-		// identical pixel.
-		//
-		// The previous shape was `state_fg := fg; if !is_sel { running/stopped }`,
-		// i.e. while a row was selected the state word took the ROW's colour and
-		// the two states collapsed into one. That is the flattening change 5
-		// forbids.
+		// The theme's `normal.green` / `normal.red` are what make the two rows
+		// differ; the highlight bar is simply the surface they are painted on.
+		// There is no derivation here any more, and no per-theme special case.
 		//
 		// This is a per-cell foreground decision on purpose. A blend/tint of the
 		// highlight over the state colour is NOT available: overlay blending has
 		// been a deliberate no-op since Phase 2 (this file's header), so a tint
 		// approach paints nothing at all (D-Q).
 		state_fg : clay.Color
-		if is_sel && row.running {
-			state_fg = pal.run_hl
-		} else if is_sel {
-			state_fg = pal.stop_hl
-		} else if row.running {
+		if row.running {
 			state_fg = pal.running
 		} else {
 			state_fg = pal.stopped

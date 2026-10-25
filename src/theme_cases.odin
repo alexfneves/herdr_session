@@ -187,73 +187,58 @@ case_theme_set :: proc() -> bool {
 	}
 	check("no duplicate theme names", dups == 0, fmt.tprintf("{} duplicate(s)", dups))
 
-	// SLOT COVERAGE. A slot left at 0x000000 means a widget silently paints
-	// with a colour nobody chose - the "gap" this check exists to prevent.
-	// None of the shipped palettes uses pure black as a semantic colour, so
-	// zero == unset is a sound reading here (and the count is asserted too, so
-	// adding a slot without filling it cannot slip past).
+	// SCHEMA COVERAGE. Every one of the 22 values of the mirrored schema must be
+	// present in every theme. A value left at 0x000000 means a widget silently
+	// paints with a colour nobody chose, and a value with bits above the RGB
+	// field means the transcription was not a colour at all. The count itself is
+	// asserted so the shape cannot change without this case noticing.
 	//
-	// run_hl / stop_hl ARE NOT AUTHORABLE, and this case says so rather than
-	// contradicting the design: they are left 0 in every literal and computed
-	// at ui.palette_of time by app.theme_hl_pair_kept. They are therefore
-	// checked in the OPPOSITE direction - a non-zero value there is the
-	// failure, because it means somebody put a hand-picked highlight back into
-	// a theme. The 17 authored slots keep the original gap rule untouched, and
-	// tests/unit/theme_roles_uip2_test.odin is what proves the derivation
-	// actually fills the two derived slots. (The unit suite is the authority;
-	// this case mirrors it so the two cannot disagree about what the table is
-	// supposed to look like.)
-	slot_names := [app.PALETTE_SLOTS]string{
-		"bg", "fg", "dim", "border", "header_fg", "accent", "sel_fg", "caret",
-		"float_bg", "float_fg", "err_fg", "running", "stopped",
-		"key_fg", "desc_fg", "caret_bg", "caret_fg", "run_hl", "stop_hl",
+	// This case mirrors `tests/unit/theme_vendored_schema_test.odin`, which is
+	// the authority: that file re-reads the vendored files and compares all 220
+	// values. What is checked here is the shape and the "no unset value" rule,
+	// so the two cannot disagree about what the table is supposed to look like.
+	slot_names := [app.PALETTE_SLOTS]string{}
+	for k in app.palette_keys() {
+		slot_names[int(k)] = app.palette_key_name(k)
 	}
-	check("PALETTE_SLOTS matches ui.Palette's field count",
-		app.PALETTE_SLOTS == 19, fmt.tprintf("{}", app.PALETTE_SLOTS))
+	check("PALETTE_SLOTS is the mirrored schema's key count (2 + 2 + 2 + 8 + 8)",
+		app.PALETTE_SLOTS == 22 && len(slot_names) == app.PALETTE_SLOTS,
+		fmt.tprintf("{}", app.PALETTE_SLOTS))
+	check("PALETTE_ROLES is the role table's size (13), and is NOT the schema count",
+		app.PALETTE_ROLES == 13 && app.PALETTE_ROLES != app.PALETTE_SLOTS,
+		fmt.tprintf("roles={} keys={}", app.PALETTE_ROLES, app.PALETTE_SLOTS))
 
 	gaps := 0
-	authored_derived := 0
 	for i in 0..<n {
 		t := app.theme_at(i)
-		slots := [app.PALETTE_SLOTS]u32{
-			t.pal.bg, t.pal.fg, t.pal.dim, t.pal.border, t.pal.header_fg,
-			t.pal.accent, t.pal.sel_fg, t.pal.caret, t.pal.float_bg,
-			t.pal.float_fg, t.pal.err_fg, t.pal.running, t.pal.stopped,
-			t.pal.key_fg, t.pal.desc_fg, t.pal.caret_bg, t.pal.caret_fg,
-			t.pal.run_hl, t.pal.stop_hl,
-		}
-		for s, k in slots {
-			derived := k == app.PALETTE_SLOTS-1 || k == app.PALETTE_SLOTS-2
+		for k in app.palette_keys() {
+			s := app.theme_slot(t.pal, k)
 			if (s & 0xff000000) != 0 {
 				gaps += 1
 				say(fmt.tprintf("    BAD: %s.%s has bits above the RGB field: %x",
-					t.name, slot_names[k], s))
-			} else if derived {
-				if (s & 0xffffff) != 0 {
-					authored_derived += 1
-					say(fmt.tprintf("    AUTHORED: %s.%s = %x - must stay 0 and be derived",
-						t.name, slot_names[k], s))
-				}
+					t.name, slot_names[int(k)], s))
 			} else if (s & 0xffffff) == 0 {
 				gaps += 1
-				say(fmt.tprintf("    GAP: {}.{} is unset (0x000000)", t.name, slot_names[k]))
+				say(fmt.tprintf("    GAP: %s.%s is unset (0x000000)",
+					t.name, slot_names[int(k)]))
 			}
 		}
 	}
-	check("every theme fills all 17 AUTHORED slots (bg/fg/border/rule/accent/selection/running/stopped/error/key/desc/caret-pair)",
+	check("every theme carries all 22 schema values (none unset, none non-RGB)",
 		gaps == 0, fmt.tprintf("{} gap(s) across {} themes", gaps, n))
-	check("and leaves both DERIVED highlight slots unset for the derivation",
-		authored_derived == 0, fmt.tprintf("{} hand-authored highlight(s)", authored_derived))
 
-	// Text must never be the same colour as its own background: a palette where
-	// fg == bg is unreadable and no glyph-level check would catch it.
+	// Text must never be the same colour as its own background. With the role
+	// table this is a statement about ROLE pairs, not about fields: primary text
+	// on the page, and the highlighted row's text on the highlighted row's
+	// background. Both are resolved through `app.theme_role`, so what is checked
+	// here is exactly what is painted.
 	invisible := 0
 	for i in 0..<n {
 		p := app.theme_at(i).pal
-		if p.fg == p.bg { invisible += 1 }
-		if p.sel_fg == p.accent { invisible += 1 } // the selection bar's text
+		if app.theme_role(p, .text) == app.theme_role(p, .background) { invisible += 1 }
+		if app.theme_role(p, .hl_text) == app.theme_role(p, .hl_bg) { invisible += 1 }
 	}
-	check("text is never its own background colour", invisible == 0,
+	check("no theme makes its text its own background", invisible == 0,
 		fmt.tprintf("{} invisible pair(s)", invisible))
 
 	// The picker gets canonical names only. An alias is a door into the table,
@@ -740,8 +725,10 @@ case_colour_wire :: proc() -> bool {
 	latte, _ := app.theme_named("catppuccin-latte")
 	p := ui.palette_of(latte)
 	check("palette_of maps hex to 0..255 float channels (no normalisation)",
-		latte.pal.bg == 0xeff1f5 && p.bg[0] == 239.0 && p.bg[1] == 241.0 && p.bg[2] == 245.0,
-		fmt.tprintf("bg = %f %f %f (from %06x)", p.bg[0], p.bg[1], p.bg[2], latte.pal.bg))
+		app.theme_role(latte.pal, .background) == 0xeff1f5 &&
+		p.bg[0] == 239.0 && p.bg[1] == 241.0 && p.bg[2] == 245.0,
+		fmt.tprintf("bg = %f %f %f (from %06x)", p.bg[0], p.bg[1], p.bg[2],
+			app.theme_role(latte.pal, .background)))
 	check("…alpha 255 (opaque) on every themed colour", p.bg[3] == 255.0,
 		fmt.tprintf("alpha = {}", p.bg[3]))
 
@@ -777,28 +764,27 @@ case_colour_wire :: proc() -> bool {
 	check("alpha 0 paints nothing (alpha is a paint flag, not an identity tag)", !pc,
 		fmt.tprintf("paints={}", pc))
 
-	// Every slot of every shipped theme must be paintable through the real
-	// renderer — no holes, and no slot that a theme forgot to fill.
+	// Every ROLE of every shipped theme must be paintable through the real
+	// renderer — no holes, and no role that resolved to nothing.
 	holes := 0
 	for i in 0..<app.theme_count() {
 		tp := ui.palette_of(app.theme_at(i))
-		slots := [19]clay.Color{tp.bg, tp.fg, tp.dim, tp.border, tp.header_fg,
-			tp.accent, tp.sel_fg, tp.caret, tp.float_bg, tp.float_fg, tp.err_fg,
-			tp.running, tp.stopped, tp.key_fg, tp.desc_fg, tp.caret_bg, tp.caret_fg,
-			tp.run_hl, tp.stop_hl}
-		for s in slots {
+		roles := [13]clay.Color{tp.bg, tp.fg, tp.dim, tp.sel_bg, tp.sel_fg,
+			tp.border, tp.key_fg, tp.desc_fg, tp.running, tp.stopped, tp.err_fg,
+			tp.caret_bg, tp.caret_fg}
+		for s in roles {
 			if _, okp := render.attr_of(s); !okp { holes += 1 }
 		}
 	}
-	check("every slot of every theme paints through render.attr_of", holes == 0,
+	check("every role of every theme paints through render.attr_of", holes == 0,
 		fmt.tprintf("{} hole(s)", holes))
 
-	// The selection bar's two colours must differ after mapping, because the
-	// label on the bar is drawn in sel_fg over accent.
+	// The highlight bar's two colours must differ after mapping, because the
+	// label on the bar is drawn in hl_text over hl_bg.
 	bar_same := 0
 	for i in 0..<app.theme_count() {
 		tp := ui.palette_of(app.theme_at(i))
-		if render.attr_painted(tp.accent) == render.attr_painted(tp.sel_fg) { bar_same += 1 }
+		if render.attr_painted(tp.sel_bg) == render.attr_painted(tp.sel_fg) { bar_same += 1 }
 	}
 	check("selection bar bg and selection text differ in every theme", bar_same == 0,
 		fmt.tprintf("{} theme(s) with an invisible selection label", bar_same))

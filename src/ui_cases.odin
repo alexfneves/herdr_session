@@ -203,7 +203,7 @@ bring_up :: proc() -> bool {
 		check("painter_start", false, "clay init failed")
 		return false
 	}
-	g_pal = ui.DEFAULT_PALETTE
+	g_pal = ui.default_palette()
 	scene.p = &g_painter
 	scene.pal = &g_pal
 	scene.f = &g_frame
@@ -976,8 +976,9 @@ case_ui_frame :: proc() -> bool {
 	// 10. Alpha is never an identity tag: every palette colour is opaque, so the
 	//     only thing alpha can mean in this renderer is "don't paint".
 	all_opaque := true
-	colours := [11]clay.Color{g_pal.bg, g_pal.fg, g_pal.dim, g_pal.border, g_pal.header_fg,
-		g_pal.accent, g_pal.sel_fg, g_pal.caret, g_pal.float_bg, g_pal.float_fg, g_pal.err_fg}
+	colours := [13]clay.Color{g_pal.bg, g_pal.fg, g_pal.dim, g_pal.sel_bg, g_pal.sel_fg,
+		g_pal.border, g_pal.key_fg, g_pal.desc_fg, g_pal.running, g_pal.stopped,
+		g_pal.err_fg, g_pal.caret_bg, g_pal.caret_fg}
 	for j := 0; j < len(colours); j += 1 {
 		if colours[j][3] != 255 {
 			all_opaque = false
@@ -1113,7 +1114,7 @@ case_ui_sessions :: proc() -> bool {
 	g_sessions.sel = app.selection_of(&ordered[1])
 	g_sessions.scroll = 0
 	paint_scene()
-	sel_bg := paint_attr(g_pal.accent)
+	sel_bg := paint_attr(g_pal.sel_bg)
 	sel_row := first + 1
 	chosen := cell_at(name_x, sel_row).bg
 	other := cell_at(name_x, first).bg
@@ -1313,7 +1314,7 @@ case_ui_shrink :: proc() -> bool {
 
 	// Read the highlight back at its NEW screen row and confirm the selected
 	// session's own name is sitting under it.
-	sel_bg := paint_attr(g_pal.accent)
+	sel_bg := paint_attr(g_pal.sel_bg)
 	row_y := first2 + i32(idx) - g_sessions.scroll
 	cell := cell_at(60, row_y)
 	check("the selected row is highlighted at its new screen row",
@@ -1805,7 +1806,7 @@ case_ui_list :: proc() -> bool {
 	check("the selection followed the SAME identity through the filter", g_list.sel == 0,
 		fmt.tprintf("sel={} (list has {} row)", g_list.sel, ui.list_count(&g_list)))
 
-	sel_bg := paint_attr(g_pal.accent)
+	sel_bg := paint_attr(g_pal.sel_bg)
 	row_y := top + i32(g_list.sel) - g_list.scroll
 	check("the selected list row carries the highlight in the cells",
 		cell_at(6, row_y).bg == sel_bg,

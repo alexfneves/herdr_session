@@ -20,10 +20,22 @@ package ui
 // was, which is what "floats over everything" has to mean.
 //
 // ── NO OVERLAY TINT ─────────────────────────────────────────────────────────
-// The pane is opaque: a solid float_bg plus a border, both drawn by
+// The pane is opaque: a solid background plus a border, both drawn by
 // Clay -> render.paint. Phase 2 left Clay's overlay tint as a deliberate no-op in
 // our renderer, so a pane that relied on tinting would render as nothing. Opaque
 // is also the honest choice for an error: it covers, it does not smudge.
+//
+// ── HOW THE PANE MAPS ONTO THE COLOUR SCHEMA ────────────────────────────────
+// The upstream `colors.*` schema has no "floating surface" key, and the role
+// table does not invent one. So the pane is composed entirely of roles that DO
+// exist: the page's own `background` as its fill, the `error` role for its
+// frame and title, `text` for the body lines and `secondary` for the dismiss
+// hint. A bordered box of the page's own colour is how a terminal has always
+// delimited a panel; picking `selection.background` instead would have made the
+// pane read as a selected row, which is a different thing entirely. The
+// consequence — the pane is separated by its border rather than by a darker
+// surface — is reported as a decision outside the role table rather than
+// papered over with a colour the schema does not have.
 //
 // ── DISMISSAL ───────────────────────────────────────────────────────────────
 // Enter or Escape closes it — see float_is_dismiss_key. That predicate lives HERE,
@@ -95,7 +107,7 @@ float_paint :: proc(f: ^Float, avail_cols: i32, pal: ^Palette) {
 			padding = clay.PaddingAll(FLOAT_PAD_X),
 			childGap = 1,
 		},
-		backgroundColor = pal.float_bg,
+		backgroundColor = pal.bg,
 		border = clay.BorderElementConfig{color = pal.err_fg, width = clay.BorderAll(FLOAT_BORDER)},
 		floating = clay.FloatingElementConfig{
 			attachTo   = clay.FloatingAttachToElement.Root, // pinned to the root, not the flow
@@ -110,7 +122,7 @@ float_paint :: proc(f: ^Float, avail_cols: i32, pal: ^Palette) {
 	}) {
 		clay.Text(ellipsize(f.title, inner_w), clay.TextElementConfig{textColor = pal.err_fg})
 		for l in f.lines {
-			clay.Text(ellipsize(l, inner_w), clay.TextElementConfig{textColor = pal.float_fg})
+			clay.Text(ellipsize(l, inner_w), clay.TextElementConfig{textColor = pal.fg})
 		}
 		if len(f.dismiss) > 0 {
 			clay.Text(ellipsize(f.dismiss, inner_w), clay.TextElementConfig{textColor = pal.dim})

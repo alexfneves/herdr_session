@@ -1,113 +1,211 @@
 package app
 
 // ============================================================================
-// app.theme — the compiled-in palette set (T6.2, plan D4)
+// app.theme — the compiled-in palette set, mirrored from the alacritty colourschema  (T6.2; schema rework)
 //
-// # WHAT THIS FILE OWNS
+// # WHAT CHANGED, AND WHAT IS NOW FIXED
 //
-// The *names* and the *colours*. Nothing else. No file I/O (that is config.odin),
-// no termbox call (that is render.attr_of), no Clay type. A palette here is a
-// table of 0xRRGGBB integers behind semantic slot names, and the only thing that
-// turns one into a `clay.Color` is `ui.palette_of` — one function, in one place,
-// with the 0..255 fact written next to it.
+// This module used to hold a hand-authored set of 19 semantic slots whose values
+// were picked by us from five upstream palette files, plus a joint blend search
+// (`theme_hl_pair_kept`) that MANUFACTURED two of those slots at palette
+// resolution time. All of that is gone.
+//
+// The colour set is now a verbatim mirror of one externally-defined schema: the
+// `colors.*` table of an alacritty colour file. The ten shipped palettes are
+// the ten files vendored under `.pi/plans/theme-sources/`, key for key, byte
+// for byte. We do not author colours any more, we do not adjust them for
+// contrast, and we do not derive anything. A theme is 22 named values from a
+// source we do not control, and every pixel of the UI picks one of those 22 by
+// ROLE.
+//
+// # THE SCHEMA (22 keys, 5 tables — this is the whole thing)
+//
+//   colors.primary.foreground   colors.primary.background
+//   colors.cursor.cursor        colors.cursor.text
+//   colors.selection.text       colors.selection.background
+//   colors.normal.{black,red,green,yellow,blue,magenta,cyan,white}
+//   colors.bright.{black,red,green,yellow,blue,magenta,cyan,white}
+//
+// There is no "accent", no "highlight", no "float surface", no "secondary
+// text" and no "state colour" in the schema. Those are ROLES, and a role is a
+// lookup into the 22 values, not a value of its own. That is the distinction
+// this module is built on: the schema is data from upstream, the role table is
+// the contract with the view layer, and the two are not the same list.
+//
+// # THE ROLE TABLE (the contract — verbatim)
+//
+//   | role                          | resolves from           |
+//   |-------------------------------|-----------------------|
+//   | background                    | `primary.background`  |
+//   | primary text                  | `primary.foreground`  |
+//   | secondary text                | `bright.black`        |
+//   | highlighted row background    | `selection.background`|
+//   | highlighted row text          | `selection.text`      |
+//   | border / between-children rules | `bright.white`      |
+//   | footer KEY token              | `primary.foreground`  |
+//   | footer DESCRIPTION token      | `bright.black`        |
+//   | running                       | `normal.green`        |
+//   | stopped                       | `normal.red`          |
+//   | error                         | `bright.red`          |
+//   | caret background              | `cursor.cursor`       |
+//   | caret glyph                   | `cursor.text`         |
+//
+// `theme_role_source` is this table as code and nothing else. Every row is
+// asserted, for every theme, by `tests/unit/theme_roles_test.odin`, so the
+// comment and the code cannot drift apart unnoticed.
+//
+// Note that the table is not one-to-one and is not meant to be:
+// `primary.foreground` answers BOTH "primary text" and "footer KEY", and
+// `bright.black` answers BOTH "secondary text" and "footer DESCRIPTION". A role
+// is a question about the screen; a schema key is a value. Two questions may
+// have the same answer, and that is upstream's choice, not a bug to iron out.
+//
+// Eleven of the 22 values are addressed by a role. The other eleven
+// (`normal.black`, `normal.yellow`, `normal.blue`, `normal.magenta`,
+// `normal.cyan`, `normal.white`, `bright.green`, `bright.yellow`,
+// `bright.blue`, `bright.magenta`, `bright.cyan`) are carried in full and
+// addressed by nothing: this repo paints twelve kinds of thing and a terminal
+// colour file has sixteen ANSI slots, so most of the file is present for
+// fidelity rather than for use. `theme_carries_every_schema_key` proves the
+// whole 22 is loaded regardless.
+//
+// # WHAT WAS DELETED, AND WHY
+//
+//   * `accent`             — a hand-picked "selection bar" colour. The schema
+//                            has no accent; the highlight bar is
+//                            `selection.background` because that is literally
+//                            what that key means.
+//   * `run_hl` / `stop_hl` — the two DERIVED highlight roles. See the
+//                            RCH-12 section below for what replaced them.
+//   * `theme_hl_pair_kept` and its whole apparatus (blend grid, candidate
+//                            ladders, joint feasibility search, hue-preservation
+//                            test, infeasibility fallback) — the derivation was
+//                            the mechanism that made the colour set a thing we
+//                            compute rather than a thing we reference, and it is
+//                            what the schema rework exists to remove.
+//   * `theme_slot_or`      — the unset-slot fallback. It existed because roles
+//                            could be missing. With a schema mirror, a role is
+//                            resolved by name from a key that is always present,
+//                            so there is nothing to fall back from.
+//   * `header_fg`, `float_bg`, `float_fg`, `caret` — four slots for surfaces
+//                            the schema does not distinguish. The header title
+//                            is primary text; the floating pane is drawn on the
+//                            page background with primary text and an
+//                            error-coloured frame; the caret is the
+//                            `cursor.cursor` / `cursor.text` PAIR, which is the
+//                            only caret colour the schema defines.
+//
+// # RCH-12 SURVIVES WITHOUT DERIVATION
+//
+// The requirement was: a selected RUNNING row must not look like a selected
+// STOPPED row. It used to be satisfied by blending the state colour so it
+// stayed legible over the highlight bar. It is now satisfied more simply and
+// more honestly: `running` and `stopped` keep `normal.green` and `normal.red`
+// painted ON TOP OF `selection.background`. The state word does not change
+// colour when its row is selected — the theme supplies the distinctness of the
+// two state colours, and we do not manufacture it.
+//
+// `tests/unit/theme_roles_test.odin` verifies that this combination clears the
+// legibility floor for all ten themes, and that verification is a floor test on
+// real numbers, not a restatement of the design. The verification is required;
+// adjusting a hex value so the verification passes is forbidden, and
+// `theme_values_match_the_vendored_schema` makes the fudge impossible to hide —
+// it re-reads the vendored files and compares.
+//
+// # LEGIBILITY FINDINGS UNDER THE STRICT MAPPING (REPORTED, NOT FIXED)
+//
+// Measured at floor 2.0:1 over the strict role table, the vendored values do
+// not clear it everywhere. Full matrix in `tests/unit/theme_roles_test.odin`
+// (`role_contrast_matrix_is_recorded`), which fails if the set of
+// sub-floor pairs changes in EITHER direction — a real regression shows up,
+// and so does a silent "fix" that would desync the ledger from the shipped
+// values.
+//
+//   * solarized-dark  secondary text (bright.black #002b36) is the same colour
+//                     as the page (primary.background #002b36): contrast
+//                     1.000. Column headers, placeholders and footer
+//                     descriptions are invisible on this theme.
+//   * solarized-light border (bright.white #fdf6e3) is the same colour as the
+//                     page (#fdf6e3): 1.000. The between-children rules are
+//                     invisible.
+//   * catppuccin-latte border 1.608; the rule is present but very faint.
+//   * tokyonight-night secondary text 1.914 and nord secondary text 1.693 are
+//                     below the floor.
+//   * the selection bar itself is close to the page on eight themes
+//                     (1.136–1.400) — subtle by upstream design, since these
+//                     are the colours a terminal's own selection uses.
+//
+// None of these were fudged. They are the consequence of the strict mapping
+// and are reported as-is.
+//
+// # THE ONE SEAM: A FUTURE SCHEMA LOADER IS AN ISOLATED ADDITION
+//
+// The product's config format stays JSON (`theme`, `remotes`,
+// `cleanup_policy`, unknown keys preserved) and there is NO parser for the
+// upstream file format anywhere in this module — see
+// `theme_hygiene_test.odin`, which fails the build on the token in
+// non-comment src lines.
+//
+// `theme_from_alacritty_schema` below is the single named drop-in point for a
+// future loader that would take a vendored colour file's text and produce a
+// `Palette`. It is deliberately UNIMPLEMENTED and returns an error. When it
+// is implemented it must be implemented ONCE, in that proc, and
+// `THEMES`/`theme_at` must be the only thing it feeds — no call site changes,
+// no second format creeping into the view layer, no role-table change. The
+// token for the upstream extension itself is spelled only in comments so the
+// hygiene guard keeps its teeth.
 //
 // # WHY A U32 HEX AND NOT A clay.Color
 //
-//   * the values below are transcribed straight from the cited sources as hex, so
-//     `bg = 0x282828` is diffable against gruvbox's own table without a
+//   * the values are transcribed from the sources as hex, so
+//     `background = 0x282828` is diffable against the upstream table without a
 //     float-in-a-literal detour;
-//   * it keeps this package free of the renderer's dependencies — `app` stays
-//     testable without a terminal or a Clay archive in the picture;
+//   * `app` stays free of the renderer's dependencies and testable without a
+//     terminal or a Clay archive in the picture;
 //   * the conversion point is then impossible to miss, which matters because of
 //     the trap below.
 //
 // # TRAP: Clay channels are 0..255, NOT 0.0..1.0
 //
 // `Clay_Color` is `[4]c.float` carrying 0..255 (clay-odin/clay.odin:51).
-// Feeding 0.16 instead of 40 paints the whole UI black and every check goes red
-// at once. Already paid for once; see render/renderer.odin's `attr_of` header.
+// Feeding 0.16 instead of 40 paints the whole UI black and every check goes
+// red at once. The one conversion lives in `ui.palette_of`.
 //
 // # TRAP: termbox2 reads a zero attr as "terminal default"
 //
 // In truecolour the attr's low 24 bits are the RGB, and an attr of 0 with no
-// TB_HI_BLACK means "use whatever the terminal has", not "black" (termbox2.h:
-// 3830, 3883). So a genuinely black cell needs TB_HI_BLACK set. That is
-// handled inside `render.attr_of` — a theme asking for #000000 gets real black,
-// not the terminal's background. `theme_rgb` keeps that a non-issue upstream by
-// never rounding a requested colour toward zero.
+// TB_HI_BLACK means "use whatever the terminal has", not "black"
+// (termbox2.h:3830, 3883). Handled inside `render.attr_of`; `theme_rgb` never
+// rounds a requested colour toward zero.
 //
-// # SOURCES (scout-nix-packaging.md §f; do not "improve" a hex value)
+// # PROVENANCE
 //
-//   gruvbox     morhetz/gruvbox          gruvbox_256palette.sh
-//   catppuccin  catppuccin/palette       palette.json (v1.8.0)
-//   tokyonight  folke/tokyonight.nvim   lua/tokyonight/colors/night.lua
-//   nord        nordtheme/nord           src/nord.scss ($nord0..$nord15)
-//   solarized   altercation/solarized    README palette table
+// Ten files, vendored under `.pi/plans/theme-sources/`, each 496 bytes, each
+// sha256-recorded in that directory's README and re-verified by the unit suite
+// against the compiled values. Names in this table are the repo's canonical
+// theme names; the file a value came from is named on each entry.
 //
-// Every slot value below is one of those files' values, re-labelled. The *choice*
-// of which documented colour fills which slot is ours and is stated per theme.
+//   gruvbox-dark       gruvbox-dark.toml        321c9813…
+//   gruvbox-light      gruvbox-light.toml       4b3f4dcc…
+//   catppuccin-latte   catppuccin-latte.toml   3e23ff7d…
+//   catppuccin-frappe  catppuccin-frappe.toml  6a2bd3bb…
+//   catppuccin-macchiato catppuccin-macchiato.toml 4340bb9b…
+//   catppuccin-mocha   catppuccin-mocha.toml   76829d7b…
+//   tokyonight-night   tokyo-night-default.toml 4618d0ef…
+//   nord               nord-default.toml        f1aeb815…
+//   solarized-dark     solarized-dark.toml      c892854c…
+//   solarized-light    solarized-light.toml     1230f8ec…
 //
-// # SLOT SET
-//
-// The rule for "no gaps" is: the palette has a slot for every semantic colour
-// the view layer references, so a view never reaches for a colour the theme does
-// not define. The nineteen slots are exactly the fields of `ui.Palette`:
-//
-//   bg, fg, dim, border (== the between-children rule colour; with D14 there is
-//   no outer box, so border and rule are the same colour by construction),
-//   header_fg, accent (the selection bar background), sel_fg (text drawn ON the
-//   bar), caret, float_bg, float_fg, err_fg, running, stopped,
-//   key_fg, desc_fg, caret_bg, caret_fg, run_hl, stop_hl.
-//
-// `running` / `stopped` are new with the theme work: the sessions table painted
-// both with the default fg, so a theme could not distinguish a live session from
-// a dormant one. Both now come from the palette.
-//
-// The six roles added by RCH-10 (`key_fg`, `desc_fg`, `caret_bg`, `caret_fg`,
-// `run_hl`, `stop_hl`) exist because the footer, the caret and the selection bar
-// each need a colour the existing slots cannot express: two DIFFERENT foregrounds
-// in one line (key vs description), a colour PAIR for the caret block (the
-// single `caret` slot is a fg for a bare glyph, not a block with a background),
-// and a readable state word ON the accent bar.
-//
-// FOUR of those six are authored per theme. TWO of them — `run_hl` and `stop_hl`
-// — are NOT authored at all and are UNSET (0) in every theme literal in `THEMES`
-// below. They are derived at `ui.palette_of` time from four slots the theme
-// already had to author (`running`, `stopped`, `accent`, `sel_fg`) by one rule,
-// `theme_hl_pair_kept`, documented in full at its own section below. That is
-// what "treat the theme as an array of colours and let elements point at it"
-// means for these two roles: nobody picks a highlight colour for one state word
-// in one theme, so it cannot be wrong in one theme.
-//
-// WHY TWO HIGHLIGHT ROLES AND NOT ONE (ORCH D-M corrected by ACK-1) — the
-// original decision asked for a single `state_hl` (13 -> 18). That version is
-// WRONG and is not what this palette ships: with one colour, a selected RUNNING
-// row and a selected STOPPED row render identically, so selection would flatten
-// the running/stopped distinction — the exact thing RCH-10 change 5 forbids. One
-// colour cannot preserve a distinction it exists to preserve. `run_hl` +
-// `stop_hl` is the only version the requirement can be falsified against, at the
-// same mechanical cost, so the total is 19 and NOT 18. The deviation from the
-// 18 in D-M is deliberate and is recorded here as well as in the worker report.
-//
-// ONE MORE WAY TO FLATTEN, AND IT IS NOW THE FORBIDDEN ONE. Two distinct role
-// names are necessary but not sufficient: if `run_hl` is given the SAME colour
-// as `sel_fg`, the state word is a different ROLE from the bar text and the
-// same PIXELS anyway. Six of the ten shipped themes did exactly that
-// (`run_hl = sel_fg` = "the loudest thing on a bright bar"), and the user's
-// complaint was precisely that a selected row's `running` looked like every
-// other highlighted character. `run_hl == sel_fg` is therefore not a legitimate
-// styling choice any more: `theme_hl_pair_kept` must return a colour at least
-// `THEME_HL_FLOOR_TEXT` (1.6:1) away from `sel_fg`, and
-// `roles_highlight_pair_is_never_the_bar_text_colour` proves it for every theme.
-// Any comment anywhere in this repo that calls `run_hl == sel_fg` deliberate is
-// describing the bug, not the design.
+// `theme_values_match_the_vendored_schema` re-reads these files and compares
+// every one of the 22 values, so a transcription error in this table is a red
+// test naming the key, not a subtly-wrong screen.
 //
 // # DEFAULT IS gruvbox-dark (D4)
 //
 // `catppuccin-latte` ships and is selectable — the user asked for it by name —
-// but it is explicitly NOT the default. `THEME_DEFAULT_NAME` is the fallback for
-// "no config", "unreadable config" and "config names a theme we do not have",
-// which is why it lives here rather than in the config module.
+// but it is explicitly NOT the default. `THEME_DEFAULT_NAME` is the fallback
+// for "no config", "unreadable config" and "config names a theme we do not
+// have", which is why it lives here rather than in the config module.
 // ============================================================================
 
 import "core:fmt"
@@ -116,89 +214,265 @@ import "base:runtime"
 import "core:strings"
 
 //-----------------------------------------------------------------------------
-// Slot model
+// THE SCHEMA
 //-----------------------------------------------------------------------------
 
-// Palette is one theme's semantic colours as 0xRRGGBB.
-//
-// Field order matches `ui.Palette` one-for-one; `ui.palette_of` maps them by
-// name, so a rename here that skips the mapper is a compile error rather than a
-// silently-miscoloured widget.
-Palette :: struct {
-	bg        : u32, // terminal background
-	fg        : u32, // default text
-	dim       : u32, // secondary text: column headers, placeholders, key hints
-	border    : u32, // box border AND the between-children rules (D14: no box)
-	header_fg : u32, // the header title
-	accent    : u32, // the selection bar background
-	sel_fg    : u32, // text drawn on the selection bar
-	caret     : u32, // edit caret
-	float_bg  : u32, // floating pane background
-	float_fg  : u32, // floating pane text
-	err_fg    : u32, // error text / error pane border
-	running   : u32, // a session that is up
-	stopped   : u32, // a session that is not
-
-	// ── RCH-10: the six roles the footer/caret/selection paint needs ────
-	// Every one of these is theme-resolved and carries a fallback (see
-	// `theme_slot_or`), so an incomplete theme cannot paint an unchosen colour.
-	key_fg   : u32, // the KEY token in a footer hint — the token the eye hunts for (AD-1.2)
-	desc_fg  : u32, // the DESCRIPTION token — muted relative to key_fg
-	caret_bg : u32, // background of the cell the caret sits on
-	caret_fg : u32, // the caret glyph itself
-	run_hl   : u32, // the "running" word WHILE its row is selected — UNSET BY DESIGN, derived by `theme_hl_pair_kept`
-	stop_hl  : u32, // the "stopped" word WHILE its row is selected — UNSET BY DESIGN, derived by `theme_hl_pair_kept`
+// Alacritty_Primary is `colors.primary`.
+Alacritty_Primary :: struct {
+	foreground : u32,
+	background : u32,
 }
 
-// PALETTE_SLOTS names the count the smoke suite asserts on. Adding a slot to
-// `Palette` without bumping this makes that check fail, which is the point: the
-// view layer must never be left without a colour.
-//
-// 19 = the 13 original semantic slots + RCH-10's six (key_fg, desc_fg,
-// caret_bg, caret_fg, run_hl, stop_hl). It is NOT 18: see the ACK-1 note in the
-// header — a single shared highlight role would make selected-running and
-// selected-stopped indistinguishable.
-//
-// Two of those 19 (run_hl, stop_hl) are counted as SLOTS but are never
-// AUTHORED — they are derived, and `theme_set_test` asserts they are 0 in every
-// literal while asserting the derived value fills them. The slot still has to
-// exist, because the view layer still has to reference it.
-PALETTE_SLOTS :: 19
+// Alacritty_Cursor is `colors.cursor`. Both members are kept: `cursor` is the
+// block and `text` is what is knocked out of it, and the UI needs the pair.
+Alacritty_Cursor :: struct {
+	text   : u32,
+	cursor : u32,
+}
 
-// theme_slot_or resolves a slot that a theme may leave unset.
+// Alacritty_Selection is `colors.selection`.
+Alacritty_Selection :: struct {
+	text       : u32,
+	background : u32,
+}
+
+// Alacritty_Ansi is one of `colors.normal` / `colors.bright`: the eight ANSI
+// slots in their canonical order.
+Alacritty_Ansi :: struct {
+	black   : u32,
+	red     : u32,
+	green   : u32,
+	yellow  : u32,
+	blue    : u32,
+	magenta : u32,
+	cyan    : u32,
+	white   : u32,
+}
+
+// Palette is one theme's colour set: the upstream schema, in full, unchanged.
 //
-// Every shipped theme fills every AUTHORED slot and `theme_set_test` proves it,
-// so this cannot rescue a typo in the table — it covers the case the table
-// cannot: a theme added later that does not bother to fill a role it does not
-// care about. A 0x000000 in a slot means "this theme never chose a colour here"
-// (0 is never a shipped semantic colour; `theme_set_test` treats it as a gap for
-// the same reason), and `fallback` is the nearest EXISTING role — a colour the
-// theme did choose. That is the fallback D-H asks for: an incomplete theme
-// degrades to a colour someone picked, never to an unchosen one.
+// There are no fields here that the schema does not have and no field of the
+// schema that is not here. If a value is needed on screen that is not in this
+// struct, the fix is a ROLE pointing at one of these keys — never a new field
+// invented for one widget.
+Palette :: struct {
+	primary   : Alacritty_Primary,
+	cursor    : Alacritty_Cursor,
+	selection : Alacritty_Selection,
+	normal    : Alacritty_Ansi,
+	bright    : Alacritty_Ansi,
+}
+
+// Palette_Key enumerates the schema's 22 values in the order the source files
+// list them. It exists so the count, the names and the values can be checked
+// against the vendored files without a hand-written loop per field.
+Palette_Key :: enum {
+	primary_foreground,
+	primary_background,
+	cursor_cursor,
+	cursor_text,
+	selection_text,
+	selection_background,
+	normal_black,
+	normal_red,
+	normal_green,
+	normal_yellow,
+	normal_blue,
+	normal_magenta,
+	normal_cyan,
+	normal_white,
+	bright_black,
+	bright_red,
+	bright_green,
+	bright_yellow,
+	bright_blue,
+	bright_magenta,
+	bright_cyan,
+	bright_white,
+}
+
+// PALETTE_SLOTS is derived from the schema's own enumeration: primary(2) +
+// cursor(2) + selection(2) + normal(8) + bright(8) = 22. It is not a number
+// anyone chose; it is the number of colour values the mirrored schema has, and
+// `len(Palette_Key)` is the derivation. `theme_slots` returns exactly this
+// many values and the tests assert the array length, the key names and the
+// per-theme values against the vendored files.
 //
-// The pairing for each role is the role it visually substitutes for:
-//   key_fg -> fg        (the key is still body text, just not emphasised)
-//   desc_fg -> dim      (descriptions were already `dim`)
-//   caret_bg -> caret   (the caret colour was always the caret's colour)
-//   caret_fg -> bg      (glyph over a block: the block's own page colour)
-//
-// `run_hl` / `stop_hl` are DELIBERATELY absent from this list. They used to be
-// here as `run_hl -> running` / `stop_hl -> stopped`, and that pass-through was
-// the mechanism that let the bug ship: falling back to the unselected state
-// colour is what painted the state word in a colour with nothing saying "this is
-// the highlighted version, and it is a DIFFERENT colour from the bar text".
-// Those two roles are computed by `theme_hl_pair_kept`, which is a strictly
-// stronger guarantee than "fall back to something", so `ui.palette_of` does not
-// call this proc for them.
-theme_slot_or :: proc(hex: u32, fallback: u32) -> u32 {
-	if (hex & 0xffffff) == 0 { return fallback }
-	return hex
+// The previous value was 19. It is not 19 any more because the thing being
+// counted changed: 19 counted hand-authored semantic slots (two of which were
+// not even authored but computed), and 22 counts the schema's colour values.
+// The view layer's count of *roles* is a different number again —
+// `PALETTE_ROLES`, 13 — and the two are deliberately not equal, because the
+// schema and the role table are different lists.
+PALETTE_SLOTS :: len(Palette_Key)
+
+// PALETTE_ROLES is the size of the role table: 13 questions the screen can ask
+// the palette. It is asserted against the `Role` enum, and the view layer's
+// `ui.Palette` is asserted to have exactly one field per role.
+PALETTE_ROLES :: len(Role)
+
+// palette_key_name renders a schema key the way the source spells it, so a
+// failure message names `selection.background` and not an array index.
+palette_key_name :: proc(k: Palette_Key) -> string {
+	switch k {
+	case .primary_foreground:   return "primary.foreground"
+	case .primary_background:   return "primary.background"
+	case .cursor_cursor:        return "cursor.cursor"
+	case .cursor_text:          return "cursor.text"
+	case .selection_text:       return "selection.text"
+	case .selection_background: return "selection.background"
+	case .normal_black:         return "normal.black"
+	case .normal_red:           return "normal.red"
+	case .normal_green:         return "normal.green"
+	case .normal_yellow:        return "normal.yellow"
+	case .normal_blue:          return "normal.blue"
+	case .normal_magenta:       return "normal.magenta"
+	case .normal_cyan:          return "normal.cyan"
+	case .normal_white:         return "normal.white"
+	case .bright_black:         return "bright.black"
+	case .bright_red:           return "bright.red"
+	case .bright_green:         return "bright.green"
+	case .bright_yellow:        return "bright.yellow"
+	case .bright_blue:          return "bright.blue"
+	case .bright_magenta:       return "bright.magenta"
+	case .bright_cyan:          return "bright.cyan"
+	case .bright_white:         return "bright.white"
+	}
+	return "?"
+}
+
+// palette_keys lists the schema keys in source order.
+palette_keys :: proc() -> [PALETTE_SLOTS]Palette_Key {
+	return [PALETTE_SLOTS]Palette_Key{
+		.primary_foreground, .primary_background,
+		.cursor_cursor, .cursor_text,
+		.selection_text, .selection_background,
+		.normal_black, .normal_red, .normal_green, .normal_yellow,
+		.normal_blue, .normal_magenta, .normal_cyan, .normal_white,
+		.bright_black, .bright_red, .bright_green, .bright_yellow,
+		.bright_blue, .bright_magenta, .bright_cyan, .bright_white,
+	}
+}
+
+// theme_slot reads one schema value by key. Explicit switch rather than a
+// transmute onto a flat array: the mapping from key to field must be visible at
+// the point of use, and a field renamed without updating this is a compile error
+// rather than a silently-shifted array.
+theme_slot :: proc(p: Palette, k: Palette_Key) -> u32 {
+	switch k {
+	case .primary_foreground:   return p.primary.foreground
+	case .primary_background:   return p.primary.background
+	case .cursor_cursor:        return p.cursor.cursor
+	case .cursor_text:          return p.cursor.text
+	case .selection_text:       return p.selection.text
+	case .selection_background: return p.selection.background
+	case .normal_black:         return p.normal.black
+	case .normal_red:           return p.normal.red
+	case .normal_green:         return p.normal.green
+	case .normal_yellow:        return p.normal.yellow
+	case .normal_blue:          return p.normal.blue
+	case .normal_magenta:       return p.normal.magenta
+	case .normal_cyan:          return p.normal.cyan
+	case .normal_white:         return p.normal.white
+	case .bright_black:         return p.bright.black
+	case .bright_red:           return p.bright.red
+	case .bright_green:         return p.bright.green
+	case .bright_yellow:        return p.bright.yellow
+	case .bright_blue:          return p.bright.blue
+	case .bright_magenta:       return p.bright.magenta
+	case .bright_cyan:          return p.bright.cyan
+	case .bright_white:         return p.bright.white
+	}
+	return 0
+}
+
+//-----------------------------------------------------------------------------
+// THE ROLE TABLE
+//-----------------------------------------------------------------------------
+
+// Role is one question the view layer asks the palette. The names are the
+// roles; `theme_role_source` is the table that ties each to a schema key.
+Role :: enum {
+	background,        // the page
+	text,              // primary text
+	secondary,        // secondary text: column headers, placeholders, muted
+	hl_bg,            // highlighted row background
+	hl_text,          // highlighted row text
+	border,           // border / between-children rules
+	footer_key,       // the KEY token in a footer hint
+	footer_desc,      // the DESCRIPTION token
+	running,          // a session that is up
+	stopped,          // a session that is not
+	error,            // error text and the error pane's frame
+	caret_bg,         // the cell the caret sits on
+	caret_glyph,      // the glyph knocked out of that cell
+}
+
+// theme_role_source is THE ROLE TABLE and nothing else. Keep it in the order of
+// the table in this file's header; `role_table_matches_the_documented_mapping`
+// asserts each row's source key by name, so a row edited here without editing
+// the header (or the reverse) fails with the row named.
+theme_role_source :: proc(r: Role) -> Palette_Key {
+	switch r {
+	case .background:   return .primary_background
+	case .text:         return .primary_foreground
+	case .secondary:    return .bright_black
+	case .hl_bg:        return .selection_background
+	case .hl_text:      return .selection_text
+	case .border:       return .bright_white
+	case .footer_key:   return .primary_foreground
+	case .footer_desc:  return .bright_black
+	case .running:      return .normal_green
+	case .stopped:      return .normal_red
+	case .error:        return .bright_red
+	case .caret_bg:     return .cursor_cursor
+	case .caret_glyph:  return .cursor_text
+	}
+	return .primary_background // unreachable; `Role` is exhaustive above
+}
+
+// theme_role resolves a role to its 0xRRGGBB. This is the ONLY way the rest of
+// the program turns a role into a colour, and the only way it turns a palette
+// into a colour for drawing purposes: `ui.palette_of` calls it, and no view
+// file touches a `Palette` field directly.
+theme_role :: proc(p: Palette, r: Role) -> u32 {
+	return theme_slot(p, theme_role_source(r))
+}
+
+// theme_role_key_name names the schema key a role resolves from — for failure
+// messages and for the self-documenting dump in `theme_cases`.
+theme_role_key_name :: proc(r: Role) -> string {
+	return palette_key_name(theme_role_source(r))
+}
+
+theme_role_names :: proc() -> [PALETTE_ROLES]string {
+	return [PALETTE_ROLES]string{
+		"background", "text", "secondary", "hl_bg", "hl_text", "border",
+		"footer_key", "footer_desc", "running", "stopped", "error",
+		"caret_bg", "caret_glyph",
+	}
+}
+
+theme_roles :: proc() -> [PALETTE_ROLES]Role {
+	return [PALETTE_ROLES]Role{
+		.background, .text, .secondary, .hl_bg, .hl_text, .border,
+		.footer_key, .footer_desc, .running, .stopped, .error,
+		.caret_bg, .caret_glyph,
+	}
+}
+
+theme_slots :: proc(p: Palette) -> [PALETTE_SLOTS]u32 {
+	out : [PALETTE_SLOTS]u32
+	for k in palette_keys() {
+		out[int(k)] = theme_slot(p, k)
+	}
+	return out
 }
 
 // theme_rgb splits a palette entry into 0..255 channels.
 //
-// Explicit shifts rather than a transmute: the caller must be able to see that a
-// 0xRRGGBB becomes (R,G,B) with no normalisation anywhere near it.
+// Explicit shifts rather than a transmute: the caller must be able to see that
+// a 0xRRGGBB becomes (R,G,B) with no normalisation anywhere near it.
 theme_rgb :: proc(hex: u32) -> (r, g, b: u8) {
 	r = u8((hex >> 16) & 0xff)
 	g = u8((hex >> 8) & 0xff)
@@ -212,22 +486,16 @@ theme_hex :: proc(hex: u32) -> string {
 }
 
 //-----------------------------------------------------------------------------
-// WCAG 2.1 luminance and contrast — IN THE PRODUCT, NOT JUST IN THE TESTS
+// WCAG 2.1 LUMINANCE AND CONTRAST
 //-----------------------------------------------------------------------------
 //
-// This maths used to live only inside tests/unit/theme_roles_uip2_test.odin, which
-// is fine while it is only a measuring stick. It is no longer only a measuring
-// stick: the highlight roles are now DERIVED with it (see `theme_hl_pair_kept`
-// below), so the number that ships would be produced by the product module and
-// judged by a second, hand-copied implementation in the test file. Two copies of
-// a formula are two chances to disagree, and the disagreement would show up as a
-// test that cannot see the bug it is meant to catch.
-//
-// So the one implementation lives here and the test file delegates to it.
+// Kept in the product module rather than duplicated in the test file because
+// the legibility verification is a claim about the shipped values, and a claim
+// measured with a second copy of the formula is a claim about the copy.
 
 // theme_srgb_to_linear inverts the sRGB transfer function. The linear segment
-// near black is part of the standard, not a shortcut: skipping it mis-ranks dark
-// colours, which is exactly the region this module's derivations work in.
+// near black is part of the standard, not a shortcut: skipping it mis-ranks
+// dark colours, which is the region these themes work in.
 theme_srgb_to_linear :: proc(c: u8) -> f64 {
 	s := f64(c) / 255.0
 	if s <= 0.03928 { return s / 12.92 }
@@ -243,9 +511,7 @@ theme_luma :: proc(hex: u32) -> f64 {
 	       0.0722 * theme_srgb_to_linear(b)
 }
 
-// theme_contrast_lumina is the ratio from two already-computed luminances. It
-// exists so a search that reuses a luminance a hundred times does not pay for
-// two `pow` calls per candidate per comparison.
+// theme_contrast_lumina is the ratio from two already-computed luminances.
 theme_contrast_lumina :: proc(a, b: f64) -> f64 {
 	la := a + 0.05
 	lb := b + 0.05
@@ -259,352 +525,62 @@ theme_contrast :: proc(a, b: u32) -> f64 {
 	return theme_contrast_lumina(theme_luma(a), theme_luma(b))
 }
 
+// THEME_LEGIBILITY_FLOOR is the floor the state-word-on-the-bar verification is
+// run against, and the floor the full role matrix is recorded against.
+//
+// It is 2.0 and not 4.5 deliberately: 4.5 is WCAG AA for body text, and no
+// terminal theme of ten is designed against it for a role like "muted footer
+// description". 2.0 is the level at which a coloured word is distinguishable
+// from the bar it sits on, which is what RCH-12 asks to preserve. It is the
+// SAME number the previous derived-pair machinery carried, so adopting it here
+// is not a softening to make a test pass: the ten vendored themes clear it for
+// the two pairs the requirement names (minimum 2.119, gruvbox-light's
+// `stopped` over `selection.background`), and where they fail elsewhere that
+// failure is recorded rather than patched.
+THEME_LEGIBILITY_FLOOR :: f64(2.0)
+
 //-----------------------------------------------------------------------------
-// THE DERIVED HIGHLIGHT PAIR — run_hl / stop_hl
-//-----------------------------------------------------------------------------
-//
-// WHY THESE TWO SLOTS ARE COMPUTED AND NOT AUTHORED
-//
-// The design directive this replaces: "treat the themes as an ARRAY of colours;
-// every element points at a number of that array; you don't figure out colours
-// individually for each theme". `run_hl` / `stop_hl` are the two slots where
-// per-theme authoring had already gone wrong: six of the ten shipped themes had
-// run_hl set to the SAME hex as sel_fg, so the selected row painted its state
-// word in the bar's own text colour and the running/stopped distinction
-// disappeared at exactly the moment the row was highlighted. A hand-authored
-// value can be wrong in ten places; a derivation is wrong or right once.
-//
-// So a theme authors `running`, `stopped`, `accent` and `sel_fg` — which it
-// already had to author anyway — and the highlight pair is derived from those by
-// ONE rule that is identical for every theme and for any theme added later.
-//
-// THE RULE IN ONE SENTENCE
-//
-//   Blend each state colour toward black or toward white by the SMALLEST amount
-//   that leaves the two words legible on the bar, clearly different from the
-//   bar's own text, clearly different from EACH OTHER, and still recognisably
-//   the colour they started as.
-//
-// WHY THE SEARCH IS JOINT AND NOT ONE ROLE AFTER THE OTHER
-//
-// The obvious shape is sequential: derive run_hl against {sel_fg}, then derive
-// stop_hl against {sel_fg, run_hl}. It does not work, and measurably so. The
-// least-mixing answer for run_hl on its own lands at the TOP of the range that
-// is still legible on the bar, which is the worst possible place to leave the
-// other role: the band left over for stop_hl shrinks to a width of about
-// 0.0007 in luminance, which the 1/64 blend grid cannot land in (it needed a
-// grid of roughly 400 to hit it by luck). gruvbox-dark is exactly that case:
-// sequential gives run_hl=0x626314 and then no stop_hl exists at all, and the
-// prescribed "maximise contrast on the bar" fallback returns 0x000000 — pure
-// black, zero spread, 1.28 against sel_fg, i.e. the unchosen-colour sentinel
-// painted into the UI.
-//
-// Minimising t_run + t_stop SUBJECT TO ALL CONSTRAINTS AT ONCE is what lets the
-// pair sit where both halves survive. It costs nothing: 129 candidates per role,
-// 16,641 pairs, arithmetic on cached luminances.
-//
-// WHY THE ON-BAR FLOOR FOR THESE TWO ROLES IS 2.0 AND NOT 2.5
-//
-// NOT a widened threshold — a geometric impossibility at 2.5, stated here so
-// the constant reads as reasoned.
-//
-// Fix the bar and the bar's text. A colour is allowed only if it clears
-// `floor_bar` against `accent` AND `floor_distinct` against `sel_fg`. Both
-// constraints are functions of luminance alone, so the allowed set is an
-// interval (at most two) of luminance, and the MOST contrast two allowed colours
-// can have with each other is fixed by that interval:
-//
-//     allowed:  L <= (Lbar + 0.05)/floor_bar - 0.05      (legible, dark side)
-//               L >= floor_distinct*(Lsel + 0.05) - 0.05 (distinct from sel_fg)
-//     =>  max mutual = [(Lbar + 0.05)/floor_bar] / [floor_distinct*(Lsel + 0.05)]
-//                   = contrast(accent, sel_fg) / (floor_bar * floor_distinct)
-//
-// Requiring that to reach floor_distinct itself needs
-//
-//     contrast(accent, sel_fg) >= floor_bar * floor_distinct^2 = 2.5 * 2.56 = 6.4
-//
-// catppuccin-frappe ships accent=0xca9ee6 and sel_fg=0x292c3c, which measure
-// contrast 6.280. The allowed interval is [0.07158, 0.14089] and the largest
-// ratio inside it is 1.569 — under the 1.6 the pair must hold. No two colours
-// of any hue can satisfy 2.5-on-bar + 1.6-vs-text + 1.6-mutual on that bar.
-// Not "we could not find any": the interval does not contain any. That is
-// why the derived pair carries its own floor; at 2.0 the same identity needs
-// contrast(accent, sel_fg) >= 5.12 and every shipped arrangement clears it.
-//
-// FLOOR_ON_BAR = 2.5 in the test file is UNCHANGED and stays authoritative for
-// every other slot (the caret block, the footer pair, the page). Only these two
-// derived roles move, and only as far as the geometry forces.
-//
-// WHAT EACH CONSTRAINT IS FOR
-//
-//   on_bar  >= THEME_HL_FLOOR_ON_BAR  the word can be read off the bar at all
-//   text    >= THEME_HL_FLOOR_TEXT     THE USER'S RULE: the state word is not
-//                                    one of the other highlighted characters
-//   mutual  >= THEME_HL_FLOOR_MUTUAL  a selected RUNNING row is not a selected
-//                                    STOPPED row (RCH-10 change 5)
-//   hue     >= THEME_HL_MIN_SPREAD +  the blend did not grind the state colour
-//           channel order intact    into "a dark colour"; green still reads green
-//
-// IF NOTHING IS FEASIBLE
-//
-// The function says so (`feasible = false`) and names the constraint that bound,
-// with the number it reached. The candidate is still chosen from the pool whose
-// hue survived, so the fallback can never hand back pure black, a zero-spread
-// grey, or anything that collides with the 0x000000 "nobody chose this" sentinel.
-// The test suite is then RED with the theme and the binding constraint named.
-// Silent degradation of the state colour is worse than a red suite: it is the
-// bug this whole change exists to remove.
+// THE SEAM: A FUTURE SCHEMA-FILE LOADER
 //-----------------------------------------------------------------------------
 
-// THEME_HL_MIX_STEPS is the blend grid: t = 0, 1/N, …, 1 toward black and the
-// same toward white, `t = 0` (the base unchanged) being a legal answer. 64 and
-// not 32 because the feasible band is thin — see the note above on why the
-// sequential version needed a grid of ~400 to land in it by accident; 64 is
-// where the joint search lands in it on purpose, and 129 candidates per role is
-// free.
-THEME_HL_MIX_STEPS :: 64
+// Theme_Schema_Loader_Stub is what the seam returns. A dedicated message so a
+// caller that forgot to implement the loader cannot mistake the result for a
+// parsed-but-empty palette.
+Theme_Schema_Loader_Stub :: "not implemented: the colour-schema file loader is a deliberate seam and has no parser here"
 
-// THEME_HL_CANDIDATES: one base candidate at t=0 plus two directions for every
-// other step. Sized by the grid so the search needs no allocator.
-THEME_HL_CANDIDATES :: THEME_HL_MIX_STEPS*2 + 1
-
-// THEME_HL_MAX_OTHERS bounds the "must stay away from these colours" list. The
-// product passes one (sel_fg); the tests pass up to three.
-THEME_HL_MAX_OTHERS :: 3
-
-// The derived pair's floors. `theme_roles_uip2_test` asserts these exact
-// numbers so a silent edit here cannot out-argue the proof above.
-THEME_HL_FLOOR_ON_BAR :: f64(2.0)
-THEME_HL_FLOOR_TEXT   :: f64(1.6)
-THEME_HL_FLOOR_MUTUAL :: f64(1.6)
-THEME_HL_MIN_SPREAD   :: 8
-
-// theme_hl_mix_channel is the per-channel blend: round(x*(1-t) + y*t).
-theme_hl_mix_channel :: proc(x, y: u32, t: f64) -> u32 {
-	return u32(math.round(f64(x) * (1.0 - t) + f64(y) * t))
-}
-
-// theme_hl_mix blends two colours, one step at a time. `t = 0` returns the base
-// unchanged, which is a legal answer to the derivation and is kept that way.
-theme_hl_mix :: proc(c, e: u32, t: f64) -> u32 {
-	r := theme_hl_mix_channel((c >> 16) & 0xff, (e >> 16) & 0xff, t)
-	g := theme_hl_mix_channel((c >> 8) & 0xff, (e >> 8) & 0xff, t)
-	b := theme_hl_mix_channel(c & 0xff, e & 0xff, t)
-	return (r << 16) | (g << 8) | b
-}
-
-// theme_hl_channel reads channel i (0=R, 1=G, 2=B) of a palette entry.
-theme_hl_channel :: proc(hex: u32, i: int) -> i32 {
-	if i == 0 { return i32((hex >> 16) & 0xff) }
-	if i == 1 { return i32((hex >> 8) & 0xff) }
-	return i32(hex & 0xff)
-}
-
-// theme_hl_spread is max-channel minus min-channel: the crude but honest "is
-// there any colour left in this" measure. A blend toward black or white scales
-// the spread by (1-t), so the spread is a direct read on how much of the base
-// colour the mix kept.
-theme_hl_spread :: proc(hex: u32) -> i32 {
-	mx := theme_hl_channel(hex, 0)
-	mn := theme_hl_channel(hex, 0)
-	for i in 1..=2 {
-		v := theme_hl_channel(hex, i)
-		if v > mx { mx = v }
-		if v < mn { mn = v }
-	}
-	return mx - mn
-}
-
-// theme_hl_hue_kept is the "still recognisably its own colour" test:
+// theme_from_alacritty_schema is the SINGLE drop-in point for reading an
+// upstream colour file's text into a `Palette`.
 //
-//   * every pairwise channel ORDER the base had is still there, and every pair
-//     the base drew level is still level — a blend toward black or white cannot
-//     flip an order, but rounding can collapse a near-tie, and a collapsed tie
-//     is a lost piece of the hue, so it is rejected rather than excused;
-//   * the spread has not been mixed away below `min_spread`.
-theme_hl_hue_kept :: proc(cand, base: u32, min_spread: i32) -> bool {
-	for i in 0..=2 {
-		for j := i + 1; j <= 2; j += 1 {
-			cb := theme_hl_channel(base, i) - theme_hl_channel(base, j)
-			cc := theme_hl_channel(cand, i) - theme_hl_channel(cand, j)
-			if cb == 0 {
-				if cc != 0 { return false }
-			} else if cc * cb <= 0 {
-				return false
-			}
-		}
-	}
-	return theme_hl_spread(cand) >= min_spread
-}
-
-// Theme_Hl_Cand is one blend of one base colour with every number the pair
-// search compares cached, so the inner loop is arithmetic only.
-Theme_Hl_Cand :: struct {
-	hex      : u32,
-	t        : f64,
-	lum      : f64,
-	sprd     : i32,
-	on_bar   : f64, // contrast against the highlight bar
-	text_min : f64, // worst contrast against the colours it must stay clear of
-	hue_ok   : bool,
-	self_ok  : bool, // on_bar, text_min and hue all clear their floors
-}
-
-// Theme_Hl_Pair is the answer: the two derived roles, plus whether they were
-// actually derivable under the floors and, if they were not, what stopped us.
-Theme_Hl_Pair :: struct {
-	run_hl   : u32,
-	stop_hl  : u32,
-	feasible : bool,
-	binding  : string, // "" when feasible
-}
-
-// theme_hl_fill_candidates builds one role's blend ladder: t = 0 (the base
-// itself) then both directions for every step, with the contrasts, the spread
-// and the floor verdicts computed once per candidate. `others` is the set of
-// colours this role must stay distinguishable from — the bar's own text, in the
-// product. No allocator: the ladder is sized by THEME_HL_CANDIDATES.
-theme_hl_fill_candidates :: proc(dst: ^[THEME_HL_CANDIDATES]Theme_Hl_Cand,
-                               base, bar: u32, others: []u32,
-                               floor_bar, floor_distinct: f64,
-                               min_spread: i32) -> int {
-	bar_lum := theme_luma(bar)
-	oth_lum : [THEME_HL_MAX_OTHERS]f64
-	for o, k in others { oth_lum[k] = theme_luma(o) }
-
-	n := 0
-	for i in 0..=THEME_HL_MIX_STEPS {
-		t := f64(i) / f64(THEME_HL_MIX_STEPS)
-		for d in 0..=1 {
-			if i == 0 && d == 1 { continue } // t =0 is the base; do it once
-			e: u32 = 0x000000
-			if d == 1 { e = 0xffffff }
-			c := &dst[n]
-			c.hex = theme_hl_mix(base, e, t)
-			c.t = t
-			c.lum = theme_luma(c.hex)
-			c.sprd = theme_hl_spread(c.hex)
-			c.on_bar = theme_contrast_lumina(c.lum, bar_lum)
-			c.text_min = f64(1.0e18)
-			for k in 0..<len(others) {
-				v := theme_contrast_lumina(c.lum, oth_lum[k])
-				if v < c.text_min { c.text_min = v }
-			}
-			c.hue_ok = theme_hl_hue_kept(c.hex, base, min_spread)
-			c.self_ok = c.on_bar >= floor_bar && c.hue_ok
-			if len(others) > 0 { c.self_ok = c.self_ok && c.text_min >= floor_distinct }
-			n += 1
-		}
-	}
-	return n
-}
-
-// theme_hl_pair_kept is THE derivation. The block comment above the constants
-// states what it guarantees and why the search is joint.
-theme_hl_pair_kept :: proc(run_base, stop_base, bar: u32, others: []u32,
-                          floor_bar, floor_distinct, floor_mutual: f64,
-                          min_spread: i32) -> Theme_Hl_Pair {
-	assert(len(others) <= THEME_HL_MAX_OTHERS,
-	       "theme_hl_pair_kept: more `others` than THEME_HL_MAX_OTHERS")
-
-	run_c : [THEME_HL_CANDIDATES]Theme_Hl_Cand
-	stop_c : [THEME_HL_CANDIDATES]Theme_Hl_Cand
-	n_run := theme_hl_fill_candidates(&run_c, run_base, bar, others,
-	                                 floor_bar, floor_distinct, min_spread)
-	n_stop := theme_hl_fill_candidates(&stop_c, stop_base, bar, others,
-	                                  floor_bar, floor_distinct, min_spread)
-
-	// ── pass 1: least TOTAL mixing among the pairs that clear everything ──
-	// Minimising the sum is what makes this joint: a role is allowed to mix MORE
-	// than it would have on its own if that is what leaves the other role a
-	// place to sit. `peak` breaks ties toward the pair that does not hammer one
-	// role while leaving the other untouched.
-	best_t := f64(1.0e18)
-	best_peak := f64(1.0e18)
-	found := false
-	ri, si := 0, 0
-	for a in 0..<n_run {
-		if !run_c[a].self_ok { continue }
-		for b in 0..<n_stop {
-			if !stop_c[b].self_ok { continue }
-			if theme_contrast_lumina(run_c[a].lum, stop_c[b].lum) < floor_mutual { continue }
-			sum := run_c[a].t + stop_c[b].t
-			peak := run_c[a].t
-			if stop_c[b].t > peak { peak = stop_c[b].t }
-			if sum < best_t - 1.0e-9 ||
-			   (math.abs(sum - best_t) < 1.0e-9 && peak < best_peak) {
-				found = true
-				best_t, best_peak, ri, si = sum, peak, a, b
-			}
-		}
-	}
-	if found {
-		return Theme_Hl_Pair{run_c[ri].hex, stop_c[si].hex, true, ""}
-	}
-
-	// ── pass 2: no pair clears every floor — degrade LOUDLY ──────────────
-	// Hue-kept candidates only, in BOTH roles, so the fallback can never hand
-	// back pure black, a zero-spread grey, or a value that reads as the
-	// 0x000000 "nobody chose this" sentinel. Of those, take the pair whose
-	// WORST normalised margin is the largest — as close to every floor as the
-	// geometry allows — and name the one that bound, with the number reached.
-	best_min := f64(-1.0)
-	best_label := ""
-	for a in 0..<n_run {
-		if !run_c[a].hue_ok { continue }
-		for b in 0..<n_stop {
-			if !stop_c[b].hue_ok { continue }
-			mu := theme_contrast_lumina(run_c[a].lum, stop_c[b].lum)
-			m := run_c[a].on_bar / floor_bar
-			lab := "on_bar(run)"
-			vb := stop_c[b].on_bar / floor_bar
-			if vb < m { m, lab = vb, "on_bar(stop)" }
-			if len(others) > 0 {
-				vt := run_c[a].text_min / floor_distinct
-				if vt < m { m, lab = vt, "vs_sel_fg(run)" }
-				vt = stop_c[b].text_min / floor_distinct
-				if vt < m { m, lab = vt, "vs_sel_fg(stop)" }
-			}
-			vm := mu / floor_mutual
-			if vm < m { m, lab = vm, "mutual" }
-			sum := run_c[a].t + stop_c[b].t
-			if m > best_min + 1.0e-9 || (math.abs(m - best_min) < 1.0e-9 && sum < best_t) {
-				best_min, best_t, best_label, ri, si = m, sum, lab, a, b
-			}
-		}
-	}
-	if best_min < 0 {
-		// Not one candidate kept its hue in at least one role: that base colour
-		// is too flat to survive any legible position on this bar. Return the
-		// least hue-destroyed candidate of each role and say so.
-		for a in 0..<n_run {
-			if run_c[a].sprd > run_c[ri].sprd { ri = a }
-		}
-		for b in 0..<n_stop {
-			if stop_c[b].sprd > stop_c[si].sprd { si = b }
-		}
-		best_label = fmt.tprintf("hue: no candidate of either role keeps spread >= {}", min_spread)
-	}
-	return Theme_Hl_Pair{run_c[ri].hex, stop_c[si].hex, false,
-	                    fmt.tprintf("{} bound at {:.3f}x its floor", best_label, best_min)}
-}
-
-// theme_hl_pair_of is the product's own view of the rule: the pair for a
-// palette, with the shipped floors. `ui.palette_of` calls this and so does the
-// test that proves the roles are derived rather than authored — one call, one
-// set of floors, no chance for the two to drift.
-theme_hl_pair_of :: proc(p: Palette) -> Theme_Hl_Pair {
-	return theme_hl_pair_kept(p.running, p.stopped, p.accent, []u32{p.sel_fg},
-	                          THEME_HL_FLOOR_ON_BAR, THEME_HL_FLOOR_TEXT,
-	                          THEME_HL_FLOOR_MUTUAL, THEME_HL_MIN_SPREAD)
+// IT IS UNIMPLEMENTED ON PURPOSE. The product reads JSON configuration only
+// (see config.odin and `theme_hygiene_test.odin`), and this repo's rule is
+// that the upstream schema is compiled in, not parsed at run time. The proc
+// exists so that the day a user-supplied file becomes a requirement, there is
+// exactly one place it lands:
+//
+//   * it takes the file's text and returns (Palette, error_message);
+//   * it must produce the SAME 22-key struct, so no caller changes;
+//   * `THEMES` becomes a runtime list built by calling it, and `theme_at` /
+//     `theme_index_of` / the role table stay untouched — a role resolves from a
+//     schema key, and the schema is the same whether it was compiled or read;
+//   * it must NOT gain contrast adjustment, blending or slot synthesis. A file
+//     that is missing a key is a parse error naming the key, not an invitation
+//     to fall back to a neighbour (that fallback existed here as `theme_slot_or`
+//     and was deleted with the rest of the manufactured-colour machinery).
+//
+// `Theme_Schema_Loader_Stub` is returned for every input, including empty and
+// including syntactically perfect input, so the seam can never be mistaken for
+// a working loader that "just needs a nudge".
+theme_from_alacritty_schema :: proc(text: string) -> (Palette, string) {
+	_ = text
+	return Palette{}, Theme_Schema_Loader_Stub
 }
 
 //-----------------------------------------------------------------------------
 // Theme identity
 //-----------------------------------------------------------------------------
 
-// Theme is one selectable entry: its canonical name, the names that also resolve
-// to it, and its colours.
+// Theme is one selectable entry: its canonical name, the names that also
+// resolve to it, and its colour set.
 Theme :: struct {
 	name    : string,   // canonical, kebab-case — what the config stores
 	aliases : []string, // tolerant spellings for CONFIG resolution only
@@ -632,284 +608,209 @@ resolve_kind_label :: proc(k: Resolve_Kind) -> string {
 }
 
 //-----------------------------------------------------------------------------
-// THE SET
+// THE SET — ten themes, each one its vendored file's 22 values
 //
-// Ten themes. The plan defers the size of the set ("extend later"), so the bar
-// used here was: every value present in scout-nix-packaging.md §f with a cited
-// upstream file, a coherent 13-slot mapping, and both required names.
-//
-// You will not find `run_hl` or `stop_hl` in any of the literals below. That is
-// the point: those two are derived (see `theme_hl_pair_kept`), so a theme
-// cannot get them wrong and a new theme does not have to choose them. Every
-// other slot is authored here from its cited upstream colour.
+// Transcribed from `.pi/plans/theme-sources/<file>` with no adjustment of any
+// kind. `theme_values_match_the_vendored_schema` re-reads those files and
+// compares all 220 values; `theme_sources_are_byte_pinned` hashes them. A
+// transcription error here is a red test naming the key and the file, not a
+// subtly-wrong screen.
 //
 // Aliases are deliberately NARROW: they exist so a hand-edited config written
 // with the flavour word ("latte") rather than the canonical id still resolves.
-// The picker's filter is a substring match over the canonical names, so
-// "latte", "catppuccin" and "c-latte" all narrow the list without help from
-// this field — see the note on theme_matches.
 //-----------------------------------------------------------------------------
 
 THEMES : [10]Theme = {
 	// ── gruvbox-dark: the default (D4) ─────────────────────────────────
-	// Source: gruvbox_256palette.sh. accent = bright yellow (gruvbox's own
-	// highlight colour); sel_fg is dark0_hard so the bar stays readable.
+	// vendored: gruvbox-dark.toml  sha256 321c9813559a9a6eb99a6ee19829f19a9b9b874ac3cb849d5ddf9826ff7aeb0f
 	{
 		name    = "gruvbox-dark",
 		aliases = []string{"gruvbox", "gruvbox_dark"},
 		pal = Palette{
-			bg        = 0x282828, // dark0
-			fg        = 0xebdbb2, // fg1
-			dim       = 0xd5c4a1, // fg2
-			border    = 0x504945, // dark2
-			header_fg = 0xebdbb2, // fg1
-			accent    = 0xd79921, // bright yellow
-			sel_fg    = 0x1d2021, // dark0_hard
-			caret     = 0xfe8019, // orange
-			float_bg  = 0x32302f, // dark0_medium
-			float_fg  = 0xebdbb2, // fg1
-			err_fg    = 0xfb4934, // red
-			running   = 0xb8bb26, // green
-			stopped   = 0x928374, // gray
-			key_fg    = 0xfabd2f, // bright yellow — the footer hunt-token
-			desc_fg   = 0xa89984, // fg4 — muted against the key
-			caret_bg  = 0xfe8019, // orange — == caret, the block the glyph sits in
-			caret_fg  = 0x1d2021, // dark0_hard — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0xebdbb2, background = 0x282828},
+			cursor    = Alacritty_Cursor{cursor = 0xebdbb2, text = 0x282828},
+			selection = Alacritty_Selection{text = 0x282828, background = 0xebdbb2},
+			normal    = Alacritty_Ansi{black = 0x282828, red = 0xcc241d, green = 0x98971a,
+			                           yellow = 0xd79921, blue = 0x458588, magenta = 0xb16286,
+			                           cyan = 0x689d6a, white = 0xa89984},
+			bright    = Alacritty_Ansi{black = 0x928374, red = 0xfb4934, green = 0xb8bb26,
+			                           yellow = 0xfabd2f, blue = 0x83a598, magenta = 0xd3869b,
+			                           cyan = 0x8ec07c, white = 0xebdbb2},
 		},
 	},
 
 	// ── gruvbox-light ──────────────────────────────────────────────────
+	// vendored: gruvbox-light.toml  sha256 4b3f4dccaf5496bbdff7908d928dc11232df4e4e9b288e42d571f3d1b586c828
 	{
 		name    = "gruvbox-light",
 		aliases = []string{"gruvbox_light"},
 		pal = Palette{
-			bg        = 0xfbf1c7, // light0
-			fg        = 0x3c3836, // dark1
-			dim       = 0x504945, // dark2
-			border    = 0xd5c4a1, // light3
-			header_fg = 0x3c3836, // dark1
-			accent    = 0xb57614, // dark yellow
-			sel_fg    = 0xfbf1c7, // light0
-			caret     = 0xaf3a03, // dark orange
-			float_bg  = 0xf9f5d7, // light0_h
-			float_fg  = 0x3c3836, // dark1
-			err_fg    = 0x9d0006, // neutral red
-			running   = 0x79740e, // neutral green
-			stopped   = 0x928374, // mid gray (documented neutral)
-			key_fg    = 0x076678, // faded blue — reads as the token, not the prose
-			desc_fg   = 0x928374, // mid gray — muted against the key
-			caret_bg  = 0xaf3a03, // dark orange — == caret
-			caret_fg  = 0xfbf1c7, // light0 — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0x3c3836, background = 0xfbf1c7},
+			cursor    = Alacritty_Cursor{cursor = 0x3c3836, text = 0xfbf1c7},
+			selection = Alacritty_Selection{text = 0xfbf1c7, background = 0x3c3836},
+			normal    = Alacritty_Ansi{black = 0xfbf1c7, red = 0xcc241d, green = 0x98971a,
+			                           yellow = 0xd79921, blue = 0x458588, magenta = 0xb16286,
+			                           cyan = 0x689d6a, white = 0x7c6f64},
+			bright    = Alacritty_Ansi{black = 0x928374, red = 0x9d0006, green = 0x79740e,
+			                           yellow = 0xb57614, blue = 0x076678, magenta = 0x8f3f71,
+			                           cyan = 0x427b58, white = 0x3c3836},
 		},
 	},
 
 	// ── catppuccin-latte: REQUIRED, and explicitly NOT the default ─────
-	// Source: catppuccin/palette palette.json v1.8.0. The canonical spelling is
-	// `catppuccin-latte` (the user wrote "catputin"); the misspelling is an
-	// alias so the config forgives but the product name stays correct.
+	// vendored: catppuccin-latte.toml  sha256 3e23ff7d55a606811dcea37fd87991c7f6c28ba7e53cd8be4107f09e99babded
+	// The canonical spelling is `catppuccin-latte` (the user wrote "catputin");
+	// the misspelling is an alias so the config forgives but the product name
+	// stays correct.
 	{
 		name    = "catppuccin-latte",
 		aliases = []string{"latte", "catppuccin", "catpuccin-latte", "catppuccin_latte"},
 		pal = Palette{
-			bg        = 0xeff1f5, // base
-			fg        = 0x4c4f69, // text
-			dim       = 0x6c6f85, // subtext0
-			border    = 0xbcc0cc, // surface1
-			header_fg = 0x4c4f69, // text
-			accent    = 0x8839ef, // mauve
-			sel_fg    = 0xeff1f5, // base
-			caret     = 0xfe640b, // peach
-			float_bg  = 0xe6e9ef, // mantle
-			float_fg  = 0x4c4f69, // text
-			err_fg    = 0xd20f39, // red
-			running   = 0x40a02b, // green
-			stopped   = 0x9ca0b0, // overlay0
-			// NOTE: `key_fg` repeats the accent hex. That is a deliberate choice,
-			// not a laziness — latte has no second saturated colour that clears the
-			// 4.5:1 floor for a text token on `base`, and mauve is the theme's own
-			// "look here" colour. The roles stay distinct from the bar by context
-			// (footer vs row) and the contrast is proven by the test either way.
-			key_fg    = 0x8839ef, // mauve
-			desc_fg   = 0x8c8fa1, // overlay1 — muted against the key
-			// NOTE: the caret block is `blue`, not latte's own peach `caret` slot.
-			// A peach block with base knocked out measures 2.6:1, under the 3.0:1
-			// floor this palette enforces for a caret glyph; no documented latte
-			// colour pairs with peach above it. Blue gives 4.3:1. Deviation flagged.
-			caret_bg  = 0x1e66f5, // blue
-			caret_fg  = 0xeff1f5, // base
+			primary   = Alacritty_Primary{foreground = 0x4c4f69, background = 0xeff1f5},
+			cursor    = Alacritty_Cursor{cursor = 0xdc8a78, text = 0xeff1f5},
+			selection = Alacritty_Selection{text = 0x4c4f69, background = 0xd8dae1},
+			normal    = Alacritty_Ansi{black = 0x5c5f77, red = 0xd20f39, green = 0x40a02b,
+			                           yellow = 0xdf8e1d, blue = 0x1e66f5, magenta = 0xea76cb,
+			                           cyan = 0x179299, white = 0xacb0be},
+			bright    = Alacritty_Ansi{black = 0x6c6f85, red = 0xde293e, green = 0x49af3d,
+			                           yellow = 0xeea02d, blue = 0x456eff, magenta = 0xfe85d8,
+			                           cyan = 0x2d9fa8, white = 0xbcc0cc},
 		},
 	},
 
+	// vendored: catppuccin-frappe.toml  sha256 6a2bd3bb2aedb7764ee302716e9ecde375a1a7efcd8578cd5061fe398011df2a
 	{
 		name    = "catppuccin-frappe",
 		aliases = []string{"frappe"},
 		pal = Palette{
-			bg        = 0x303446, // base
-			fg        = 0xc6d0f5, // text
-			dim       = 0xa5adce, // subtext0
-			border    = 0x51576d, // surface1
-			header_fg = 0xc6d0f5, // text
-			accent    = 0xca9ee6, // mauve
-			sel_fg    = 0x292c3c, // mantle
-			caret     = 0xef9f76, // peach
-			float_bg  = 0x292c3c, // mantle
-			float_fg  = 0xc6d0f5, // text
-			err_fg    = 0xe78284, // red
-			running   = 0xa6d189, // green
-			stopped   = 0x737994, // overlay0
-			key_fg    = 0xe5c890, // yellow — the footer hunt-token
-			desc_fg   = 0x838ba7, // overlay1 — muted against the key
-			caret_bg  = 0xef9f76, // peach — == caret
-			caret_fg  = 0x232634, // crust — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0xc6d0f5, background = 0x303446},
+			cursor    = Alacritty_Cursor{cursor = 0xf2d5cf, text = 0x232634},
+			selection = Alacritty_Selection{text = 0xc6d0f5, background = 0x44495d},
+			normal    = Alacritty_Ansi{black = 0x51576d, red = 0xe78284, green = 0xa6d189,
+			                           yellow = 0xe5c890, blue = 0x8caaee, magenta = 0xf4b8e4,
+			                           cyan = 0x81c8be, white = 0xa5adce},
+			bright    = Alacritty_Ansi{black = 0x626880, red = 0xe67172, green = 0x8ec772,
+			                           yellow = 0xd9ba73, blue = 0x7b9ef0, magenta = 0xf2a4db,
+			                           cyan = 0x5abfb5, white = 0xb5bfe2},
 		},
 	},
 
+	// vendored: catppuccin-macchiato.toml  sha256 4340bb9b6b3ad823d27d4e66052b00a06e51876f12bcdd8e668a569bd7c2055f
 	{
 		name    = "catppuccin-macchiato",
 		aliases = []string{"macchiato"},
 		pal = Palette{
-			bg        = 0x24273a, // base
-			fg        = 0xcad3f5, // text
-			dim       = 0xa5adcb, // subtext0
-			border    = 0x494d64, // surface1
-			header_fg = 0xcad3f5, // text
-			accent    = 0xc6a0f6, // mauve
-			sel_fg    = 0x1e2030, // mantle
-			caret     = 0xf5a97f, // peach
-			float_bg  = 0x1e2030, // mantle
-			float_fg  = 0xcad3f5, // text
-			err_fg    = 0xed8796, // red
-			running   = 0xa6da95, // green
-			stopped   = 0x6e738d, // overlay0
-			key_fg    = 0xeed49f, // yellow — the footer hunt-token
-			desc_fg   = 0x8087a2, // overlay1 — muted against the key
-			caret_bg  = 0xf5a97f, // peach — == caret
-			caret_fg  = 0x181926, // crust — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0xcad3f5, background = 0x24273a},
+			cursor    = Alacritty_Cursor{cursor = 0xf4dbd6, text = 0x181926},
+			selection = Alacritty_Selection{text = 0xcad3f5, background = 0x3a3e53},
+			normal    = Alacritty_Ansi{black = 0x494d64, red = 0xed8796, green = 0xa6da95,
+			                           yellow = 0xeed49f, blue = 0x8aadf4, magenta = 0xf5bde6,
+			                           cyan = 0x8bd5ca, white = 0xa5adcb},
+			bright    = Alacritty_Ansi{black = 0x5b6078, red = 0xec7486, green = 0x8ccf7f,
+			                           yellow = 0xe1c682, blue = 0x78a1f6, magenta = 0xf2a9dd,
+			                           cyan = 0x63cbc0, white = 0xb8c0e0},
 		},
 	},
 
+	// vendored: catppuccin-mocha.toml  sha256 76829d7b773dfa66f282c2963d297089db89e45c442dd71b33f6d45cf4e8a43b
 	{
 		name    = "catppuccin-mocha",
 		aliases = []string{"mocha"},
 		pal = Palette{
-			bg        = 0x1e1e2e, // base
-			fg        = 0xcdd6f4, // text
-			dim       = 0xa6adc8, // subtext0
-			border    = 0x45475a, // surface1
-			header_fg = 0xcdd6f4, // text
-			accent    = 0xcba6f7, // mauve
-			sel_fg    = 0x181825, // mantle
-			caret     = 0xfab387, // peach
-			float_bg  = 0x181825, // mantle
-			float_fg  = 0xcdd6f4, // text
-			err_fg    = 0xf38ba8, // red
-			running   = 0xa6e3a1, // green
-			stopped   = 0x6c7086, // overlay0
-			key_fg    = 0xf9e2af, // yellow — the footer hunt-token
-			desc_fg   = 0x7f849c, // overlay1 — muted against the key
-			caret_bg  = 0xfab387, // peach — == caret
-			caret_fg  = 0x11111b, // crust — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0xcdd6f4, background = 0x1e1e2e},
+			cursor    = Alacritty_Cursor{cursor = 0xf5e0dc, text = 0x11111b},
+			selection = Alacritty_Selection{text = 0xcdd6f4, background = 0x353748},
+			normal    = Alacritty_Ansi{black = 0x45475a, red = 0xf38ba8, green = 0xa6e3a1,
+			                           yellow = 0xf9e2af, blue = 0x89b4fa, magenta = 0xf5c2e7,
+			                           cyan = 0x94e2d5, white = 0xa6adc8},
+			bright    = Alacritty_Ansi{black = 0x585b70, red = 0xf37799, green = 0x89d88b,
+			                           yellow = 0xebd391, blue = 0x74a8fc, magenta = 0xf2aede,
+			                           cyan = 0x6bd7ca, white = 0xbac2de},
 		},
 	},
 
 	// ── tokyonight-night ───────────────────────────────────────────────
+	// vendored: tokyo-night-default.toml  sha256 4618d0efa28c768b86973fcf6f0a94e92f2bb14fae46cac3992b0cfe54821092
+	// The repo's canonical name is `tokyonight-night`; the file is the
+	// "default" flavour of the upstream tokyo-night slug.
 	{
 		name    = "tokyonight-night",
 		aliases = []string{"tokyonight", "tokyo-night", "tokyo_night"},
 		pal = Palette{
-			bg        = 0x1a1b26, // bg
-			fg        = 0xc0caf5, // fg
-			dim       = 0xa9b1d6, // fg
-			border    = 0x3b4261, // fg_gutter
-			header_fg = 0xc0caf5, // fg
-			accent    = 0x7aa2f7, // blue
-			sel_fg    = 0x1a1b26, // bg
-			caret     = 0xff9e64, // orange
-			float_bg  = 0x16161e, // bg_dark
-			float_fg  = 0xc0caf5, // fg
-			err_fg    = 0xf7768e, // red
-			running   = 0x9ece6a, // green
-			stopped   = 0x565f89, // comment
-			key_fg    = 0xe0af68, // yellow — the footer hunt-token
-			desc_fg   = 0x565f89, // comment — muted against the key
-			caret_bg  = 0xff9e64, // orange — == caret
-			caret_fg  = 0x0c0e14, // bg_crust — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0xc0caf5, background = 0x1a1b26},
+			cursor    = Alacritty_Cursor{cursor = 0xc0caf5, text = 0x1a1b26},
+			selection = Alacritty_Selection{text = 0xc0caf5, background = 0x283457},
+			normal    = Alacritty_Ansi{black = 0x15161e, red = 0xf7768e, green = 0x9ece6a,
+			                           yellow = 0xe0af68, blue = 0x7aa2f7, magenta = 0xbb9af7,
+			                           cyan = 0x7dcfff, white = 0xa9b1d6},
+			bright    = Alacritty_Ansi{black = 0x414868, red = 0xf7768e, green = 0x9ece6a,
+			                           yellow = 0xe0af68, blue = 0x7aa2f7, magenta = 0xbb9af7,
+			                           cyan = 0x7dcfff, white = 0xc0caf5},
 		},
 	},
 
-	// ── nord: nord0..nord15 maps 1:1 onto the slots ───────────────────
+	// ── nord ───────────────────────────────────────────────────────────
+	// vendored: nord-default.toml  sha256 f1aeb81518df1413f1e265c8e207cad214bf09a3a4b379b73d4dbd91b7329431
+	// NOTE vs the old hand-authored palette: this file's `primary.foreground`
+	// is #d8dee9 (nord4). The palette this repo shipped before used
+	// #e5e9f0 (nord5) for `fg`. The mirror uses the file. `normal.white` is
+	// #e5e9f0 in the file, which is where the old value now lives.
 	{
 		name    = "nord",
 		aliases = []string{"nord-theme", "nordtheme"},
 		pal = Palette{
-			bg        = 0x2e3440, // nord0
-			fg        = 0xe5e9f0, // nord5
-			dim       = 0xd8dee9, // nord4
-			border    = 0x4c566a, // nord3
-			header_fg = 0xeceff4, // nord6
-			accent    = 0x88c0d0, // nord8 (frost)
-			sel_fg    = 0x2e3440, // nord0
-			caret     = 0xd08770, // nord12
-			float_bg  = 0x3b4252, // nord1
-			float_fg  = 0xe5e9f0, // nord5
-			err_fg    = 0xbf616a, // nord11
-			running   = 0xa3be8c, // nord14
-			stopped   = 0x4c566a, // nord3
-			key_fg    = 0xebcb8b, // nord13 — the footer hunt-token
-			desc_fg   = 0x5e81ac, // nord10 — muted against the key
-			caret_bg  = 0xd08770, // nord12 — == caret
-			caret_fg  = 0x2e3440, // nord0 — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0xd8dee9, background = 0x2e3440},
+			cursor    = Alacritty_Cursor{cursor = 0xd8dee9, text = 0x2e3440},
+			selection = Alacritty_Selection{text = 0xd8dee9, background = 0x3f4758},
+			normal    = Alacritty_Ansi{black = 0x3b4252, red = 0xbf616a, green = 0xa3be8c,
+			                           yellow = 0xebcb8b, blue = 0x81a1c1, magenta = 0xb48ead,
+			                           cyan = 0x88c0d0, white = 0xe5e9f0},
+			bright    = Alacritty_Ansi{black = 0x4c566a, red = 0xbf616a, green = 0xa3be8c,
+			                           yellow = 0xebcb8b, blue = 0x81a1c1, magenta = 0xb48ead,
+			                           cyan = 0x8fbcbb, white = 0xeceff4},
 		},
 	},
 
 	// ── solarized ──────────────────────────────────────────────────────
-	// Dark and light share the accent set exactly; only the monotone pairs swap
-	// (base03<->base3, base02<->base2, base01<->base1, base00<->base0).
+	// vendored: solarized-dark.toml  sha256 c892854c5437e8b39161092f452fb06d6b86064fff2c2b9ed147ac5f725cd346
+	// NOTE: this file's `bright.black` is #002b36, which is ALSO
+	// `primary.background`. Under the role table that makes secondary text the
+	// page colour on this theme (contrast 1.000 — invisible). Reported as a
+	// finding; the value is NOT changed.
 	{
 		name    = "solarized-dark",
 		aliases = []string{"solarized", "solarized_dark"},
 		pal = Palette{
-			bg        = 0x002b36, // base03
-			fg        = 0x839496, // base0
-			dim       = 0x586e75, // base01
-			border    = 0x073642, // base02
-			header_fg = 0x93a1a1, // base1
-			accent    = 0x268bd2, // blue
-			sel_fg    = 0x002b36, // base03
-			caret     = 0xcb4b16, // orange
-			float_bg  = 0x073642, // base02
-			float_fg  = 0x839496, // base0
-			err_fg    = 0xdc322f, // red
-			running   = 0x859900, // green
-			stopped   = 0x586e75, // base01
-			key_fg    = 0xb58900, // yellow — the footer hunt-token
-			desc_fg   = 0x586e75, // base01 — muted against the key
-			caret_bg  = 0xcb4b16, // orange — == caret
-			caret_fg  = 0x002b36, // base03 — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0x839496, background = 0x002b36},
+			cursor    = Alacritty_Cursor{cursor = 0x839496, text = 0x002b36},
+			selection = Alacritty_Selection{text = 0x93a1a1, background = 0x073642},
+			normal    = Alacritty_Ansi{black = 0x073642, red = 0xdc322f, green = 0x859900,
+			                           yellow = 0xb58900, blue = 0x268bd2, magenta = 0xd33682,
+			                           cyan = 0x2aa198, white = 0xeee8d5},
+			bright    = Alacritty_Ansi{black = 0x002b36, red = 0xcb4b16, green = 0x586e75,
+			                           yellow = 0x657b83, blue = 0x839496, magenta = 0x6c71c4,
+			                           cyan = 0x93a1a1, white = 0xfdf6e3},
 		},
 	},
 
+	// vendored: solarized-light.toml  sha256 1230f8ec75ddb464d9edd026c08e5f9876cf1df5bf1266fb5065cec2869a2cf4
+	// NOTE: this file's `bright.white` is #fdf6e3, which is ALSO
+	// `primary.background`. Under the role table that makes the
+	// between-children rules invisible on this theme (1.000). Reported as a
+	// finding; the value is NOT changed.
 	{
 		name    = "solarized-light",
 		aliases = []string{"solarized_light"},
 		pal = Palette{
-			bg        = 0xfdf6e3, // base3
-			fg        = 0x657b83, // base00
-			dim       = 0x93a1a1, // base1
-			border    = 0xeee8d5, // base2
-			header_fg = 0x586e75, // base01
-			accent    = 0x268bd2, // blue (identical in both modes)
-			sel_fg    = 0xfdf6e3, // base3
-			caret     = 0xcb4b16, // orange
-			float_bg  = 0xeee8d5, // base2
-			float_fg  = 0x657b83, // base00
-			err_fg    = 0xdc322f, // red
-			running   = 0x859900, // green
-			stopped   = 0x93a1a1, // base1
-			key_fg    = 0x586e75, // base01 — the footer hunt-token on cream
-			desc_fg   = 0x839496, // base0 — muted against the key
-			caret_bg  = 0xcb4b16, // orange — == caret
-			caret_fg  = 0xfdf6e3, // base3 — the glyph knocked out of the block
+			primary   = Alacritty_Primary{foreground = 0x657b83, background = 0xfdf6e3},
+			cursor    = Alacritty_Cursor{cursor = 0x657b83, text = 0xfdf6e3},
+			selection = Alacritty_Selection{text = 0x586e75, background = 0xeee8d5},
+			normal    = Alacritty_Ansi{black = 0x073642, red = 0xdc322f, green = 0x859900,
+			                           yellow = 0xb58900, blue = 0x268bd2, magenta = 0xd33682,
+			                           cyan = 0x2aa198, white = 0xeee8d5},
+			bright    = Alacritty_Ansi{black = 0x002b36, red = 0xcb4b16, green = 0x586e75,
+			                           yellow = 0x657b83, blue = 0x839496, magenta = 0x6c71c4,
+			                           cyan = 0x93a1a1, white = 0xfdf6e3},
 		},
 	},
 }
@@ -925,15 +826,8 @@ theme_at :: proc(i: int) -> Theme { return THEMES[i] }
 // theme_names lists the CANONICAL names in picker order, allocated from `alloc`.
 //
 // Only canonical names reach the picker: an alias is a door into the table, not
-// a second entry in it. Listing both would let the user "pick" two names for one
-// palette and then the config would disagree with the screen.
-//
-// The picker's *filter* is `theme_matches`, which lives with the state machine in
-// state.odin and is a case-insensitive substring test over the canonical name.
-// The alias list is deliberately NOT consulted there: the filter narrows a list
-// the user is looking at, and showing `latte` and `catppuccin-latte` as two rows
-// for one palette would misreport how many themes exist. Aliases belong to
-// config resolution (theme_resolve), where the user typed a name and meant one.
+// a second entry in it. Listing both would let the user "pick" two names for
+// one palette and then the config would disagree with the screen.
 theme_names :: proc(alloc: runtime.Allocator) -> ([]string, runtime.Allocator_Error) {
 	out := make([dynamic]string, 0, len(THEMES))
 	for t in THEMES do append(&out, strings.clone(t.name, alloc))
@@ -987,8 +881,8 @@ theme_named_or_default :: proc(requested: string) -> Theme {
 }
 
 // theme_default is THE fallback theme: no config, unreadable config, or a config
-// naming something we do not ship. It is a lookup, so the default can never be a
-// palette that drifted away from the table.
+// naming something we do not ship. It is a lookup, so the default can never be
+// a palette that drifted away from the table.
 theme_default :: proc() -> Theme {
 	t, ok := theme_named(THEME_DEFAULT_NAME)
 	// gruvbox-dark is in the table by construction (the smoke suite asserts
@@ -1001,10 +895,10 @@ theme_default :: proc() -> Theme {
 // theme_resolve answers "the config said X — what do we paint, and what must we
 // tell the user about it?"
 //
-// The three answers are why this returns a kind rather than a bool: ISC-19 needs
-// an unknown name to be LOUD (a warning) and an absent name to be SILENT (a
-// default). A bool would collapse the two and the footer would either spam on a
-// fresh install or stay quiet over a typo.
+// The three answers are why this returns a kind rather than a bool: ISC-19
+// needs an unknown name to be LOUD (a warning) and an absent name to be SILENT
+// (a default). A bool would collapse the two and the footer would either spam
+// on a fresh install or stay quiet over a typo.
 theme_resolve :: proc(requested: string) -> (Theme, Resolve_Kind) {
 	trimmed := strings.trim_space(requested)
 	if len(trimmed) == 0 {
@@ -1017,8 +911,8 @@ theme_resolve :: proc(requested: string) -> (Theme, Resolve_Kind) {
 	return t, .explicit
 }
 
-// Unknown_Theme_Message is the one line ISC-19 asks for: it names the value that
-// was wrong, what is being used instead, and where the list lives.
+// Unknown_Theme_Message is the one line ISC-19 asks for: it names the value
+// that was wrong, what is being used instead, and where the list lives.
 Unknown_Theme_Message :: proc(requested: string) -> string {
 	return fmt.tprintf(
 		"unknown theme '%s' - using %s (available: %s)",
@@ -1026,9 +920,6 @@ Unknown_Theme_Message :: proc(requested: string) -> string {
 }
 
 // theme_list_string is the shipped set, canonical spelling, in picker order.
-//
-// strings.join, not `+`: Odin does not concatenate strings with an operator (the
-// plan's trap list), and the result is allocated from the caller's allocator.
 theme_list_string :: proc(alloc: runtime.Allocator) -> string {
 	names, _ := theme_names(alloc)
 	joined, _ := strings.join(names, ", ", alloc)

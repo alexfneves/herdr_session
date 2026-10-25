@@ -1,8 +1,8 @@
 package unit
 
 // ============================================================================
-// sessions_sel_state_test.odin — UIP-3 / RCH-10 change 5: the selection
-// highlight must NOT flatten the running/stopped state colour.
+// sessions_sel_state_test.odin — RCH-12: the selection highlight must NOT
+// flatten the running/stopped state colour.
 //
 // WHAT WAS WRONG
 //
@@ -10,32 +10,37 @@ package unit
 // While a row was selected the state word took the ROW's colour (pal.sel_fg)
 // instead of its own, so a selected RUNNING row and a selected STOPPED row
 // painted the word with ONE colour. The selection collapsed the only thing that
-// column exists to say. The fix gives the selected row its own PAIR —
-// `run_hl` / `stop_hl` — per-cell.
+// column exists to say.
 //
-// WHY BOTH run-vs-stop AND state-vs-sel_fg ARE ASSERTED (AND WHY THE OLD
-// COMMENT SAYING OTHERWISE WAS WRONG)
+// WHAT THE FIX IS NOW, AND WHY IT NEEDS NO DERIVATION
 //
-// An earlier version of this header argued that comparing the state cell against
-// the row colour "is WRONG and would fail on a correct palette — several
-// shipped themes deliberately set run_hl to the same value as sel_fg (the
-// loudest thing on a bright bar)". THAT CLAIM DESCRIBES THE BUG, NOT THE
-// DESIGN, and it is now deleted on purpose. Six of ten themes did set run_hl ==
-// sel_fg, and the user's complaint about exactly that is what this change
-// exists to fix: a selected row whose state word is the bar's own text colour
-// is a selected row whose state has been deleted, however nicely the role is
-// named. `run_hl == sel_fg` is not a legitimate styling choice any more.
+// The state word paints `pal.running` / `pal.stopped` — the theme's
+// `normal.green` / `normal.red` — in BOTH selection states. Those colours ride
+// on top of `pal.sel_bg` (the theme's `selection.background`) when the row is
+// selected. That is the whole mechanism.
 //
-// So both comparisons are made, and they are not redundant:
+// It used to be that the selected pair was DERIVED (a blend search that moved
+// the state colour until it cleared a floor against the bar). The palette is
+// now a mirror of an externally-defined colour schema and nothing is
+// manufactured on top of it: the theme supplies the distinctness of green from
+// red, and the highlight supplies the surface. `tests/unit/theme_roles_test.odin`
+// measures the combination for all ten themes; this file measures it in the
+// back buffer, where the renderer actually committed the cells.
+//
+// WHY BOTH run-vs-stop AND state-vs-sel_fg ARE ASSERTED
+//
+// They are not redundant, and both are needed to say the requirement is met:
 //
 //   * run-vs-stop says a selected RUNNING row does not look like a selected
-//     STOPPED row (RCH-10 change 5);
-//   * state-vs-device-cell (which is painted sel_fg) says the state word does
-//     not look like the rest of the highlighted text — the user's rule, seen
-//     in the back buffer rather than in the palette.
+//     STOPPED row (RCH-12);
+//   * state-vs-device-cell (which is painted sel_fg) says the state word is
+//     not simply the row's own text colour — i.e. the state column is still
+//     doing its job while highlighted, seen in the back buffer rather than in
+//     the palette.
 //
-// A palette could satisfy the first and fail the second (that is exactly the
-// state the shipped table was in), which is why neither is dropped.
+// A view could satisfy the first by accident (two unrelated colours) while the
+// state column silently took the row colour, and vice versa. Neither check can
+// be dropped.
 //
 // WHY PER-CELL, AND WHY TWO PAINTS
 //
@@ -56,13 +61,13 @@ package unit
 //   * unselected pair == running / stopped — fails if the fix overreached and
 //     painted the highlight colour everywhere, which would pass the headline
 //     check while destroying the unselected encoding.
-//   * selected running == run_hl, selected stopped == stop_hl — fails if the
-//     view reads the wrong role, or the roles are swapped, or the old `fg`
+//   * selected running == running, selected stopped == stopped — fails if the
+//     view reads the wrong role, the roles are swapped, or the old `fg`
 //     fallback is still in the path.
 //   * selected_run != selected_stop — THE requirement. Fails, and only this,
 //     if the flatten guard survives (both would read sel_fg) or if a future
 //     palette gives both roles one value.
-//   * selected cells sit ON the accent bar — fails if the selection rectangle
+//   * selected cells sit ON the highlight bar — fails if the selection rectangle
 //     is not where the state cell is, because then "under selection" was never
 //     actually being tested.
 //   * selection still paints the row (device cell == sel_fg) — fails if the
@@ -242,28 +247,29 @@ sel_state_highlight_is_not_the_bar_text_in_the_back_buffer :: proc(t: ^testing.T
 				detail, th.name, u32(f_run.run_dev.fg), u32(sel))
 		}
 
-		// (3) not merely different, but far enough apart to see: the derived
-		// role is underwritten by >= 1.6 against sel_fg, checked on the value
-		// that was actually painted.
-		run_hl := clay_hex(pal.run_hl)
-		stop_hl := clay_hex(pal.stop_hl)
-		if app.theme_contrast(run_hl, sel_attr_hex) < app.THEME_HL_FLOOR_TEXT ||
-		   app.theme_contrast(stop_hl, sel_attr_hex) < app.THEME_HL_FLOOR_TEXT {
+		// (3) RCH-12, verified on the value that was actually painted: the
+		// state word must clear the legibility floor over the BAR it sits on,
+		// and it must not collapse into the bar's own TEXT colour. The first
+		// is the requirement; the second is "the state word is not just
+		// another highlighted character", measured rather than promised.
+		bar_hex := clay_hex(pal.sel_bg)
+		run_hex := clay_hex(pal.running)
+		stop_hex := clay_hex(pal.stopped)
+		cr := app.theme_contrast(run_hex, bar_hex)
+		cs := app.theme_contrast(stop_hex, bar_hex)
+		if cr < app.THEME_LEGIBILITY_FLOOR || cs < app.THEME_LEGIBILITY_FLOOR {
 			too_close += 1
-			detail = fmt.tprintf("{} {}; run vs sel_fg={:.3f} stop vs sel_fg={:.3f} (floor {:.2f})",
-				detail, th.name,
-				app.theme_contrast(run_hl, sel_attr_hex),
-				app.theme_contrast(stop_hl, sel_attr_hex),
-				app.THEME_HL_FLOOR_TEXT)
+			detail = fmt.tprintf("{} {}; running-on-bar={:.3f} stopped-on-bar={:.3f} (floor {:.2f})",
+				detail, th.name, cr, cs, app.THEME_LEGIBILITY_FLOOR)
 		}
 
-		// (4) and the cell IS the derived role, so (1) is a statement about
-		// the derivation and not about an unrelated colour in the cell
-		if f_run.run.fg != sel_attr(pal.run_hl) || f_stop.stop.fg != sel_attr(pal.stop_hl) {
+		// (4) and the cell IS the role, so (1) is a statement about the role
+		// and not about an unrelated colour that happens to land in the cell.
+		if f_run.run.fg != sel_attr(pal.running) || f_stop.stop.fg != sel_attr(pal.stopped) {
 			not_the_role += 1
-			detail = fmt.tprintf("{} {}; state cell fg=0x{:08X}/0x{:08X} but derived roles are 0x{:08X}/0x{:08X}",
+			detail = fmt.tprintf("{} {}; state cell fg=0x{:08X}/0x{:08X} but the roles are 0x{:08X}/0x{:08X}",
 				detail, th.name, u32(f_run.run.fg), u32(f_stop.stop.fg),
-				u32(sel_attr(pal.run_hl)), u32(sel_attr(pal.stop_hl)))
+				u32(sel_attr(pal.running)), u32(sel_attr(pal.stopped)))
 		}
 	}
 
@@ -271,8 +277,8 @@ sel_state_highlight_is_not_the_bar_text_in_the_back_buffer :: proc(t: ^testing.T
 		same_as_bar == 0, fmt.tprintf("{} violation(s){}", same_as_bar, detail))
 	support.check(t, "…and the comparison was made against sel_fg / the derived role itself",
 		not_the_role == 0, fmt.tprintf("{} control failure(s){}", not_the_role, detail))
-	support.check(t, "…with the derived role at least 1.6:1 off sel_fg, not one quantum off",
-		too_close == 0, fmt.tprintf("{} too-close theme(s){}", too_close, detail))
+	support.check(t, "…with the state word clearing the legibility floor over the bar it is painted on",
+		too_close == 0, fmt.tprintf("{} below-floor theme(s){}", too_close, detail))
 }
 
 // ── THE requirement ────────────────────────────────────────────────────────
@@ -316,11 +322,11 @@ sel_state_selection_does_not_flatten_running_into_stopped :: proc(t: ^testing.T)
 
 	// GROUNDING 3 — the selection rectangle actually covers the state cell, so
 	// "under selection" is a fact and not an assumption.
-	accent := sel_attr(pal.accent)
-	support.check(t, "the state cell is drawn ON the accent bar in both selected frames",
-		f_run.run.bg == accent && f_stop.stop.bg == accent,
-		fmt.tprintf("run bg=0x{:08X} stop bg=0x{:08X} want accent=0x{:08X}",
-			u32(f_run.run.bg), u32(f_stop.stop.bg), u32(accent)))
+	bar := sel_attr(pal.sel_bg)
+	support.check(t, "the state cell is drawn ON the highlight bar in both selected frames",
+		f_run.run.bg == bar && f_stop.stop.bg == bar,
+		fmt.tprintf("run bg=0x{:08X} stop bg=0x{:08X} want sel_bg=0x{:08X}",
+			u32(f_run.run.bg), u32(f_stop.stop.bg), u32(bar)))
 
 	// ── THE assertion: selected-running ≠ selected-stopped ────────────────
 	// This is the check that change 5 lives or dies on. Under the old
@@ -334,13 +340,13 @@ sel_state_selection_does_not_flatten_running_into_stopped :: proc(t: ^testing.T)
 			u32(f_run.run.fg), u32(f_stop.stop.fg)))
 
 	// AND the two are the SPECIFIC palette roles, not just "different".
-	// "Some colour changed" is not the requirement; `run_hl` / `stop_hl` are.
-	support.check(t, "…selected running is exactly run_hl",
-		f_run.run.fg == sel_attr(pal.run_hl),
-		fmt.tprintf("got=0x{:08X} want run_hl=0x{:08X}", u32(f_run.run.fg), u32(sel_attr(pal.run_hl))))
-	support.check(t, "…and selected stopped is exactly stop_hl",
-		f_stop.stop.fg == sel_attr(pal.stop_hl),
-		fmt.tprintf("got=0x{:08X} want stop_hl=0x{:08X}", u32(f_stop.stop.fg), u32(sel_attr(pal.stop_hl))))
+	// "Some colour changed" is not the requirement; the STATE ROLES are.
+	support.check(t, "…selected running is exactly the `running` role (normal.green)",
+		f_run.run.fg == sel_attr(pal.running),
+		fmt.tprintf("got=0x{:08X} want running=0x{:08X}", u32(f_run.run.fg), u32(sel_attr(pal.running))))
+	support.check(t, "…and selected stopped is exactly the `stopped` role (normal.red)",
+		f_stop.stop.fg == sel_attr(pal.stopped),
+		fmt.tprintf("got=0x{:08X} want stopped=0x{:08X}", u32(f_stop.stop.fg), u32(sel_attr(pal.stopped))))
 
 	// THE OTHER HALF — unselected rows keep the UNSELECTED roles. Without this
 	// a "make the state column always the highlight colour" change would pass
@@ -416,16 +422,16 @@ sel_state_no_theme_flattens_running_into_stopped :: proc(t: ^testing.T) {
 				detail, th.name, u32(f_run.run.fg), u32(f_stop.stop.fg))
 			continue
 		}
-		if f_run.run.fg != sel_attr(pal.run_hl) || f_stop.stop.fg != sel_attr(pal.stop_hl) {
+		if f_run.run.fg != sel_attr(pal.running) || f_stop.stop.fg != sel_attr(pal.stopped) {
 			wrong_role += 1
 			detail = fmt.tprintf("{} {}; WRONG ROLE sel_run=0x{:08X} want 0x{:08X} sel_stop=0x{:08X} want 0x{:08X}",
-				detail, th.name, u32(f_run.run.fg), u32(sel_attr(pal.run_hl)),
-				u32(f_stop.stop.fg), u32(sel_attr(pal.stop_hl)))
+				detail, th.name, u32(f_run.run.fg), u32(sel_attr(pal.running)),
+				u32(f_stop.stop.fg), u32(sel_attr(pal.stopped)))
 		}
 	}
 
 	support.check(t, "no theme renders a selected RUNNING row like a selected STOPPED row",
 		flattened == 0, fmt.tprintf("{} flattened/unprovable theme(s){}", flattened, detail))
-	support.check(t, "and every theme draws the pair from run_hl / stop_hl specifically",
+	support.check(t, "and every theme draws the pair from the running / stopped roles specifically",
 		wrong_role == 0, fmt.tprintf("{} wrong-role theme(s){}", wrong_role, detail))
 }
