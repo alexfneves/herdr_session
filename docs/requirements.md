@@ -159,7 +159,7 @@ If an error happens (e.g. failed to create the remote session), a floating pane
 
 The theme is saved in ~/.config/herdr_session.json (JSON, not TOML — the config format is JSON and there is no TOML parser in the product; the alacritty colour files live in `.pi/plans/theme-sources/` as vendored data only). When the program starts, it reads this configuration so that it knows the colors one want. Look in the internet for a list of themes. There must be catputin-latte (that is not the default, it's just what I prefer).
 
-The palette itself is a verbatim alacritty `colors.*` schema mirror; an optional per-role override layer (`theme_overrides` in the same JSON file) may replace the resolved colour of one role per theme on top of that base.
+The palette itself is a verbatim alacritty `colors.*` schema mirror; an optional per-role override layer (`theme_overrides` in the same JSON file, or the override a theme ships for its colliding roles) may replace the resolved colour of one role per theme on top of that base. Colliding roles are remediated through that layer rather than through an edit of the verbatim values: solarized-dark ships an override for `secondary` (and its `footer_desc` alias, same source), and solarized-light ships one for `border`, each replacing the colliding value with a legible `#586e75`.
 
 The program should immediately show the local sessions, and in parallel, it should try to fetch the remote sessions. Whenever there is information of a session, it should update the list of sessions.
 

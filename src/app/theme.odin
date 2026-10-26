@@ -543,18 +543,25 @@ theme_role_index_by_name :: proc(name: string) -> (int, bool) {
 
 // theme_overrides_for builds the optional override set that applies to one
 // theme out of the config's `theme_overrides` object — the shape
-// `{ "<theme>": { "<role>": "#rrggbb", … } }`.
+// `{ "<theme>": { "<role>": "#rrggbb", … } }` — overlaid on the THEME'S OWN
+// compiled-in overrides (the base).
 //
 // The lookup is by the theme's CANONICAL name (what the resolution landed on),
 // because an override is a claim about one entry of the table; aliases are doors
 // into it, not separate entries, so an override written under an alias name
 // simply does not apply.
 //
+// Merge order: the theme's own compiled-in overrides (the base — today the two
+// colliding themes carry theirs) are applied first, then the config's entries for
+// that theme on top, so a hand-edited `theme_overrides` layer can still fix a
+// colliding role the shipped default did not cover. The user layer wins; the
+// base is data, the user is data, and the resolution is one override-aware hop.
+//
 // Bad entries (an unknown role, a value that is not a "#rrggbb" string) are
 // skipped and named in the returned notes, so a hand-edited config surfaces a
 // warning line rather than silently painting a wrong colour.
-theme_overrides_for :: proc(overrides_json: json.Object, theme_name: string) -> (Theme_Override_Spec, []string) {
-	spec := Theme_Override_Spec{}
+theme_overrides_for :: proc(base: Theme_Override_Spec, overrides_json: json.Object, theme_name: string) -> (Theme_Override_Spec, []string) {
+	spec := base
 	notes := make([dynamic]string, 0, 2)
 	wanted := strings.to_lower(theme_name, context.temp_allocator)
 	for name, val in overrides_json {
@@ -724,9 +731,12 @@ theme_from_alacritty_schema :: proc(text: string) -> (Palette, string) {
 // the override-seam decision): when a theme carries overrides, they replace the
 // resolved colour of the named ROLES on top of the verbatim base — the compiled
 // values are never edited, an override is user-editable data applied at
-// resolution time. A theme with no overrides (every compiled-in theme, and any
-// theme the config does not override) carries the zero spec, which means "no
-// overrides": every role resolves through `theme_role` to the verbatim base.
+// resolution time. A theme with no overrides carries the zero spec, which means
+// "no overrides": every role resolves through `theme_role` to the verbatim base.
+// A theme that ships colliding overrides (today: solarized-dark — secondary /
+// footer_desc; solarized-light — border) carries them HERE, on the entry, as
+// data; the user layer below overlays the config's `theme_overrides` on top of
+// that compiled-in base.
 Theme :: struct {
 	name    : string,   // canonical, kebab-case — what the config stores
 	aliases : []string, // tolerant spellings for CONFIG resolution only
@@ -924,6 +934,15 @@ THEMES : [10]Theme = {
 	// `primary.background`. Under the role table that makes secondary text the
 	// page colour on this theme (contrast 1.000 — invisible). Reported as a
 	// finding; the value is NOT changed.
+	//
+	// The colliding roles are remediated through the OPTIONAL OVERRIDE LAYER
+	// (design option (b)), NOT through an edit of the verbatim base: this entry
+	// carries the override that replaces the resolved colour of the colliding
+	// roles. `bright.black` answers BOTH the `secondary` role (column headers,
+	// placeholders, muted text) and the `footer_desc` role (footer descriptions),
+	// so both roles whose resolved colour collides are overridden here. The base
+	// `pal` above stays byte-for-byte the vendored file's values; the override is
+	// what clears the 1.000 collision, and it is data, not a base edit.
 	{
 		name    = "solarized-dark",
 		aliases = []string{"solarized", "solarized_dark"},
@@ -937,6 +956,10 @@ THEMES : [10]Theme = {
 			bright    = Alacritty_Ansi{black = 0x002b36, red = 0xcb4b16, green = 0x586e75,
 			                           yellow = 0x657b83, blue = 0x839496, magenta = 0x6c71c4,
 			                           cyan = 0x93a1a1, white = 0xfdf6e3},
+		},
+		overrides = Theme_Override_Spec{
+			overridden = [PALETTE_ROLES]bool{false, false, true, false, false, false, false, true, false, false, false, false, false},
+			hexes       = [PALETTE_ROLES]u32{0, 0, 0x586e75, 0, 0, 0, 0, 0x586e75, 0, 0, 0, 0, 0},
 		},
 	},
 
@@ -958,6 +981,10 @@ THEMES : [10]Theme = {
 			bright    = Alacritty_Ansi{black = 0x002b36, red = 0xcb4b16, green = 0x586e75,
 			                           yellow = 0x657b83, blue = 0x839496, magenta = 0x6c71c4,
 			                           cyan = 0x93a1a1, white = 0xfdf6e3},
+		},
+		overrides = Theme_Override_Spec{
+			overridden = [PALETTE_ROLES]bool{false, false, false, false, false, true, false, false, false, false, false, false, false},
+			hexes       = [PALETTE_ROLES]u32{0, 0, 0, 0, 0, 0x586e75, 0, 0, 0, 0, 0, 0, 0},
 		},
 	},
 }

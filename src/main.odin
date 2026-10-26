@@ -685,9 +685,10 @@ tui_persist_theme :: proc(name: string) -> string {
 	tui.theme = t
 	tui.theme_now = t.name
 	// The picker-chosen theme gets the same optional override layer the config
-	// named at boot: overrides are scoped by theme name, so an override written
-	// for the theme being applied is what the screen paints with now.
-	tov, tnotes := app.theme_overrides_for(tui.cfg.theme_overrides, t.name)
+	// named at boot, overlaid on the theme's own compiled-in overrides: overrides
+	// are scoped by theme name, so an override written for the theme being applied
+	// is what the screen paints with now.
+	tov, tnotes := app.theme_overrides_for(t.overrides, tui.cfg.theme_overrides, t.name)
 	tui.theme.overrides = tov
 	for n in tnotes { app.config_add_warning(&tui.cfg, n) }
 	tui.pal = ui.palette_of(t)
@@ -1428,10 +1429,11 @@ tui_boot :: proc() -> bool {
 	tui.theme = app.theme_named_or_default(tui.cfg.theme)
 	tui.theme_now = tui.theme.name
 	// THE OVERRIDE LAYER: an optional per-role override from the config's
-	// `theme_overrides`, applied ON TOP of the verbatim compiled-in palette.
-	// Absent overrides (the default) carry the zero spec and resolve every role
-	// through the verbatim base — nothing about the shipped themes changes.
-	ov, notes := app.theme_overrides_for(tui.cfg.theme_overrides, tui.theme.name)
+	// `theme_overrides`, overlaid ON TOP of the verbatim compiled-in palette (and
+	// of any override the theme itself ships). Absent overrides (the default)
+	// carry the zero spec and resolve every role through the verbatim base —
+	// nothing about the shipped themes changes.
+	ov, notes := app.theme_overrides_for(tui.theme.overrides, tui.cfg.theme_overrides, tui.theme.name)
 	tui.theme.overrides = ov
 	for n in notes { app.config_add_warning(&tui.cfg, n) }
 	tui.pal = ui.palette_of(tui.theme)

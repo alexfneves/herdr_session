@@ -398,11 +398,24 @@ fixed in user-editable data rather than in code:
 The compiled-in values remain the **base** (verbatim, vendored-mirrored); an
 override replaces the resolved colour of ONE role for the theme it is scoped to,
 riding through the same role table (`src/app/theme.odin`, `theme_role` /
-`theme_role_with_override`) and through `ui.palette_of`. Absent overrides — the
-default — resolve every role through the verbatim base, so the shipped themes,
-the vendored-schema tests and the legibility ledger are untouched by the layer.
-Bad override entries (unknown role, malformed hex) are ignored with one warning
-line, exactly like any other bad config value.
+`theme_role_with_override`) and through `ui.palette_of`.
+
+**Where the overrides live.** The colliding roles are shipped as override data
+on the theme entries themselves: `solarized-dark` carries overrides for its
+colliding roles (`secondary` — which also covers the `footer_desc` alias, since
+both resolve from `bright.black`) and `solarized-light` carries an override for
+its colliding role (`border`), both replacing the colliding value with
+`#586e75` so the pair no longer measures 1.000 against the page. The compiled-in
+values under those entries are **not** edited — the override is data layered on
+the verbatim base, and the vendored-schema tests plus the legibility ledger (which
+pin the verbatim base) are untouched by it.
+
+Absent overrides — every theme that does not ship one, and every role a theme
+does not override — resolve through the verbatim base, so nothing else about the
+shipped screen changes. A user's own `theme_overrides` in the JSON config layer
+on top of the theme's shipped overrides (the user layer wins); bad override
+entries (unknown role, malformed hex) are ignored with one warning line, exactly
+like any other bad config value.
 
 ### Roles
 

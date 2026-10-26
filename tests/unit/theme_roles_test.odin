@@ -264,7 +264,11 @@ ui_palette_is_a_pure_function_of_the_role_table :: proc(t: ^testing.T) {
 		p := ui.palette_of(th)
 		for row, j in ROLE_TABLE {
 			got := clay_hex(ui_field(p, int(j)))
-			want := app.theme_role(th.pal, row.role) & 0xffffff
+			// The override-aware half of the contract: a theme that carries an
+			// override resolves through `theme_role_with_override`; a theme that
+			// does not through `theme_role`. The view palette is still a pure
+			// function of the role table plus the theme's override set.
+			want := app.theme_role_with_override(th.pal, row.role, th.overrides) & 0xffffff
 			if got != want {
 				bad += 1
 				detail = fmt.tprintf("{} {}.{} = {:06x} but role '{}' ({}) resolves to {:06x}",
@@ -548,11 +552,14 @@ role_contrast_matrix_is_recorded :: proc(t: ^testing.T) {
 
 	for i := 0; i < app.theme_count(); i += 1 {
 		th := app.theme_at(i)
-		p := ui.palette_of(th)
 		line := fmt.tprintf("    {}", pad_right(th.name, 21))
 		for pr in MEASURED {
-			a := clay_hex(ui_field(p, role_index_in_palette(pr.fg)))
-			b := clay_hex(ui_field(p, role_index_in_palette(pr.bg)))
+			// The ledger pins the STRICT MAPPING over the VERBATIM BASE: the
+			// optional override layer is the sanctioned remediation for colliding
+			// roles, so these findings are about the vendored values, which the
+			// base keeps byte-for-byte.
+			a := app.theme_role(th.pal, pr.fg)
+			b := app.theme_role(th.pal, pr.bg)
 			r := app.theme_contrast(a, b)
 			line = fmt.tprintf("{} {}: {}", line, pad_right(pr.label, 21), fmt.tprintf("{:.3f}", r))
 			if r < FLOOR {
@@ -632,15 +639,14 @@ ledger_measured_values_match_the_recorded_ratios :: proc(t: ^testing.T) {
 			detail = fmt.tprintf("{} ledger names an unshipped theme '{}';", detail, L.theme)
 			continue
 		}
-		p := ui.palette_of(th)
 		row := pair_row_for(L.pair)
 		if row == nil {
 			bad += 1
 			detail = fmt.tprintf("{} ledger pair '{}' is not in MEASURED;", detail, L.pair)
 			continue
 		}
-		a := clay_hex(ui_field(p, role_index_in_palette(row^.fg)))
-		b := clay_hex(ui_field(p, role_index_in_palette(row^.bg)))
+		a := app.theme_role(th.pal, row^.fg)
+		b := app.theme_role(th.pal, row^.bg)
 		got := app.theme_contrast(a, b)
 		// two-decimal agreement: 0.005 tolerance
 		diff := got - L.measured
@@ -672,26 +678,114 @@ pair_row_for :: proc(label: string) -> ^Pair_Row {
 // Design decision (override seam, option (b)): a theme MAY carry optional
 // per-role overrides on top of its verbatim compiled-in base. The base never
 // moves — the vendored-mirror and role-table tests above keep holding because
-// the compiled-in themes carry the zero override spec — and an override is a
-// data-driven replacement of the colour one ROLE resolves to.
+// the compiled-in themes keep the verbatim palette — and an override is a
+// data-driven replacement of the colour one ROLE resolves to. Today the two
+// colliding themes ship theirs; every other theme carries the zero spec.
 
 @(test)
-theme_overrides_absent_every_compiled_theme_resolves_the_verbatim_base :: proc(t: ^testing.T) {
-	// No compiled-in theme carries an override, so the shipped screen is the
-	// verbatim mirror and the ledger above is still the honest measurement of it.
+theme_overrides_resolve_the_verbatim_base_when_no_override_is_set :: proc(t: ^testing.T) {
+	// An override that is NOT set must resolve the verbatim base — presence is
+	// tracked by `overridden[]`, NOT by the hex being non-zero, so an override of
+	// #000000 is still an override and an unset role is still the base.
 	bad := 0
 	detail := ""
 	for i := 0; i < app.theme_count(); i += 1 {
 		th := app.theme_at(i)
 		for row in ROLE_TABLE {
-			if th.overrides.overridden[int(row.role)] {
-				bad += 1
-				detail = fmt.tprintf("{} {}: role '{}' carries an override", detail, th.name, row.role_name)
+			if !th.overrides.overridden[int(row.role)] {
+				if app.theme_role_with_override(th.pal, row.role, th.overrides) != app.theme_role(th.pal, row.role) {
+					bad += 1
+					detail = fmt.tprintf("{} {}: role '{}' resolved through an override it does not carry",
+						detail, th.name, row.role_name)
+				}
 			}
 		}
 	}
-	support.check(t, "every compiled-in theme carries NO overrides (the verbatim base stands)",
-		bad == 0, fmt.tprintf("{} theme(s) carry overrides: {}", bad, detail))
+	support.check(t, "every role without an override resolves through the verbatim base",
+		bad == 0, fmt.tprintf("{} bad resolution(s){}", bad, detail))
+}
+
+@(test)
+theme_overrides_resolve_the_shipped_colliding_overrides :: proc(t: ^testing.T) {
+	// THE FIX, AS SHIPPED: the colliding themes carry their colliding roles as
+	// override DATA (design option (b)); the verbatim base underneath stays
+	// byte-for-byte the vendored values.
+	solarized, ok := app.theme_named("solarized-dark")
+	support.check(t, "solarized-dark ships (the override subject exists)", ok, "theme not found")
+	support.check(t, "solarized-dark overrides secondary and footer_desc (bright.black collides with the page)",
+		solarized.overrides.overridden[int(app.Role.secondary)] &&
+		solarized.overrides.overridden[int(app.Role.footer_desc)],
+		fmt.tprintf("secondary overridden={} footer_desc overridden={}",
+			solarized.overrides.overridden[int(app.Role.secondary)],
+			solarized.overrides.overridden[int(app.Role.footer_desc)]))
+	support.check(t, "solarized-dark's override hexes are the replacement colours",
+		solarized.overrides.hexes[int(app.Role.secondary)] == 0x586e75 &&
+		solarized.overrides.hexes[int(app.Role.footer_desc)] == 0x586e75,
+		fmt.tprintf("secondary={:06x} footer_desc={:06x}",
+			solarized.overrides.hexes[int(app.Role.secondary)], solarized.overrides.hexes[int(app.Role.footer_desc)]))
+	support.check(t, "solarized-dark's verbatim base still resolves bright.black (#002b36)",
+		app.theme_role(solarized.pal, app.Role.secondary) == 0x002b36,
+		fmt.tprintf("base secondary={:06x}", app.theme_role(solarized.pal, app.Role.secondary)))
+
+	light, ok2 := app.theme_named("solarized-light")
+	support.check(t, "solarized-light ships (the override subject exists)", ok2, "theme not found")
+	support.check(t, "solarized-light overrides border (bright.white collides with the page)",
+		light.overrides.overridden[int(app.Role.border)],
+		fmt.tprintf("border overridden={}", light.overrides.overridden[int(app.Role.border)]))
+	support.check(t, "solarized-light's border override is the replacement colour",
+		light.overrides.hexes[int(app.Role.border)] == 0x586e75,
+		fmt.tprintf("border={:06x}", light.overrides.hexes[int(app.Role.border)]))
+	support.check(t, "solarized-light's verbatim base still resolves bright.white (#fdf6e3)",
+		app.theme_role(light.pal, app.Role.border) == 0xfdf6e3,
+		fmt.tprintf("base border={:06x}", app.theme_role(light.pal, app.Role.border)))
+
+	// The shipped fix is NARROW: exactly the two colliding themes carry overrides,
+	// and each carries only the colliding role(s).
+	carrying := 0
+	for i := 0; i < app.theme_count(); i += 1 {
+		th := app.theme_at(i)
+		n := 0
+		for row in ROLE_TABLE {
+			if th.overrides.overridden[int(row.role)] { n += 1 }
+		}
+		if n > 0 { carrying += 1 }
+	}
+	support.check(t, "exactly the two colliding themes carry compiled-in overrides", carrying == 2,
+		fmt.tprintf("{} theme(s) carry overrides", carrying))
+}
+
+@(test)
+theme_overrides_make_the_colliding_pairs_legible :: proc(t: ^testing.T) {
+	// THE FIX, MEASURED: the shipped overrides replace the colliding roles, so
+	// the pairs that measured 1.000 under the strict mapping now resolve through
+	// the override-aware half of the contract and clear THEME_LEGIBILITY_FLOOR.
+	FLOOR := app.THEME_LEGIBILITY_FLOOR
+	bad := 0
+	detail := ""
+	solarized, ok := app.theme_named("solarized-dark")
+	if !ok {
+		support.check(t, "the colliding override subject ships", false, "solarized-dark not found")
+		return
+	}
+	if app.theme_contrast(app.theme_role_with_override(solarized.pal, .secondary, solarized.overrides), app.theme_role(solarized.pal, .background)) < FLOOR {
+		bad += 1
+		detail = fmt.tprintf("solarized-dark secondary override below floor {:.2f}", FLOOR)
+	}
+	if app.theme_contrast(app.theme_role_with_override(solarized.pal, .footer_desc, solarized.overrides), app.theme_role(solarized.pal, .background)) < FLOOR {
+		bad += 1
+		detail = fmt.tprintf("solarized-dark footer_desc override below floor {:.2f}", FLOOR)
+	}
+	light, ok2 := app.theme_named("solarized-light")
+	if !ok2 {
+		support.check(t, "the colliding override subject ships", false, "solarized-light not found")
+		return
+	}
+	if app.theme_contrast(app.theme_role_with_override(light.pal, .border, light.overrides), app.theme_role(light.pal, .background)) < FLOOR {
+		bad += 1
+		detail = fmt.tprintf("solarized-light border override below floor {:.2f}", FLOOR)
+	}
+	support.check(t, "the shipped overrides clear the legibility floor on the colliding pairs",
+		bad == 0, fmt.tprintf("{} violation(s){}", bad, detail))
 }
 
 @(test)
