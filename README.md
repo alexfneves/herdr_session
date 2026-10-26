@@ -242,7 +242,7 @@ landing screen never carries a stale pointer from two screens ago.
 variable is set). The file is optional — with no file at all the app runs on
 defaults.
 
-Three keys are ours. **Everything else in the file is preserved untouched on save**,
+Four keys are ours. **Everything else in the file is preserved untouched on save**,
 so you can keep your own keys next to ours.
 
 ```json
@@ -253,7 +253,10 @@ so you can keep your own keys next to ours.
     "deploy@10.0.0.7",
     { "target": "gpu-box", "label": "GPU box" }
   ],
-  "cleanup_policy": "only_created"
+  "cleanup_policy": "only_created",
+  "theme_overrides": {
+    "solarized-dark": { "secondary": "#586e75" }
+  }
 }
 ```
 
@@ -262,6 +265,7 @@ so you can keep your own keys next to ours.
 | `theme` | string | `"gruvbox-dark"` | Colour theme. See [Themes](#themes). |
 | `remotes` | array | `[]` | SSH targets. See [Adding a remote](#adding-a-remote). |
 | `cleanup_policy` | string | `"only_created"` | What happens to a session after you detach. See [Cleanup policy](#cleanup-policy). |
+| `theme_overrides` | object | `{}` | Optional per-theme role overrides. See [Themes](#the-palette-is-a-schema-mirror-not-a-hand-picked-set). |
 
 ### Bad config is shown, not thrown
 
@@ -276,7 +280,7 @@ problem becomes defaults plus **one warning line in the footer**:
 | Unknown extra key | **silently ignored and preserved on save** (it's your key, not ours) |
 
 The one thing that is *not* preserved: if the file cannot be parsed, the first save
-writes a document containing only our three keys. The warning already told you the
+writes a document containing only our four keys. The warning already told you the
 file was invalid before that happened.
 
 ---
@@ -377,6 +381,28 @@ the upstream file vendored under `.pi/plans/theme-sources/`, and
 the vendored file key-for-key, with the file pinned by byte length and sha256.
 **Hex values are never adjusted for contrast.** If a value differs from upstream,
 the test goes red.
+
+### Optional per-role overrides
+
+The palette is still a verbatim mirror — but a theme may carry **optional
+per-role overrides**, so a colour collision the strict mapping surfaces can be
+fixed in user-editable data rather than in code:
+
+```json
+{
+  "theme": "solarized-dark",
+  "theme_overrides": { "solarized-dark": { "secondary": "#586e75" } }
+}
+```
+
+The compiled-in values remain the **base** (verbatim, vendored-mirrored); an
+override replaces the resolved colour of ONE role for the theme it is scoped to,
+riding through the same role table (`src/app/theme.odin`, `theme_role` /
+`theme_role_with_override`) and through `ui.palette_of`. Absent overrides — the
+default — resolve every role through the verbatim base, so the shipped themes,
+the vendored-schema tests and the legibility ledger are untouched by the layer.
+Bad override entries (unknown role, malformed hex) are ignored with one warning
+line, exactly like any other bad config value.
 
 ### Roles
 

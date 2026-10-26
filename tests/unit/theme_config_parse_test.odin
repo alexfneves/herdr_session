@@ -13,6 +13,7 @@ package unit
 // its own assertion here for that reason.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import json "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:testing"
@@ -209,4 +210,40 @@ config_parse_json5_comments_and_trailing_comma :: proc(t: ^testing.T) {
 	support.check(t, "JSON5 comments + trailing comma load (hand-edit friendly)",
 		j5.theme == "nord" && !j5.corrupt && len(j5.warnings) == 0,
 		fmt.tprintf("theme='{}' corrupt={} warnings={}", j5.theme, j5.corrupt, len(j5.warnings)))
+}
+
+// ── theme_overrides: the optional per-role override layer ──────────────────
+
+@(test)
+config_parse_theme_overrides_wrong_type_is_ignored_with_one_warning :: proc(t: ^testing.T) {
+	w := app.config_parse_json(`{"theme_overrides":"nope"}`, "/tmp/ov-bad")
+	support.check(t, "theme_overrides of the wrong type is ignored",
+		len(w.warnings) == 1 && strings.contains(w.warnings[0], "theme_overrides"),
+		fmt.tprintf("{} warning(s): {}", len(w.warnings), warn_join(w)))
+	support.eq(t, "…the theme still resolves from the owned key alone", w.theme, "gruvbox-dark")
+}
+
+@(test)
+config_parse_theme_overrides_object_is_carried :: proc(t: ^testing.T) {
+	c := app.config_parse_json(
+		`{"theme":"solarized-dark","theme_overrides":{"solarized-dark":{"secondary":"#073642"}}}`, "/tmp/ov")
+	support.check(t, "theme_overrides object PARSES (no warning, not corrupt)",
+		len(c.warnings) == 0 && !c.corrupt,
+		fmt.tprintf("theme='{}' corrupt={} warnings={}", c.theme, c.corrupt, len(c.warnings)))
+	support.eq(t, "…and the applied theme is the named one", c.theme, "solarized-dark")
+
+	// Read the override back out of the carried object, the way the theme layer
+	// will: theme name -> role -> "#rrggbb".
+	ov, has_theme := c.theme_overrides["solarized-dark"]
+	support.check(t, "…the override is scoped to the theme that named it", has_theme,
+		fmt.tprintf("no override for 'solarized-dark' in the config"))
+	ov_obj, is_obj := ov.(json.Object)
+	support.check(t, "…and it is an object", is_obj, fmt.tprintf("value type is not an object: {}", ov))
+	if is_obj {
+		sec, has_role := ov_obj["secondary"]
+		sec_str, is_str := sec.(json.String)
+		support.check(t, "…and it names a ROLE",
+			has_role && is_str && strings.contains(string(sec_str), "073642"),
+			fmt.tprintf("secondary -> {}", string(sec_str)))
+	}
 }

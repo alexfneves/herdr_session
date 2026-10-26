@@ -33,12 +33,12 @@ package app
 // is what `Config.warnings` is for: the footer puts the first one where the user
 // will actually see it.
 //
-// # WRITE-BACK RULE: we own three keys, and only three
+// # WRITE-BACK RULE: we own four keys, and only four
 //
 // A save is a READ-MODIFY-WRITE of the parsed document:
 //
 //   1. read + parse the current file (if it parses)
-//   2. set OUR keys: theme / remotes / cleanup_policy
+//   2. set OUR keys: theme / remotes / cleanup_policy / theme_overrides
 //   3. marshal the WHOLE object back out
 //
 // `json.Object` IS the parsed document, so step 3 carries every key we do not
@@ -132,6 +132,14 @@ Config :: struct {
 	present         : bool,   // the file existed
 	corrupt         : bool,   // existed but could not be read as JSON
 	theme_fell_back : bool,   // `theme` was present but unknown (ISC-19)
+
+	// --- the optional per-theme override layer ---------------------------
+	// The raw `theme_overrides` object from the file, as the user wrote it:
+	// { "<theme>": { "<role>": "#rrggbb" } }. Absent or wrong-typed at parse time
+	// leaves this at the zero value (no overrides). It is read here and written
+	// back verbatim by the save paths — the user owns the values, the app owns
+	// the seam they are applied through.
+	theme_overrides : json.Object,
 
 	// --- what the user has to be told -----------------------------------
 	warnings : [dynamic]string,
@@ -259,6 +267,23 @@ config_parse_json :: proc(text: string, path: string) -> Config {
 			out.cleanup_policy = CLEANUP_LABEL_NONE
 		} else {
 			out.cleanup_policy = string(pol)
+		}
+	}
+
+	// --- theme_overrides --------------------------------------------------
+	// The OPTIONAL per-role override layer (design option (b)): the user's data
+	// applied on top of the verbatim compiled-in palette. Shape:
+	//
+	//   "theme_overrides": { "<theme>": { "<role>": "#rrggbb" } }
+	//
+	// A wrong type is ignored with one warning — the same treatment every owned
+	// key gets — and an absent key leaves the theme on its verbatim base.
+	if v, found := obj["theme_overrides"]; found {
+		o, is_overrides_obj := v.(json.Object)
+		if !is_overrides_obj {
+			config_add_warning(&out, "config key 'theme_overrides' is not an object - ignored")
+		} else {
+			out.theme_overrides = o
 		}
 	}
 
@@ -414,6 +439,15 @@ doc_set_string_list :: proc(obj: ^json.Object, key: string, items: []string) {
 	obj^[key] = json.Array(dv)
 }
 
+// doc_set_object sets a nested JSON object the way doc_set_string sets a string:
+// through the pointer, because a *by-value distinct map cannot be assigned into
+// ("Cannot assign to the value of a map"). The value is carried as the parsed
+// json.Object, so the user's own key order and nested shape survive a save
+// untouched — we never rewrite what we do not own semantically here.
+doc_set_object :: proc(obj: ^json.Object, key: string, value: json.Object) {
+	obj^[key] = value
+}
+
 // config_save_theme persists the applied theme. This is the ISC-7 write path.
 //
 // Merging is not optional: marshalling a Config back out would write only the
@@ -426,6 +460,12 @@ config_save_theme :: proc(path: string, theme_name: string) -> (bool, string) {
 	// theme change vanished on a first run. `make` is not optional.
 	if !ok { obj = make(json.Object) }
 	doc_set_string(&obj, "theme", theme_name)
+	// THE OVERRIDE LAYER IS OURS AND ONLY OURS: carry the user's optional
+	// per-theme overrides through the save untouched, so a hand-edited
+	// `theme_overrides` survives a theme change the same way remotes do.
+	if v, found := obj["theme_overrides"]; found {
+		if o, ok2 := v.(json.Object); ok2 { doc_set_object(&obj, "theme_overrides", o) }
+	}
 	return write_doc(path, obj)
 }
 
@@ -440,6 +480,12 @@ config_save_remotes :: proc(path: string, remotes: []Remote) -> (bool, string) {
 	targets := make([dynamic]string, 0, len(remotes))
 	for r in remotes { append(&targets, r.device) }
 	doc_set_string_list(&obj, "remotes", targets[:])
+	// THE OVERRIDE LAYER IS OURS AND ONLY OURS: carry the user's optional
+	// per-theme overrides through the save untouched, whatever key they ride
+	// under (a save of the host list must not drop an override the user wrote).
+	if v, found := obj["theme_overrides"]; found {
+		if o, ok2 := v.(json.Object); ok2 { doc_set_object(&obj, "theme_overrides", o) }
+	}
 	return write_doc(path, obj)
 }
 
@@ -452,6 +498,12 @@ config_save_cleanup :: proc(path: string, policy: string) -> (bool, string) {
 	// theme change vanished on a first run. `make` is not optional.
 	if !ok { obj = make(json.Object) }
 	doc_set_string(&obj, "cleanup_policy", policy)
+	// THE OVERRIDE LAYER IS OURS AND ONLY OURS: carry the user's optional
+	// per-theme overrides through the save untouched, so a save that rewrites
+	// the policy does not drop an override the user wrote.
+	if v, found := obj["theme_overrides"]; found {
+		if o, ok2 := v.(json.Object); ok2 { doc_set_object(&obj, "theme_overrides", o) }
+	}
 	return write_doc(path, obj)
 }
 

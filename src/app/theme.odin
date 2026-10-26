@@ -138,6 +138,16 @@ package app
 // None of these were fudged. They are the consequence of the strict mapping
 // and are reported as-is.
 //
+// # THE OPTIONAL OVERRIDE LAYER (DESIGN OPTION (B))
+//
+// The user chose to fix colliding roles in user-editable data rather than in
+// code: a theme may carry an optional per-role override, applied on top of the
+// verbatim base through `theme_role_with_override` and out through
+// `ui.palette_of`. The compiled-in values above are never edited; the override
+// is data (`theme_overrides` in the JSON config), and an absent override leaves
+// every role on the verbatim base. The vendored-mirror and role-table tests are
+// unchanged by the layer, because the base they pin never moved.
+//
 // # THE ONE SEAM: A FUTURE SCHEMA LOADER IS AN ISOLATED ADDITION
 //
 // The product's config format stays JSON (`theme`, `remotes`,
@@ -208,6 +218,7 @@ package app
 // have", which is why it lives here rather than in the config module.
 // ============================================================================
 
+import json "core:encoding/json"
 import "core:fmt"
 import "core:math"
 import "base:runtime"
@@ -445,6 +456,133 @@ theme_role_key_name :: proc(r: Role) -> string {
 	return palette_key_name(theme_role_source(r))
 }
 
+//-----------------------------------------------------------------------------
+// THE OPTIONAL OVERRIDE LAYER
+//-----------------------------------------------------------------------------
+
+// Theme_Override_Spec is the optional per-role override layer for ONE theme.
+//
+// It is the answer to the legibility findings the strict schema mirror surfaced
+// and the user chose NOT to fix in code: solarized-dark's `bright.black` IS its
+// own page background (secondary text / footer descriptions at contrast 1.000),
+// and solarized-light's `bright.white` IS its own page background (the
+// between-children rules at contrast 1.000). Rather than editing the vendored
+// values — which the verbatim-mirror tests forbid — the theme may carry an
+// optional override per ROLE, and the override is user-editable data
+// (`theme_overrides` in the JSON config), not a code-side colour.
+//
+// Presence is tracked by `overridden[]` per role, NOT by the hex being zero:
+// an override of #000000 is a real override and must not read as absent. The
+// zero value of this struct therefore means "no overrides", which is what every
+// compiled-in theme and every unconfigured theme resolves through `theme_role`.
+Theme_Override_Spec :: struct {
+	overridden : [PALETTE_ROLES]bool, // presence per role, in theme_role order
+	hexes       : [PALETTE_ROLES]u32, // the override hex per overridden role
+}
+
+// theme_role_with_override resolves one role to its colour, applying an
+// optional override when the theme carries one for that role.
+//
+// This is the override-aware half of the single contract: `theme_role` stays
+// the pure, verbatim-base resolver (and is what the compiled-in table and the
+// role-table tests exercise), while a theme that carries an override set routes
+// through here instead. The override REPLACES the resolved colour; it never
+// blends, never derives, never adjusts — it is data applied on top of the base.
+//
+// The index is the role's ordinal in the same order `theme_role_names` lists
+// them, which is also the order the view layer's `ui.Palette` fields use; the
+// codebase already leans on that correspondence (`int(Palette_Key)` array
+// indexing in `theme_slots`).
+theme_role_with_override :: proc(p: Palette, r: Role, ov: Theme_Override_Spec) -> u32 {
+	i := int(r)
+	if i >= 0 && i < PALETTE_ROLES && ov.overridden[i] {
+		return ov.hexes[i]
+	}
+	return theme_role(p, r)
+}
+
+// theme_hex_value parses a "#rrggbb" string into the 0xRRGGBB the rest of the
+// module works in. The leading `#` and the six digits are required; anything
+// else is not an override this layer will apply (and the caller reports it).
+//
+// Explicit shifts rather than a transmute: the caller must be able to see that
+// a "#rrggbb" becomes 0xRRGGBB with no normalisation anywhere near it.
+theme_hex_value :: proc(s: string) -> (u32, bool) {
+	if len(s) != 7 || s[0] != '#' { return 0, false }
+	v : u32 = 0
+	for i in 1..<7 {
+		c := s[i]
+		d : u8
+		if c >= '0' && c <= '9' {
+			d = u8(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			d = u8(c - 'a') + 10
+		} else if c >= 'A' && c <= 'F' {
+			d = u8(c - 'A') + 10
+		} else {
+			return 0, false
+		}
+		v = (v << 4) | u32(d)
+	}
+	return v, true
+}
+
+// theme_role_index_by_name finds the ordinal of a role by its documented name
+// ("secondary", "hl_bg", …) — the lookup the override layer's data is written
+// in. Names are compared case-insensitively, like theme resolution itself.
+theme_role_index_by_name :: proc(name: string) -> (int, bool) {
+	names := theme_role_names()
+	wanted := strings.to_lower(name, context.temp_allocator)
+	for i in 0..<len(names) {
+		if strings.to_lower(names[i], context.temp_allocator) == wanted {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// theme_overrides_for builds the optional override set that applies to one
+// theme out of the config's `theme_overrides` object — the shape
+// `{ "<theme>": { "<role>": "#rrggbb", … } }`.
+//
+// The lookup is by the theme's CANONICAL name (what the resolution landed on),
+// because an override is a claim about one entry of the table; aliases are doors
+// into it, not separate entries, so an override written under an alias name
+// simply does not apply.
+//
+// Bad entries (an unknown role, a value that is not a "#rrggbb" string) are
+// skipped and named in the returned notes, so a hand-edited config surfaces a
+// warning line rather than silently painting a wrong colour.
+theme_overrides_for :: proc(overrides_json: json.Object, theme_name: string) -> (Theme_Override_Spec, []string) {
+	spec := Theme_Override_Spec{}
+	notes := make([dynamic]string, 0, 2)
+	wanted := strings.to_lower(theme_name, context.temp_allocator)
+	for name, val in overrides_json {
+		if strings.to_lower(name, context.temp_allocator) != wanted { continue }
+		ov, is_obj := val.(json.Object)
+		if !is_obj {
+			append(&notes, fmt.tprintf(
+				"config: theme '%s' has a malformed override entry - not applied", name))
+			continue
+		}
+		for role_name, hex_val in ov {
+			hex_str, is_str := hex_val.(json.String)
+			idx, is_role := theme_role_index_by_name(role_name)
+			hex, hex_ok := u32(0), false
+			if is_str { hex, hex_ok = theme_hex_value(string(hex_str)) }
+			if !is_role || !hex_ok {
+				append(&notes, fmt.tprintf(
+					"config: theme '%s' override for unknown role '%s' is not applied",
+					theme_name, role_name))
+				continue
+			}
+			spec.overridden[idx] = true
+			spec.hexes[idx] = hex
+		}
+	}
+	return spec, notes[:]
+}
+
 theme_role_names :: proc() -> [PALETTE_ROLES]string {
 	return [PALETTE_ROLES]string{
 		"background", "text", "secondary", "hl_bg", "hl_text", "border",
@@ -581,10 +719,19 @@ theme_from_alacritty_schema :: proc(text: string) -> (Palette, string) {
 
 // Theme is one selectable entry: its canonical name, the names that also
 // resolve to it, and its colour set.
+//
+// `overrides` is the OPTIONAL per-role override layer (design option (b) from
+// the override-seam decision): when a theme carries overrides, they replace the
+// resolved colour of the named ROLES on top of the verbatim base — the compiled
+// values are never edited, an override is user-editable data applied at
+// resolution time. A theme with no overrides (every compiled-in theme, and any
+// theme the config does not override) carries the zero spec, which means "no
+// overrides": every role resolves through `theme_role` to the verbatim base.
 Theme :: struct {
 	name    : string,   // canonical, kebab-case — what the config stores
 	aliases : []string, // tolerant spellings for CONFIG resolution only
-	pal     : Palette,
+	pal     : Palette, // the verbatim alacritty schema values for this theme
+	overrides : Theme_Override_Spec, // optional per-role overrides; zero = none
 }
 
 // THEME_DEFAULT_NAME is the answer to "we could not work out a theme". D4.

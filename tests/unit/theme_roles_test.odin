@@ -666,3 +666,92 @@ pair_row_for :: proc(label: string) -> ^Pair_Row {
 	}
 	return nil
 }
+
+// ── 5. THE OPTIONAL OVERRIDE LAYER ─────────────────────────────────────────
+//
+// Design decision (override seam, option (b)): a theme MAY carry optional
+// per-role overrides on top of its verbatim compiled-in base. The base never
+// moves — the vendored-mirror and role-table tests above keep holding because
+// the compiled-in themes carry the zero override spec — and an override is a
+// data-driven replacement of the colour one ROLE resolves to.
+
+@(test)
+theme_overrides_absent_every_compiled_theme_resolves_the_verbatim_base :: proc(t: ^testing.T) {
+	// No compiled-in theme carries an override, so the shipped screen is the
+	// verbatim mirror and the ledger above is still the honest measurement of it.
+	bad := 0
+	detail := ""
+	for i := 0; i < app.theme_count(); i += 1 {
+		th := app.theme_at(i)
+		for row in ROLE_TABLE {
+			if th.overrides.overridden[int(row.role)] {
+				bad += 1
+				detail = fmt.tprintf("{} {}: role '{}' carries an override", detail, th.name, row.role_name)
+			}
+		}
+	}
+	support.check(t, "every compiled-in theme carries NO overrides (the verbatim base stands)",
+		bad == 0, fmt.tprintf("{} theme(s) carry overrides: {}", bad, detail))
+}
+
+@(test)
+theme_overrides_swap_named_roles_through_the_view_palette :: proc(t: ^testing.T) {
+	// THE COLLIDING PAIR, AS THE USER WOULD FIX IT: solarized-dark's
+	// `bright.black` IS its page background, so the secondary text / footer
+	// descriptions are invisible (contrast 1.000). The override layer is the
+	// opt-in way to fix exactly that in user-editable data rather than in code.
+	solarized, ok := app.theme_named("solarized-dark")
+	support.check(t, "solarized-dark ships (the override subject exists)", ok, "theme not found")
+
+	base := ui.palette_of(solarized)
+	spec := app.Theme_Override_Spec{}
+	spec.overridden[int(app.Role.secondary)] = true
+	spec.overridden[int(app.Role.border)] = true
+	spec.hexes[int(app.Role.secondary)] = 0x586e75
+	spec.hexes[int(app.Role.border)] = 0x586e75
+
+	swapped := app.Theme{
+		name = solarized.name,
+		aliases = solarized.aliases,
+		pal = solarized.pal,
+		overrides = spec,
+	}
+	p := ui.palette_of(swapped)
+
+	bad := 0
+	if clay_hex(p.dim) != 0x586e75 { bad += 1 }
+	if clay_hex(p.border) != 0x586e75 { bad += 1 }
+	// a role that was NOT overridden still resolves from the verbatim base
+	if clay_hex(p.bg) != clay_hex(base.bg) { bad += 1 }
+	if clay_hex(p.sel_bg) != clay_hex(base.sel_bg) { bad += 1 }
+	support.check(t, "an override swaps the named role and leaves the rest on the base",
+		bad == 0, fmt.tprintf("{} mismatch(es){}", bad, fmt.tprintf("dim={:06x} border={:06x} bg={:06x}",
+			clay_hex(p.dim), clay_hex(p.border), clay_hex(p.bg))))
+
+	// An override that fixes the collision is a COLOUR the user chose, applied
+	// through the same single contract — it is not a second palette and it does
+	// not reach the ui.Palette through any door but the role table.
+	if clay_hex(p.dim) == clay_hex(p.bg) {
+		support.check(t, "an override never re-creates the collision it was meant to fix", false,
+			fmt.tprintf("dim={} still equals bg={}", clay_hex(p.dim), clay_hex(p.bg)))
+	}
+}
+
+@(test)
+theme_override_hex_and_role_lookups :: proc(t: ^testing.T) {
+	hx, hex_ok := app.theme_hex_value("#073642")
+	_, short_ok := app.theme_hex_value("#0736")
+	_, no_hash_ok := app.theme_hex_value("073642")
+	support.eq_i(t, "…'#073642' parses to the hex 0x073642", int(hx), 0x073642)
+	support.check(t, "…and the parse requires the leading '#' and six digits",
+		hex_ok && short_ok == false && no_hash_ok == false,
+		fmt.tprintf("hex_ok={} short_ok={} no_hash_ok={}", hex_ok, short_ok, no_hash_ok))
+
+	idx, idx_ok := app.theme_role_index_by_name("Secondary")
+	support.eq_i(t, "…'Secondary' resolves to the secondary role's ordinal", idx, int(app.Role.secondary))
+	support.check(t, "…the ordinal is the secondary role's", idx_ok,
+		fmt.tprintf("'Secondary' -> {} (secondary = {})", idx, int(app.Role.secondary)))
+	_, unknown_ok := app.theme_role_index_by_name("nope")
+	support.check(t, "…an unknown role name resolves to none", !unknown_ok,
+		fmt.tprintf("unknown -> {}", unknown_ok))
+}

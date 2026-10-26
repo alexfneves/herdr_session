@@ -272,23 +272,25 @@ Palette :: struct {
 // decision: paint, or don't" (render/renderer.odin:133) and a themed colour is
 // always meant to paint.
 // palette_of resolves the 13 roles of one theme into clay colours. EVERY field
-// goes through `app.theme_role`, which is the role table; nothing here reads a
-// `Palette` field directly and nothing here computes a colour.
+// goes through the role table — `app.theme_role`, or
+// `app.theme_role_with_override` when the theme carries an optional override —
+// and nothing here reads a `Palette` field directly and nothing here computes a
+// colour.
 palette_of :: proc(t: app.Theme) -> Palette {
 	return Palette{
-		bg       = clay_colour(app.theme_role(t.pal, .background)),
-		fg       = clay_colour(app.theme_role(t.pal, .text)),
-		dim      = clay_colour(app.theme_role(t.pal, .secondary)),
-		sel_bg   = clay_colour(app.theme_role(t.pal, .hl_bg)),
-		sel_fg   = clay_colour(app.theme_role(t.pal, .hl_text)),
-		border   = clay_colour(app.theme_role(t.pal, .border)),
-		key_fg   = clay_colour(app.theme_role(t.pal, .footer_key)),
-		desc_fg  = clay_colour(app.theme_role(t.pal, .footer_desc)),
-		running  = clay_colour(app.theme_role(t.pal, .running)),
-		stopped  = clay_colour(app.theme_role(t.pal, .stopped)),
-		err_fg   = clay_colour(app.theme_role(t.pal, .error)),
-		caret_bg = clay_colour(app.theme_role(t.pal, .caret_bg)),
-		caret_fg = clay_colour(app.theme_role(t.pal, .caret_glyph)),
+		bg       = clay_colour(app.theme_role_with_override(t.pal, .background, t.overrides)),
+		fg       = clay_colour(app.theme_role_with_override(t.pal, .text, t.overrides)),
+		dim      = clay_colour(app.theme_role_with_override(t.pal, .secondary, t.overrides)),
+		sel_bg   = clay_colour(app.theme_role_with_override(t.pal, .hl_bg, t.overrides)),
+		sel_fg   = clay_colour(app.theme_role_with_override(t.pal, .hl_text, t.overrides)),
+		border   = clay_colour(app.theme_role_with_override(t.pal, .border, t.overrides)),
+		key_fg   = clay_colour(app.theme_role_with_override(t.pal, .footer_key, t.overrides)),
+		desc_fg  = clay_colour(app.theme_role_with_override(t.pal, .footer_desc, t.overrides)),
+		running  = clay_colour(app.theme_role_with_override(t.pal, .running, t.overrides)),
+		stopped  = clay_colour(app.theme_role_with_override(t.pal, .stopped, t.overrides)),
+		err_fg   = clay_colour(app.theme_role_with_override(t.pal, .error, t.overrides)),
+		caret_bg = clay_colour(app.theme_role_with_override(t.pal, .caret_bg, t.overrides)),
+		caret_fg = clay_colour(app.theme_role_with_override(t.pal, .caret_glyph, t.overrides)),
 	}
 }
 
