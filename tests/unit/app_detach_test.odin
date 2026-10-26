@@ -253,6 +253,86 @@ adt_r1_only_created_destroys_ours_spares_theirs :: proc(t: ^testing.T) {
 		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
 }
 
+// ── UNCONDITIONAL: the create/attach handoff destroys what it went through ─
+
+// The create/attach handoff now destroys the session it just went through,
+// REGARDLESS of who made the name (the 2026-10-26 decision): after the launch or
+// the attach hands off and the child comes back, the session is deleted. `we
+// created it` no longer spares anything, and the policy seam above is NOT what
+// answers here — `post_handoff` is.
+//
+// The two halves the user asked for live here: a session the app CREATED is
+// destroyed, and a session the app only ever ATTACHED to is destroyed just the
+// same. Both go through `post_handoff` and both must land.
+@(test)
+adt_unconditional_post_handoff_destroys_the_handoff_target :: proc(t: ^testing.T) {
+	c := au_live(t)
+	created := "hs-t-uh-owned"
+	guest   := "hs-t-uh-joined"
+	adt_teardown(&c, created, "pre-run safety")
+	adt_teardown(&c, guest, "pre-run safety")
+	defer {
+		adt_teardown(&c, created, "final sweep")
+		adt_teardown(&c, guest, "final sweep")
+	}
+	if !adt_spawn_pty(created) {
+		au_say(&c, "    SKIP: could not create the 'created here' scratch session")
+		return
+	}
+	if !adt_spawn_pty(guest) {
+		au_say(&c, "    SKIP: could not create the 'already there' scratch session")
+		adt_teardown(&c, created, "skip path")
+		return
+	}
+
+	before := adt_list_now()
+	au_check(&c, "both scratch sessions exist before the handoff destroy",
+		adt_contains_name(before, created) && adt_contains_name(before, guest),
+		fmt.tprintf("names={}", adt_names_of(before)))
+
+	n_created := app.post_handoff(app.DEVICE_LOCAL, created)
+	au_say(&c, fmt.tprintf("    post_handoff notice (created here): {}", n_created))
+	au_check(&c, "THE HANDOFF DESTROYS THE SESSION IT CREATED",
+		!adt_contains_name(adt_list_now(), created),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
+	au_check(&c, "…and the notice states it plainly, with no error wording",
+		strings.contains(n_created, "stopped and deleted") &&
+			!strings.contains(n_created, "NOT cleaned") &&
+			!strings.contains(n_created, "failed"),
+		fmt.tprintf("notice={}", n_created))
+
+	n_joined := app.post_handoff(app.DEVICE_LOCAL, guest)
+	au_say(&c, fmt.tprintf("    post_handoff notice (only joined): {}", n_joined))
+	au_check(&c, "THE HANDOFF DESTROYS THE SESSION IT ONLY JOINED (no creator spared)",
+		!adt_contains_name(adt_list_now(), guest),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
+	au_check(&c, "…and the notice states it plainly, with no error wording",
+		strings.contains(n_joined, "stopped and deleted") &&
+			!strings.contains(n_joined, "NOT cleaned") &&
+			!strings.contains(n_joined, "failed"),
+		fmt.tprintf("notice={}", n_joined))
+
+	// D12 still outranks the unconditional destroy: `default` is never destroyed,
+	// and the unconditional path answers that with the same "left running" shape.
+	default_notice := app.post_handoff(app.DEVICE_LOCAL, "default")
+	au_say(&c, fmt.tprintf("    post_handoff notice (default): {}", default_notice))
+	au_check(&c, "D12 OUTRANKS THE UNCONDITIONAL HANDOFF: `default` is left running",
+		strings.contains(default_notice, "left running") &&
+			!strings.contains(default_notice, "stopped and deleted"),
+		fmt.tprintf("notice={}", default_notice))
+
+	// Explicit teardown, asserted — not left to the deferred sweep. If the
+	// stop-then-delete ordering ever stops working the failure lands here, on the
+	// unconditional section that ran the destroys, rather than on a generic
+	// end-of-file sweep that cannot say which section leaked.
+	adt_teardown(&c, created, "end of the unconditional handoff live")
+	adt_teardown(&c, guest, "end of the unconditional handoff live")
+	au_check(&c, "teardown leaves no unconditional-handoff scratch behind",
+		!adt_contains_name(adt_list_now(), created) &&
+			!adt_contains_name(adt_list_now(), guest),
+		fmt.tprintf("names={}", adt_names_of(adt_list_now())))
+}
+
 // ── P2-5 LIVE: a control command against a black-holed host ───────────────
 
 @(test)

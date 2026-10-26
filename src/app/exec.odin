@@ -33,9 +33,10 @@ package app
 //     `$HOME` cwd and the SIGINT/SIGQUIT dance all live in T2 and are reused
 //     verbatim — the executor adds no terminal logic of its own.
 //
-//  6. **Cleanup is policy, not reflex.** D2 is parked at `never`, so after a
-//     detach we destroy nothing. The seam is still wired, so when D2 lands the
-//     answer changes in one place (see `post_detach`).
+//  6. **Cleanup is policy, not reflex** — with the create/attach handoff now
+//     owning an UNCONDITIONAL destroy of the session it just went through (see
+//     `post_handoff`), while the generic detach seam stays policy-driven
+//     (`post_detach` / `cleanup_should_run`) for the callers that are still theirs.
 //
 // Nothing here reads the keyboard, paints a cell, or knows the poll loop exists.
 // Effect :: exec — that is the whole contract.
@@ -203,10 +204,11 @@ do_launch :: proc(cmd: Command, home: string) -> Effect {
 	}
 	eff := run_child(argv, home)
 	eff.refresh = true
-	// We asked for this name to exist, so it is the one candidate for cleanup
-	// once the child is gone. Under the parked policy this is a no-op sentence.
+	// We asked for this name to exist, so once the child is gone the handoff owns
+	// the destroy. The create/attach rule is an unconditional delete of the session
+	// we just went through — the creator distinction no longer gates it.
 	if eff.kind == .child {
-		eff.message = fmt.tprintf("{} — {}", eff.message, post_detach(cmd.device, cmd.name, true))
+		eff.message = fmt.tprintf("{} — {}", eff.message, post_handoff(cmd.device, cmd.name))
 	}
 	return eff
 }
@@ -258,11 +260,11 @@ do_attach :: proc(cmd: Command, rows: []Session, home: string) -> Effect {
 
 	eff := run_child(argv, home)
 	eff.refresh = true
-	// The user's own session: `only_created` must never touch it, and `never`
-	// touches nothing. Passing we_created = false is what makes that distinction
-	// real rather than assumed.
+	// The attach handoff is a create-or-attach we asked for: once the child has
+	// come back, the session is destroyed — whatever the creator bookkeeping says,
+	// because the user asked to attach and the handoff ends in a delete.
 	if eff.kind == .child {
-		eff.message = fmt.tprintf("{} — {}", eff.message, post_detach(cmd.device, cmd.name, false))
+		eff.message = fmt.tprintf("{} — {}", eff.message, post_handoff(cmd.device, cmd.name))
 	}
 	return eff
 }
@@ -345,6 +347,11 @@ run_child :: proc(argv: []string, home: string) -> Effect {
 // The D2 seam — wired, not invented
 // -----------------------------------------------------------------------------
 
+// UNCONDITIONAL_CLEANUP_TOKEN is the notice token for the post-handoff destroy,
+// which answers "yes, destroy" without consulting the policy — the create/attach
+// handoff owns its session now, whatever the creator bookkeeping says.
+UNCONDITIONAL_CLEANUP_TOKEN :: "unconditional"
+
 // cleanup_argv decides what "destroy this session" MEANS on one device: the bare
 // herdr control command locally, the mandatory ssh-wrapped form remotely. Pure,
 // no spawn and no config read, because it is the P1 proof.
@@ -368,10 +375,44 @@ cleanup_target_label :: proc(device: string) -> string {
 	return device
 }
 
+// cleanup_run performs the stop-then-delete pair for `name` on `device`, under the
+// honesty contract every cleanup path shares: the delete answer is the authority (a
+// failed stop is normal — the session may already be down); if the delete did not
+// land, the notice says NOT cleaned and why, so a remote host that went away
+// mid-handoff shows up on the footer as a live problem instead of a silent "done".
+// Without that, a cleanup aimed at an unreachable remote would read "stopped and
+// deleted" while nothing was stopped, nothing was deleted, and the local namesake
+// was gone.
+//
+// `token` is the only caller-supplied half of the notice: the policy label on the
+// policy-driven path, the unconditional marker on the handoff path.
+cleanup_run :: proc(device: string, name: string, token: string) -> string {
+	label := cleanup_target_label(device)
+	stop_cmd, delete_cmd := cleanup_argv(device, name)
+	stop := run_capture(stop_cmd, CONTROL_TIMEOUT)
+	del := run_capture(delete_cmd, CONTROL_TIMEOUT)
+	if del.code != 0 {
+		why := parse_error_envelope(del.err).message
+		if why == "" { why = fmt.tprintf("exit {}", del.code) }
+		if del.timed_out {
+			why = fmt.tprintf("{} (timed out at {}s)", why, int(CONTROL_TIMEOUT / time.Second))
+		}
+		return fmt.tprintf("cleanup_policy={}: {} on {} NOT cleaned ({})",
+			token, name, label, why)
+	}
+	_ = stop
+	return fmt.tprintf("cleanup_policy={}: {} on {} stopped and deleted",
+		token, name, label)
+}
+
 // post_detach runs right after a handoff returns, and asks the policy whether the
-// session we just left should be destroyed. With D2 parked at `never` it destroys
-// nothing and reports that, which is the point: the seam is exercised on every
-// detach so the day D2 is decided it is one constant, not a code hunt.
+// session we just left should be destroyed. It is the policy-driven SEAM: a destroy
+// that is not policy-shaped belongs to a caller that says so outright, and that is
+// `post_handoff` — the create/attach handoff, which now destroys unconditionally.
+//
+// With D2 parked at `never` it destroys nothing and reports that, which is the point:
+// the seam is exercised on every policy-driven detach so the day the policy lands
+// it is one constant, not a code hunt.
 //
 // It takes the DEVICE because the cleanup has to happen on the host that owns the
 // session, and it never claims a cleanup it did not perform. The `delete` answer
@@ -387,22 +428,28 @@ post_detach :: proc(device: string, name: string, we_created: bool) -> string {
 		return fmt.tprintf("cleanup_policy={}: {} left running",
 			cleanup_policy_label(p), name)
 	}
-	label := cleanup_target_label(device)
-	stop_cmd, delete_cmd := cleanup_argv(device, name)
-	stop := run_capture(stop_cmd, CONTROL_TIMEOUT)
-	del := run_capture(delete_cmd, CONTROL_TIMEOUT)
-	if del.code != 0 {
-		why := parse_error_envelope(del.err).message
-		if why == "" { why = fmt.tprintf("exit {}", del.code) }
-		if del.timed_out {
-			why = fmt.tprintf("{} (timed out at {}s)", why, int(CONTROL_TIMEOUT / time.Second))
-		}
-		return fmt.tprintf("cleanup_policy={}: {} on {} NOT cleaned ({})",
-			cleanup_policy_label(p), name, label, why)
+	return cleanup_run(device, name, cleanup_policy_label(p))
+}
+
+// post_handoff runs right after a CREATE-or-ATTACH handoff returns, and destroys
+// the session that handoff just went through — unconditionally. The user asked for
+// the create/attach and, once the child has exited, the app is done with that session
+// either way, so the destroy is owed and is taken: the creator distinction the
+// `only_created` policy encoded is retired FOR THIS PATH. A session the user merely
+// attached to is not spared here any more than one we spawned ourselves.
+//
+// D12 still outranks everything: `default` is never destroyed, and the unconditional
+// path answers that with the same "left running" shape the policy path uses, so the
+// footer can never drift between the two paths on the one question that matters.
+//
+// It takes the DEVICE because the cleanup has to happen on the host that owns the
+// session, and it never claims a cleanup it did not perform — the same honesty
+// contract as `post_detach`, via `cleanup_run`.
+post_handoff :: proc(device: string, name: string) -> string {
+	if is_default_session_name(name) {
+		return fmt.tprintf("cleanup_policy={}: {} left running", UNCONDITIONAL_CLEANUP_TOKEN, name)
 	}
-	_ = stop
-	return fmt.tprintf("cleanup_policy={}: {} on {} stopped and deleted",
-		cleanup_policy_label(p), name, label)
+	return cleanup_run(device, name, UNCONDITIONAL_CLEANUP_TOKEN)
 }
 
 cleanup_policy_label :: proc(p: Cleanup_Policy) -> string {
