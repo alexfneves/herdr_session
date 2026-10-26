@@ -496,7 +496,10 @@ creates or deletes a session. Three things keep that visible instead of hidden:
   The age token lives in that notice, not in a permanent status cell: you see
   how old the rows were at the moment you asked, and nothing else.
 - **The footer shows what each host is doing** — `local ok 2  build-box down 1`.
-  The list itself is a snapshot, so the loop never wakes on a timer and no number
+  The list itself is a snapshot, so the loop never wakes on a timer — the one
+  scheduled wake it ever takes is the caret blink (ISC-A-2: the blink re-arms from
+  the Edit's own monotonic deadline and the loop just re-arms its poll to the next
+  edge; with no caret visible it blocks indefinitely on `poll(-1)`) — and no number
   quietly goes stale: the freshness you can act on is the one `Ctrl-L` prints and
   the one every Attach/Delete entry re-earns by re-reading before it lets you act.
 

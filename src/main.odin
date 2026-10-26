@@ -343,9 +343,9 @@ Tui :: struct {
 
 	// caret_src is WHICH editor owns the caret for the frame being painted, and
 	// it is written by the body painter that drew the editor. After the frame is
-	// closed it is what the real terminal cursor gets aimed at; nil means this
-	// frame has no caret at all, so the cursor is hidden rather than left on
-	// some older frame's cell. Reset at the top of every paint.
+	// closed it is what the blink phase is read back from; nil means this frame
+	// has no caret at all, so the hardware cursor stays hidden rather than being
+	// left on some older frame's cell. Reset at the top of every paint.
 	caret_src : ^ui.Edit,
 
 	cfg     : app.Config, // what ~/.config/herdr_session.json said (T6.1)
@@ -371,9 +371,11 @@ Tui :: struct {
 	// the stamp itself is still what makes the refresh notice honest, and what
 	// lets "re-read now" mean something.
 	//
-	// It is stamped at PAINT time and the loop never wakes on a timer (ISC-A-2:
-	// 0 ticks idle), so the age is "as of the last frame" — the frame the user
-	// is reading after not touching the app for that long.
+	// It is stamped at PAINT time and the loop never wakes on a timer except to
+	// the next caret-blink edge (ISC-A-2: 0 idle ticks — the blink is the ONE
+	// scheduled wake this loop ever takes; with no caret visible it blocks
+	// indefinitely on poll(-1)), so the age is "as of the last frame" — the frame
+	// the user is reading after not touching the app for that long.
 	list_at   : time.Time,
 	list_seen : bool,
 
@@ -798,8 +800,13 @@ tui_merge :: proc(f: ^app.Fetch) {
 
 // tui_wait blocks until the tty has a key, the resize pipe speaks, a fetch has
 // bytes, or the earliest deadline arrives. `timeout == -1` when nothing is in
-// flight: the process then sleeps until the user does something, which is the
-// difference between an event loop and a spin lock.
+// flight AND no caret is blinking: the process then sleeps until the user does
+// something, which is the difference between an event loop and a spin lock.
+//
+// THE ONE SCHEDULED WAKE (ISC-A-2, amended by the app-driven caret blink): the
+// loop never sleeps on a timer unless a caret is blinking, and then sleeps only
+// until that caret's next blink edge. With no caret visible it passes -1 to
+// poll and blocks indefinitely — no idle spin, no timer, no thread.
 //
 // Returns false ONLY for a poll failure that is not EINTR. The caller turns that
 // into `tui_lost_terminal()`; returning true there would re-enter a poll set we
@@ -812,7 +819,9 @@ tui_wait :: proc() -> bool {
 	append(&tui.fds, posix.pollfd{fd = posix.FD(rsfd),  events = {.IN}})
 	app.registry_fds(&tui.reg, &tui.fds)
 
-	// The timeout is a three-way min, and the middle term is not a knob.
+	// The timeout is a min of the three possible sleeps (registry deadline vs
+	// caret blink edge vs -1 for "nothing to do"), and the middle term is not a
+	// knob.
 	//
 	// A fetch whose stdout AND stderr have both hit EOF leaves the poll set (there
 	// is nothing left to read from it), but that does NOT mean it is finished:
@@ -830,13 +839,21 @@ tui_wait :: proc() -> bool {
 	// timer at all is still what happens once the registry is empty, which is
 	// what keeps the idle CPU at zero.
 	timeout : i32 = -1
+	// App-driven caret blink: when a caret owns this frame the loop sleeps at
+	// most until that caret's next blink edge (the finite half of the ISC-A-2
+	// invariant). No caret visible -> still -1 (block indefinitely).
+	if tui.caret_src != nil {
+		if ms := ui.edit_blink_wait_ms(tui.caret_src); ms >= 0 {
+			if timeout == -1 || ms < timeout { timeout = ms }
+		}
+	}
 	if app.registry_pending(&tui.reg) > 0 {
 		left := app.registry_min_remaining(&tui.reg)
 		ms := i32(time.duration_milliseconds(left))
 		if ms < 0 { ms = 0 }
 		slice := i32(time.duration_milliseconds(app.POLL_SLICE))
 		if ms > slice { ms = slice }
-		timeout = ms
+		if timeout == -1 || ms < timeout { timeout = ms }
 	}
 
 	if len(tui.fds) == 0 { return true }
@@ -912,6 +929,9 @@ tui_project_shown :: proc() -> []app.Session {
 // because the caret is machine state now (arrow keys move it) and a view that
 // re-forgot it would snap to end-of-line on every repaint.
 tui_sync_text :: proc(e: ^ui.Edit, s: string, caret: int) {
+	// The mirrored caret moved -> the blink phase resets to ON (UIP-5). Compare
+	// BEFORE edit_clear clobbers the editor's caret.
+	moved := e.caret != caret
 	ui.edit_clear(e)
 	if len(s) > 0 { ui.edit_paste(e, s) }
 	// The clamp is a safety net, not a policy: the machine keeps the caret on a
@@ -921,6 +941,7 @@ tui_sync_text :: proc(e: ^ui.Edit, s: string, caret: int) {
 	if at < 0 { at = 0 }
 	if at > e.len { at = e.len }
 	e.caret = at
+	if moved { ui.edit_blink_reset(e) }
 }
 
 // ── painting ─────────────────────────────────────────────────────────────
@@ -1028,22 +1049,18 @@ tui_source_line :: proc() -> string {
 	return fmt.tprintf("from {}", app.machine_source_label(tui.disc_source))
 }
 
-// tui_paint_cursor aims the REAL terminal cursor at the cell Clay painted the
-// caret into, and asks the terminal for a blinking block while it is there.
-// The bytes themselves are the caret's own concern (ui.edit_place_cursor);
-// which editor owns the caret, and whether to hide instead, is decided here.
+// tui_paint_cursor owns the hardware cursor's visibility for the frame. There is
+// NO TIMER and NO TERMINAL CURSOR for the caret any more (UIP-5 refinement): the
+// caret is painted by Clay through the app-driven pair swap, so the real cursor
+// is HIDDEN for the editable field (ESC[?25l via tb_hide_cursor) and never
+// positioned and never asked to blink — positioning was only ever needed to host
+// a terminal-owned DECSCUSR blink, and the blink is the app's now.
 //
-// There is NO TIMER. One emission per painted frame, driven by paint alone: a
-// blink timer would wake the loop on a clock and break the frozen idle budget
-// (≤ 2 ticks per 5 s, D-K). The terminal blinks the cursor by itself, so
-// nothing has to be scheduled in order to let it.
-//
-// CAVEAT before changing the order: a captured frame ends
-// `<caret CUP><ESC[3 q><caret CUP><ESC[?12l><ESC[?25h>` — termbox appends its
-// own end-of-flush cursor sync and un-hide AFTER the caret's DECSCUSR. Whether
-// that mode-12 reset suppresses the blink the DECSCUSR asked for is emulator
-// behaviour this suite cannot observe (the bundled pty emulator parses DECSCUSR
-// and ignores it), so "it blinks" stays eyeball-only rather than asserted.
+// No caret in this frame -> hide, rather than leave the cursor sitting on the
+// cell an earlier frame's caret occupied. With a caret -> also hide: the caret
+// element the paint laid out carries the pair, and the hardware cursor must not
+// double-draw over it. Hiding here is idempotent, so the three branches are one
+// behaviour.
 tui_paint_cursor :: proc() {
 	if tui.caret_src == nil {
 		termbox2.tb_hide_cursor()
@@ -1053,7 +1070,13 @@ tui_paint_cursor :: proc() {
 		// No caret in this frame: hide, rather than leave the cursor sitting on
 		// the cell an earlier frame's caret occupied.
 		termbox2.tb_hide_cursor()
+		return
 	}
+	// The caret element was laid out this frame: the caret is app-painted (Clay
+	// pair swap), so the real cursor stays HIDDEN for the editable field. This is
+	// the hide half of "hide for editable fields" — there is no show and no
+	// positioning left to keep in step.
+	termbox2.tb_hide_cursor()
 }
 
 tui_paint :: proc() {
@@ -1118,14 +1141,9 @@ tui_paint :: proc() {
 		error_body(l)
 	}
 	ui.frame_close(&tui.painter, f)
-	// The caret's cursor bytes are queued BEFORE the flush that carries them.
-	// Measured (see tests/unit/caret_cursor_test): termbox has no exported
-	// flush of its own — tb_set_cursor/tb_send only append to termbox's output
-	// buffer — so emitting AFTER tb_present leaves those bytes sitting in that
-	// buffer until some LATER flush. The caret would land a frame late, or, in
-	// an idle app with no next frame, never arrive at all. Emitting before the
-	// present puts them in the same write as the frame, and termbox's own
-	// end-of-flush cursor sync then leaves the real cursor on the caret cell.
+	// The caret has no terminal bytes any more (UIP-5): it is painted by Clay
+	// through the app-driven pair swap, and the hardware cursor is hidden. So
+	// there is nothing to queue before the present here.
 	tui_paint_cursor()
 	termbox2.tb_present()
 	termhandoff.note_paint(&tui.coalescer)
@@ -1289,6 +1307,14 @@ tui_loop :: proc() {
 		// 4. Sleep until something real happens. A non-EINTR poll failure means
 		//    the wait set itself is dead, which is the lost-terminal case.
 		if !tui_wait() { tui_lost_terminal("poll/get_fds failed") }
+
+		// 5. App-driven caret blink: if a caret owns this frame and its phase is
+		//    due, flip it and mark the frame dirty so the next paint swaps the
+		//    pair. With no caret owning the frame there is nothing to flip and the
+		//    loop above already slept indefinitely.
+		if tui.caret_src != nil {
+			if ui.edit_blink_step(tui.caret_src) { tui.dirty = true }
+		}
 	}
 }
 

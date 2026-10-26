@@ -56,17 +56,17 @@ package ui
 //
 // WHY THE GLYPH IS PAINTED AND NEVER LEFT TO THE TERMINAL'S CURSOR
 //
-// The terminal cursor is kept BLINKING (DECSCUSR `ESC[3 q`) — a hard product
-// requirement — and an inverted-cell blink spends half its cycle inverting the
-// cell the cursor is on. If the caret cell instead held a bare block and relied
-// on the terminal's own cursor overlay to reveal the character underneath, that
-// character would VANISH for half of every blink. So the character is painted
-// into the caret cell by Clay and is visible in BOTH blink states: with the
-// blink off you see the glyph in `caret_fg` on `caret_bg`; with the blink on
-// the terminal INVERTS that same cell and the glyph is still there, knocked out
-// in the other colour. Removing the glyph to paint a bare block, or trusting
-// the cursor overlay to bring it back, breaks the blink requirement and is the
-// thing this paragraph exists to prevent.
+// The caret blinks in the APP now (UIP-5 refinement): the phase lives in this
+// struct (see `blink_on` / `blink_at` / `blink_armed` below) and the loop wakes
+// once per ~530 ms blink edge to step it. The glyph is painted into the caret
+// cell by Clay and is visible in BOTH phase states: phase ON -> the glyph is in
+// `caret_fg` on `caret_bg` (the highlighted pair); phase OFF -> the same glyph
+// is in the normal pair (`fg` on `bg`). Swapping the two pairs needs no terminal
+// inversion, no DECSCUSR, and never loses the character for half of a blink.
+//
+// The terminal cursor itself is never part of this any more: it is HIDDEN for
+// editable fields (`tb_hide_cursor`, ESC[?25l) and never positioned or asked to
+// blink.
 //
 // ── WHY A FIXED BUFFER ───────────────────────────────────────────────────────
 // Editing means inserting and deleting in the middle, and `delete(arr[i:j])` on a
@@ -80,7 +80,7 @@ import clay "../../clay-odin"
 import render "../render"
 import tb "../../vendor/termbox2-odin"
 
-import "core:c"
+import "core:time"
 import "core:unicode/utf8"
 
 // CARET_GLYPH is a one-cell full block: it fills the cell it sits on, so it
@@ -103,6 +103,10 @@ CARET_ID_LABEL :: "caret"
 // hard bound on what a single paste can put on screen.
 EDIT_MAX :: 1024
 
+// CARET_BLINK_PERIOD is the app-driven caret blink: how long each phase (ON / OFF)
+// lasts, ~530 ms. A phase flip is a blink edge; the loop sleeps until the next one.
+CARET_BLINK_PERIOD :: time.Duration(530 * 1_000_000) // 530 ms, in nanoseconds
+
 // Edit is the editor state. `caret` is a BYTE index into buf; every screen
 // position is derived from it, never the other way round.
 Edit :: struct {
@@ -117,20 +121,82 @@ Edit :: struct {
 	// never name an element this frame did not draw.
 	caret_id       : clay.ElementId,
 	caret_laid_out : bool,
+
+	// App-driven caret blink (UIP-5 refinement): the PHASE the caret is painted
+	// in, and the deadline of the next phase flip, plus whether a caret currently
+	// owns this editor. The phase lives here (not in the terminal) because the
+	// blink must be visible in the frame the renderer paints — a terminal-owned
+	// DECSCUSR blink cannot be seen through Clay's colour pairs and cannot be
+	// asserted; the app can. `blink_armed` is set by the paint and read back by the
+	// loop to decide whether to sleep on the blink at all.
+	blink_on    : bool, // phase: true = highlighted (caret pair), false = normal pair
+	blink_at    : time.Time, // deadline of the next phase flip
+	blink_armed : bool, // a caret currently owns this editor (set by the paint)
 }
 
+// edit_init is the fresh-editor reset. The phase starts ON (the caret is
+// highlighted) and `blink_armed` is false until a frame paints the caret — an
+// editor that has not been painted has no caret to blink.
 edit_init :: proc(e: ^Edit) {
 	e.len = 0
 	e.caret = 0
 	e.caret_id = clay.ElementId{}
 	e.caret_laid_out = false
+	e.blink_on = true
+	e.blink_at = time.time_add(time.now(), CARET_BLINK_PERIOD)
+	e.blink_armed = false
 }
 
+// edit_clear is the buffer reset. It deliberately does NOT touch the blink phase
+// or its deadline: clearing the buffer does not clear the caret's blink — the
+// phase belongs to the CARET, and whoever re-arms re-arms on the move that
+// followed. It only retires the arm, because with no buffer there is no caret.
 edit_clear :: proc(e: ^Edit) {
 	e.len = 0
 	e.caret = 0
 	e.caret_id = clay.ElementId{}
 	e.caret_laid_out = false
+	e.blink_armed = false
+}
+
+// edit_blink_reset is the "phase resets to ON" primitive: a caret move or a
+// typed character arms the blink again, starting a fresh ON phase whose next
+// flip is one CARET_BLINK_PERIOD away. Called by the caret movers and by the
+// machine->view sync when the mirrored caret changed.
+edit_blink_reset :: proc(e: ^Edit) {
+	e.blink_on = true
+	e.blink_at = time.time_add(time.now(), CARET_BLINK_PERIOD)
+	e.blink_armed = true
+}
+
+// edit_blink_due reports whether the current phase's time is up: the phase has
+// reached its end and the loop owes this editor a flip.
+edit_blink_due :: proc(e: ^Edit) -> bool {
+	if e == nil || !e.blink_armed { return false }
+	return i64(time.since(e.blink_at)) >= 0
+}
+
+// edit_blink_step flips the phase at its deadline and returns whether it did.
+// The caller repaints (the frame before the flip painted the older phase; the
+// frame after flips paints the new one).
+edit_blink_step :: proc(e: ^Edit) -> bool {
+	if !edit_blink_due(e) { return false }
+	e.blink_on = !e.blink_on
+	e.blink_at = time.time_add(time.now(), CARET_BLINK_PERIOD)
+	return true
+}
+
+// edit_blink_wait_ms is how long the loop should sleep before the next phase
+// flip. It is the finite "time to the next blink edge" while a caret owns the
+// editor, and -1 when the editor holds no caret the loop should blink (never
+// armed — nothing was painted for it). The loop turns -1 into poll(-1), i.e. an
+// indefinite block; a caret visible turns it into a finite timeout.
+edit_blink_wait_ms :: proc(e: ^Edit) -> i32 {
+	if e == nil || !e.blink_armed { return -1 }
+	rem := time.time_to_unix_nano(e.blink_at) - time.time_to_unix_nano(time.now())
+	ms := i32(time.duration_milliseconds(time.Duration(rem)))
+	if ms < 0 { ms = 0 }
+	return ms
 }
 
 edit_text :: proc(e: ^Edit) -> string {
@@ -233,6 +299,8 @@ edit_insert_rune :: proc(e: ^Edit, r: rune) -> bool {
 		return false
 	}
 	e.caret = at + n
+	// The caret MOVED (a character landed at it) -> the blink phase resets to ON.
+	edit_blink_reset(e)
 	return true
 }
 
@@ -273,8 +341,20 @@ edit_paste :: proc(e: ^Edit, pasted: string) -> int {
 			i += 1
 			continue
 		}
-		if edit_insert_rune(e, r) {
-			accepted += 1
+		// The burst insert goes through insert_bytes directly (NOT edit_insert_rune):
+		// a paste is one caret move and the CALLER (the sync layer) owns the blink
+		// reset, so a per-frame paste cannot restart the blink deadline every frame.
+		if edit_is_drawable(r) {
+			tmp, n := utf8.encode_rune(r)
+			if n > 0 {
+				at := e.caret
+				if at < 0 { at = 0 }
+				if at > e.len { at = e.len }
+				if insert_bytes(e, at, tmp[0:n]) {
+					e.caret = at + n
+					accepted += 1
+				}
+			}
 		}
 		i += size
 	}
@@ -298,6 +378,8 @@ edit_backspace :: proc(e: ^Edit) -> bool {
 	start := e.caret - n
 	remove_bytes(e, start, n)
 	e.caret = start
+	// The caret MOVED -> the blink phase resets to ON.
+	edit_blink_reset(e)
 	return true
 }
 
@@ -312,6 +394,8 @@ edit_delete_forward :: proc(e: ^Edit) -> bool {
 		n = 1
 	}
 	remove_bytes(e, e.caret, n)
+	// The caret MOVED -> the blink phase resets to ON.
+	edit_blink_reset(e)
 	return true
 }
 
@@ -330,6 +414,8 @@ edit_left :: proc(e: ^Edit) -> bool {
 	if e.caret < 0 {
 		e.caret = 0
 	}
+	// The caret MOVED -> the blink phase resets to ON.
+	edit_blink_reset(e)
 	return true
 }
 
@@ -345,6 +431,8 @@ edit_right :: proc(e: ^Edit) -> bool {
 	if e.caret > e.len {
 		e.caret = e.len
 	}
+	// The caret MOVED -> the blink phase resets to ON.
+	edit_blink_reset(e)
 	return true
 }
 
@@ -503,6 +591,20 @@ edit_paint :: proc(e: ^Edit, id: string, width: i32, pal: ^Palette) {
 		cid := clay.ID_LOCAL(CARET_ID_LABEL)
 		e.caret_id = cid
 		e.caret_laid_out = true
+		e.blink_armed = true
+		// THE PAIR SWAP (UIP-5): phase ON -> the highlighted pair (glyph in
+		// `caret_fg` knocked out of a `caret_bg` block); phase OFF -> the normal
+		// pair (glyph in `fg`, cell fill `bg`). The glyph is the overlay — the real
+		// character under the caret, or the solid block at end of buffer — and it
+		// is in the cell in BOTH phases, so the blink swaps colours, never content,
+		// and the character cannot vanish for half of every blink. No underline: the
+		// two pairs are fg/bg swaps, never an underline style.
+		caret_bg := pal.caret_bg
+		caret_fg := pal.caret_fg
+		if !e.blink_on {
+			caret_bg = pal.bg
+			caret_fg = pal.fg
+		}
 		// The caret paints the character it sits on. At end of buffer there is
 		// none, so it paints the block. Either way the glyph is IN the cell, so
 		// it survives the blink in both states.
@@ -522,9 +624,9 @@ edit_paint :: proc(e: ^Edit, id: string, width: i32, pal: ^Palette) {
 				},
 				layoutDirection = clay.LayoutDirection.LeftToRight,
 			},
-			backgroundColor = pal.caret_bg,
+			backgroundColor = caret_bg,
 		}) {
-			clay.Text(caret_text, clay.TextElementConfig{textColor = pal.caret_fg})
+			clay.Text(caret_text, clay.TextElementConfig{textColor = caret_fg})
 		}
 		if len(v.suffix) > 0 {
 			clay.Text(v.suffix, clay.TextElementConfig{textColor = pal.fg})
@@ -553,27 +655,19 @@ edit_caret_cell :: proc(e: ^Edit) -> (x, y: i32, ok: bool) {
 	return r.x, r.y, true
 }
 
-// CARET_SHAPE_BLINK_BLOCK is DECSCUSR `ESC[3 q` — a BLINKING BLOCK cursor, the
-// shape that matches the painted block caret.
+// THE TERMINAL CURSOR IS NOT THE CARET ANY MORE — AND THAT IS DELIBERATE.
 //
-// Raw bytes because tb_send takes a `rawptr` and Odin will NOT coerce a string
-// literal into one (measured: `Cannot convert "\x1b[3 q" to 'rawptr'`).
-CARET_SHAPE_BLINK_BLOCK := []u8{0x1b, '[', '3', ' ', 'q'}
-
-// edit_place_cursor points the terminal's REAL cursor at the cell the caret was
-// painted into, and asks the terminal for a blinking block to match. Both bytes
-// go out on the frame's own flush — see the caller's note on ordering.
-//
-// This is the ONLY place the caret touches the terminal directly, and it moves
-// the cursor without drawing anything: the caret's CELLS still arrive through
-// Clay -> render.paint. Which editor owns the caret, and whether to hide the
-// cursor instead, is the caller's decision.
+// edit_place_cursor used to point the terminal's REAL cursor at the cell the
+// caret was painted into and ask the terminal for a blinking block to match
+// (DECSCUSR `ESC[3 q`). THE CARET IS NOW PAINTED BY CLAY THROUGH THE APP-DRIVEN
+// PAIR SWAP (see edit_paint), so the real terminal cursor is HIDDEN for editable
+// fields (`tb_hide_cursor`, ESC[?25l) and needs neither positioning nor a blink:
+// positioning was only ever there to host a terminal-owned blink, and the blink
+// is the app's now. So this proc keeps the ONE thing that is genuinely still
+// needed from the old shape — reading the cell back for the caller — and takes no
+// terminal bytes at all. Which editor owns the caret, and whether to hide the
+// hardware cursor instead, is the caller's decision.
 edit_place_cursor :: proc(e: ^Edit) -> (x, y: i32, ok: bool) {
 	x, y, ok = edit_caret_cell(e)
-	if !ok {
-		return
-	}
-	tb.tb_set_cursor(x, y)
-	tb.tb_send(raw_data(CARET_SHAPE_BLINK_BLOCK), c.size_t(len(CARET_SHAPE_BLINK_BLOCK)))
-	return x, y, true
+	return x, y, ok
 }
